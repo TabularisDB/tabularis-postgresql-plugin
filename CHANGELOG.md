@@ -5,7 +5,9 @@
 ### Added
 
 - Repo scaffolding: `LICENSE` (Apache-2.0), `.gitignore`, `.editorconfig`,
-  `CODEOWNERS`, `rust-toolchain.toml`, `.github/dependabot.yml`.
+  `CODEOWNERS`, `rust-toolchain.toml` (pinning `rustfmt`/`clippy`),
+  `.github/dependabot.yml`, `justfile` (build/test/lint/fmt/dev-install/
+  demo-db recipes, matching sibling plugin repos).
 - `CI` workflow (`cargo build`/`test`/`clippy`/`fmt --check`) and `Release`
   workflow (cross-platform binary builds for Linux x86_64/aarch64, macOS
   x86_64/aarch64, Windows x86_64, published as GitHub release assets

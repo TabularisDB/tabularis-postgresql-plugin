@@ -1,5 +1,6 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
+  <img src="https://wiki.postgresql.org/images/3/30/PostgreSQL_logo.3colors.120x120.png" width="120" height="120" alt="PostgreSQL logo" />
 </div>
 
 # tabularis-postgresql-plugin
@@ -21,7 +22,7 @@ directly into the Tabularis application. It is byte-for-byte behaviorally
 identical to that built-in driver, proven by an 82-test parity suite that runs
 both drivers against the same live database and compares every response.
 
-> **Status: scaffolding only.** This repo currently holds only the repo-level
+> ⚠️ **Work in progress** — this repo currently holds only the repo-level
 > basics (license, CI/release workflow shape, contributor docs). The actual
 > plugin source (`Cargo.toml`, `src/`, `.tabularium` manifest) has not been
 > migrated yet — it still lives at
@@ -157,9 +158,17 @@ reconnecting.
 ### Prerequisites
 
 - [Rust](https://www.rust-lang.org/tools/install) (edition 2021)
+- [`just`](https://github.com/casey/just) (optional, wraps the common cargo invocations)
 - A running PostgreSQL instance (for integration tests)
 
 ### Build
+
+```bash
+just build      # debug build
+just release    # release build (what the GitHub Actions workflow ships)
+```
+
+Or directly with cargo:
 
 ```bash
 cargo build --release
@@ -170,7 +179,15 @@ The binary will be located at `target/release/postgresql-plugin`.
 ### Install Locally
 
 ```bash
-just dev-install
+just dev-install   # build + copy binary and manifest into the Tabularis plugins dir
+just uninstall     # remove the installed plugin
+```
+
+### Local Test Database
+
+```bash
+just demo-db        # postgres:16-alpine in Docker (postgres / password / testdb)
+just demo-db-stop
 ```
 
 ## Development
@@ -178,14 +195,9 @@ just dev-install
 ### Running Tests
 
 ```bash
-# Unit tests
-cargo test
-
-# Lint
-cargo clippy --all-targets -- -D warnings
-
-# Format
-cargo fmt --all
+just test    # cargo test — unit tests for SQL builders, parsing, RPC
+just lint    # clippy -D warnings
+just fmt     # cargo fmt --all
 ```
 
 ### Manual JSON-RPC test via shell
