@@ -4,6 +4,36 @@
 
 ### Added
 
+- CI hardening — deliberately set a higher bar than the sibling plugin
+  repos and the org's own documented requirements (no sibling runs
+  `cargo audit`; only 2 of 11 Rust siblings gate on clippy/fmt at all):
+  - `.tabularium` manifest validation against the live registry schema via
+    `@tabularium/cli validate`, catching a malformed manifest automatically
+    (we got `name`/`id` wrong once by hand earlier this session).
+  - `markdownlint-cli` as an enforced CI job, not a manually-run habit.
+  - A release-binary smoke test: pipe a trivial `initialize` JSON-RPC
+    request into each freshly-built platform binary and assert a valid
+    (non-error) response before it ships in a zip. Skipped for `linux-arm64`
+    only, since that leg is cross-compiled and the binary can't execute on
+    the x86_64 build runner without QEMU emulation.
+  - `cargo audit` (via `rustsec/audit-check`) for supply-chain
+    vulnerabilities, on every push/PR and a weekly schedule (catches CVEs
+    disclosed after merge against unchanged dependencies).
+  - `tests/live_db.rs`: a self-contained live-`postgres:16`-container
+    integration test (first top-level `tests/` dir in this repo — existing
+    tests are all pure unit tests via the `.rules/rust.md` #4/#5
+    sibling-file convention). Covers connect, a basic query, an insert, and
+    the `startup_script`/`connection_string` handlers found completely
+    uncovered during the security-audit pass — closes the actual biggest
+    gap in this repo's CI: nothing previously verified the binary against
+    a real database automatically. Deliberately NOT the cross-repo 82-test
+    parity suite (that stays a manual/periodic check against `tabularis`,
+    per the "Repo Extraction" open question in
+    `docs/planning/02-phase-1-plugin-build.md`).
+  - Two further hardening ideas — `dependency-review-action` on PRs and
+    SBOM generation via `cargo-cyclonedx` — were considered and
+    deliberately deferred rather than implemented now; see
+    `docs/planning/ci-hardening-deferred.md` for the rationale.
 - `main.rs` rewritten to a worker-pool architecture (4 workers + a single
   writer task + a dedicated pool-cleanup task, coordinated via a
   `tokio::sync::watch` shutdown signal on stdin EOF), matching the
