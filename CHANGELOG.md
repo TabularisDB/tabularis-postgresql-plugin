@@ -4,6 +4,34 @@
 
 ### Added
 
+- `main.rs` rewritten to a worker-pool architecture (4 workers + a single
+  writer task + a dedicated pool-cleanup task, coordinated via a
+  `tokio::sync::watch` shutdown signal on stdin EOF), matching the
+  sqlserver/dynamodb sibling plugins. A slow query on one connection no
+  longer blocks a concurrent `ping` or metadata call on another; the host
+  already tolerates out-of-order responses (it correlates by JSON-RPC `id`
+  via a `HashMap`, not arrival order), so this required no protocol change.
+- Periodic idle-pool eviction: every 10 minutes, `client::cleanup_idle_pools()`
+  drops cached connection pools that currently have no checked-out
+  connections, so a long-running session that has connected to many
+  distinct targets doesn't pin idle TCP connections and pool memory for
+  the plugin's lifetime. Matches the sqlserver/dynamodb sibling plugins'
+  pattern exactly (`pool.status().size > pool.status().available` as the
+  keep predicate). Found missing during the same security-audit pass that
+  flagged "pool cleanup on shutdown" — investigation showed the host never
+  sends the plugin a `shutdown` RPC call at all (it kills the process
+  outright), so that specific checklist wording described something
+  unreachable; comparing sibling plugins surfaced this as the real,
+  exercisable gap instead. Added test-first (TDD): a unit test asserting
+  an idle pool gets evicted, written and confirmed RED (`cleanup_idle_pools`
+  didn't exist) before the function was implemented to GREEN.
+- `save_blob_to_file` now validates `file_path` (empty, existing-directory,
+  or missing-parent-directory) before spending a DB round-trip on a write
+  that would fail anyway — a clearly attributed `-32602` error instead of
+  a bare OS error number surfacing after the query already ran. Not a
+  security boundary (the path comes from the frontend's native save
+  dialog), just a fast-fail. The builtin driver's identical gap is
+  untouched; this fix is plugin-only. Found during the security-audit pass.
 - `startup_script` support: SQL supplied on the connection now runs on every
   new pooled connection via a `deadpool-postgres` `post_create` hook, with a
   preflight validation pass so a broken script fails fast with a clearly

@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio_postgres::types::{ToSql, Type};
 use uuid::Uuid;
 
-pub type PgParam = Box<dyn ToSql + Sync>;
+pub type PgParam = Box<dyn ToSql + Sync + Send>;
 pub type TypedPgParam = (PgParam, Type);
 
 pub struct BoundValue {

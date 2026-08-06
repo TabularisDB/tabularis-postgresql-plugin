@@ -1,7 +1,7 @@
 //! Unit tests for `client.rs`. Sibling test file per repo convention
 //! (`.rules/rust.md` #4/#5) — loaded via `#[cfg(test)] mod client_tests;`.
 
-use super::{connection_key, get_or_create_pool, POOLS};
+use super::{cleanup_idle_pools, connection_key, get_or_create_pool, POOLS};
 use crate::models::ConnectionParams;
 
 fn params(host: &str, port: u16, db: &str, user: &str) -> ConnectionParams {
@@ -85,5 +85,26 @@ async fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     assert_eq!(
         after_second, after_first,
         "second call with identical params must not create a new entry"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_idle_pools_evicts_pools_with_no_checked_out_connections() {
+    // A freshly-built, never-connected pool has status().size ==
+    // status().available == 0 (deadpool's Pool::new is lazy) — no
+    // checked-out connections, so it must be evicted as idle/unused.
+    let p = params("cleanup-test-host-unique", 5432, "db", "user");
+    let key = connection_key(&p);
+
+    get_or_create_pool(&p)
+        .await
+        .expect("pool should be created and cached");
+    assert!(POOLS.lock().unwrap().contains_key(&key));
+
+    cleanup_idle_pools();
+
+    assert!(
+        !POOLS.lock().unwrap().contains_key(&key),
+        "an idle pool with no checked-out connections must be evicted"
     );
 }

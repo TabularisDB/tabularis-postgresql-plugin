@@ -251,6 +251,18 @@ async fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
     Ok(pools.entry(key).or_insert(pool).clone())
 }
 
+/// Drop pools that currently have no checked-out connections. Called
+/// periodically so long-idle sessions don't linger for the plugin's
+/// lifetime — matches the sqlserver/dynamodb sibling plugins' pattern.
+pub fn cleanup_idle_pools() {
+    if let Ok(mut pools) = POOLS.lock() {
+        pools.retain(|_, pool| {
+            let status = pool.status();
+            status.size > status.available
+        });
+    }
+}
+
 /// Build a deadpool-postgres pool for the given connection parameters.
 ///
 /// When `connection_string` is set, it takes precedence over the discrete
