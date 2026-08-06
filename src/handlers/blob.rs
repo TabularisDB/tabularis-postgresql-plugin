@@ -32,10 +32,14 @@ pub async fn save_blob_to_file(id: Value, params: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
 
+    if let Err(e) = validate_writable_file_path(file_path) {
+        return error_response(id, -32602, &e);
+    }
+
     match fetch_blob_bytes(&conn_params, table, col_name, &pk_map, schema).await {
         Ok(bytes) => match std::fs::write(file_path, bytes) {
             Ok(_) => ok_response(id, Value::Null),
-            Err(e) => error_response(id, -32603, &e.to_string()),
+            Err(e) => error_response(id, -32603, &format!("Failed to write '{file_path}': {e}")),
         },
         Err(e) => error_response(id, -32603, &e),
     }
@@ -93,6 +97,32 @@ async fn fetch_blob_bytes(
     let rows = client::query_typed(conn_params, &query, &typed_params).await?;
     let row = rows.first().ok_or_else(|| "Row not found".to_string())?;
     row.try_get::<_, Vec<u8>>(0).map_err(|e| e.to_string())
+}
+
+/// Sanity-check `file_path` before spending a DB round-trip on a write that's
+/// going to fail anyway. Deliberately permissive — this is not a security
+/// boundary (the path comes from the Tabularis frontend's native save-file
+/// dialog, not directly from an untrusted network caller) but a fast-fail for
+/// the common mistakes `std::fs::write`'s raw OS error doesn't clearly name:
+/// an empty path, a parent directory that doesn't exist, or a path that's
+/// itself an existing directory.
+fn validate_writable_file_path(file_path: &str) -> Result<(), String> {
+    if file_path.trim().is_empty() {
+        return Err("file_path must not be empty".to_string());
+    }
+    let path = std::path::Path::new(file_path);
+    if path.is_dir() {
+        return Err(format!(
+            "file_path '{file_path}' is a directory, not a file"
+        ));
+    }
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() && !parent.is_dir() => Err(format!(
+            "file_path '{file_path}': parent directory '{}' does not exist",
+            parent.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Encode raw bytes into the canonical BLOB wire format:
