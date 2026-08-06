@@ -122,7 +122,8 @@ mod add_column {
             default_value: Some("0".to_string()),
         };
         let sql = build_add_column_sql("all_types", &col, "test_schema");
-        assert!(sql.contains("ALTER TABLE \"test_schema\".\"all_types\" ADD COLUMN \"new_col\" INTEGER"));
+        assert!(sql
+            .contains("ALTER TABLE \"test_schema\".\"all_types\" ADD COLUMN \"new_col\" INTEGER"));
         assert!(sql.contains("DEFAULT 0"));
     }
 }
@@ -144,7 +145,9 @@ mod alter_column {
         let old = column("col_text", "TEXT");
         let new = column("col_text", "VARCHAR(500)");
         let stmts = build_alter_column_sql("t", &old, &new, "public").unwrap();
-        assert!(stmts.iter().any(|s| s.contains("TYPE VARCHAR(500)") && !s.contains("USING")));
+        assert!(stmts
+            .iter()
+            .any(|s| s.contains("TYPE VARCHAR(500)") && !s.contains("USING")));
     }
 
     #[test]
@@ -275,7 +278,14 @@ mod create_foreign_key {
     #[test]
     fn on_delete_and_on_update_actions_are_appended() {
         let sql = build_create_foreign_key_sql(
-            "t", "fk", "c", "ref_t", "ref_c", Some("CASCADE"), Some("RESTRICT"), "public",
+            "t",
+            "fk",
+            "c",
+            "ref_t",
+            "ref_c",
+            Some("CASCADE"),
+            Some("RESTRICT"),
+            "public",
         );
         assert!(sql.ends_with("ON DELETE CASCADE ON UPDATE RESTRICT"));
     }

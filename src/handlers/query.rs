@@ -6,13 +6,16 @@ use std::time::Instant;
 
 use crate::client;
 use crate::extract::extract_value;
-use crate::models::{ConnectionParams, inner_params};
+use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{error_response, ok_response};
 
 pub async fn execute_query(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let query = params.get("query").and_then(Value::as_str).unwrap_or("");
-    let limit = params.get("limit").and_then(Value::as_u64).map(|v| v as u32);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
     let page = params.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
     let schema = params.get("schema").and_then(Value::as_str);
 
@@ -27,9 +30,16 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     let queries: Vec<String> = params
         .get("queries")
         .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let limit = params.get("limit").and_then(Value::as_u64).map(|v| v as u32);
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
     let page = params.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
     let schema = params.get("schema").and_then(Value::as_str);
 
@@ -77,7 +87,10 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
 pub async fn explain_query(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let query = params.get("query").and_then(Value::as_str).unwrap_or("");
-    let analyze = params.get("analyze").and_then(Value::as_bool).unwrap_or(false);
+    let analyze = params
+        .get("analyze")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let schema = params.get("schema").and_then(Value::as_str);
 
     let explain_sql = if analyze {
@@ -119,10 +132,7 @@ async fn exec_query(
 
     // Set search_path if schema is specified
     if let Some(s) = schema {
-        let set_path = format!(
-            "SET search_path TO \"{}\"",
-            s.replace('"', "\"\"")
-        );
+        let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
         pg_client
             .batch_execute(&set_path)
             .await
@@ -172,7 +182,10 @@ async fn exec_query_on_client(
     if rows.is_empty() {
         // Get columns from the statement if possible
         let columns: Vec<String> = if let Ok(stmt) = pg_client.prepare(&final_query).await {
-            stmt.columns().iter().map(|c| c.name().to_string()).collect()
+            stmt.columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect()
         } else {
             vec![]
         };

@@ -18,8 +18,14 @@ pub async fn save_blob_to_file(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
     let col_name = params.get("col_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
-    let file_path = params.get("file_path").and_then(Value::as_str).unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
+    let file_path = params
+        .get("file_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let pk_map = params
         .get("pk_map")
         .and_then(Value::as_object)
@@ -39,7 +45,10 @@ pub async fn fetch_blob_as_data_url(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
     let col_name = params.get("col_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
     let pk_map = params
         .get("pk_map")
         .and_then(Value::as_object)
@@ -59,8 +68,14 @@ async fn fetch_blob_bytes(
     pk_map: &serde_json::Map<String, Value>,
     schema: &str,
 ) -> Result<Vec<u8>, String> {
-    let qualified = format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\""));
-    let column_types = client::get_column_types_map(conn_params, table, schema).await.unwrap_or_default();
+    let qualified = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        table.replace('"', "\"\"")
+    );
+    let column_types = client::get_column_types_map(conn_params, table, schema)
+        .await
+        .unwrap_or_default();
 
     let (predicate, owned_params) = build_pk_map_predicate(pk_map, &column_types, 1)?;
     let query = format!(
@@ -86,7 +101,9 @@ async fn fetch_blob_bytes(
 /// `application/octet-stream`. Matches `encode_blob_full` in
 /// `src-tauri/src/drivers/common/blob.rs`.
 fn encode_blob_full(data: &[u8]) -> String {
-    let mime_type = infer::get(data).map(|k| k.mime_type()).unwrap_or("application/octet-stream");
+    let mime_type = infer::get(data)
+        .map(|k| k.mime_type())
+        .unwrap_or("application/octet-stream");
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
     format!("BLOB:{}:{}:{}", data.len(), mime_type, b64)
 }

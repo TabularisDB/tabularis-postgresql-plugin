@@ -38,9 +38,15 @@ pub async fn handle_line(line: &str) -> Value {
         "get_view_definition" => handlers::metadata::get_view_definition(id, &params).await,
         "get_view_columns" => handlers::metadata::get_view_columns(id, &params).await,
         "get_materialized_views" => handlers::metadata::get_materialized_views(id, &params).await,
-        "get_materialized_view_columns" => handlers::metadata::get_materialized_view_columns(id, &params).await,
-        "get_materialized_view_definition" => handlers::metadata::get_materialized_view_definition(id, &params).await,
-        "refresh_materialized_view" => handlers::metadata::refresh_materialized_view(id, &params).await,
+        "get_materialized_view_columns" => {
+            handlers::metadata::get_materialized_view_columns(id, &params).await
+        }
+        "get_materialized_view_definition" => {
+            handlers::metadata::get_materialized_view_definition(id, &params).await
+        }
+        "refresh_materialized_view" => {
+            handlers::metadata::refresh_materialized_view(id, &params).await
+        }
         "get_routines" => handlers::metadata::get_routines(id, &params).await,
         "get_routine_parameters" => handlers::metadata::get_routine_parameters(id, &params).await,
         "get_routine_definition" => handlers::metadata::get_routine_definition(id, &params).await,
@@ -48,7 +54,9 @@ pub async fn handle_line(line: &str) -> Value {
         "get_trigger_definition" => handlers::metadata::get_trigger_definition(id, &params).await,
         "get_schema_snapshot" => handlers::metadata::get_schema_snapshot(id, &params).await,
         "get_all_columns_batch" => handlers::metadata::get_all_columns_batch(id, &params).await,
-        "get_all_foreign_keys_batch" => handlers::metadata::get_all_foreign_keys_batch(id, &params).await,
+        "get_all_foreign_keys_batch" => {
+            handlers::metadata::get_all_foreign_keys_batch(id, &params).await
+        }
 
         // View mutation
         "create_view" => handlers::metadata::create_view(id, &params).await,
@@ -72,7 +80,9 @@ pub async fn handle_line(line: &str) -> Value {
         "get_add_column_sql" => handlers::ddl::get_add_column_sql(id, &params).await,
         "get_alter_column_sql" => handlers::ddl::get_alter_column_sql(id, &params).await,
         "get_create_index_sql" => handlers::ddl::get_create_index_sql(id, &params).await,
-        "get_create_foreign_key_sql" => handlers::ddl::get_create_foreign_key_sql(id, &params).await,
+        "get_create_foreign_key_sql" => {
+            handlers::ddl::get_create_foreign_key_sql(id, &params).await
+        }
         "drop_index" => handlers::ddl::drop_index(id, &params).await,
         "drop_foreign_key" => handlers::ddl::drop_foreign_key(id, &params).await,
 

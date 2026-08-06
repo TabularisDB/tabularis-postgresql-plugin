@@ -144,12 +144,8 @@ mod bind_pg_value_tests {
             enum_type: Some("\"public\".\"status\""),
             allow_default: false,
         };
-        let bound = bind_pg_value(
-            json!("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
-            1,
-            &options,
-        )
-        .unwrap();
+        let bound =
+            bind_pg_value(json!("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"), 1, &options).unwrap();
         assert_eq!(bound.sql, "CAST($1 AS \"public\".\"status\")");
     }
 

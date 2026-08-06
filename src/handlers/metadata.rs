@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 
 use crate::client;
-use crate::models::{ConnectionParams, inner_params};
+use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{error_response, not_implemented, ok_response};
 
 pub async fn get_databases(id: Value, params: &Value) -> Value {
@@ -72,7 +72,10 @@ pub async fn get_tables(id: Value, params: &Value) -> Value {
 pub async fn get_columns(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = r#"
         SELECT
@@ -140,7 +143,9 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
     };
 
     let is_auto_increment = is_identity == "YES"
-        || column_default.as_deref().map_or(false, |d| d.contains("nextval"));
+        || column_default
+            .as_deref()
+            .is_some_and(|d| d.contains("nextval"));
 
     let is_nullable = is_nullable_str == "YES";
 
@@ -161,7 +166,9 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
     });
 
     if let Some(dv) = default_value {
-        col.as_object_mut().unwrap().insert("default_value".to_string(), json!(dv));
+        col.as_object_mut()
+            .unwrap()
+            .insert("default_value".to_string(), json!(dv));
     }
     if let Some(len) = char_max_len.and_then(|v| u64::try_from(v).ok()) {
         col.as_object_mut()
@@ -175,7 +182,10 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
 pub async fn get_foreign_keys(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = r#"
         SELECT
@@ -250,7 +260,10 @@ pub async fn get_foreign_keys(id: Value, params: &Value) -> Value {
 pub async fn get_indexes(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = r#"
         SELECT
@@ -312,7 +325,10 @@ pub async fn get_indexes(id: Value, params: &Value) -> Value {
 }
 pub async fn get_views(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     match client::query_strings(
         &conn_params,
@@ -335,8 +351,14 @@ pub async fn get_views(id: Value, params: &Value) -> Value {
 
 pub async fn get_view_definition(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let view_name = params.get("view_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let qualified = crate::utils::identifiers::qualified(schema, view_name);
 
@@ -362,8 +384,14 @@ pub async fn get_view_definition(id: Value, params: &Value) -> Value {
 
 pub async fn get_view_columns(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let view_name = params.get("view_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = r#"
         SELECT
@@ -412,9 +440,18 @@ pub async fn get_view_columns(id: Value, params: &Value) -> Value {
 
 pub async fn create_view(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let view_name = params.get("view_name").and_then(Value::as_str).unwrap_or("");
-    let definition = params.get("definition").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let definition = params
+        .get("definition")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = format!(
         "CREATE VIEW {} AS {}",
@@ -429,9 +466,18 @@ pub async fn create_view(id: Value, params: &Value) -> Value {
 
 pub async fn alter_view(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let view_name = params.get("view_name").and_then(Value::as_str).unwrap_or("");
-    let definition = params.get("definition").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let definition = params
+        .get("definition")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = format!(
         "CREATE OR REPLACE VIEW {} AS {}",
@@ -446,8 +492,14 @@ pub async fn alter_view(id: Value, params: &Value) -> Value {
 
 pub async fn drop_view(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let view_name = params.get("view_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = format!(
         "DROP VIEW IF EXISTS {}",
@@ -461,7 +513,10 @@ pub async fn drop_view(id: Value, params: &Value) -> Value {
 
 pub async fn get_materialized_views(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     match client::query_strings(
         &conn_params,
@@ -484,8 +539,14 @@ pub async fn get_materialized_views(id: Value, params: &Value) -> Value {
 
 pub async fn get_materialized_view_columns(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let view_name = params.get("view_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     // Materialized views are not exposed via information_schema.columns, so
     // their columns must be read from the system catalog.
@@ -525,12 +586,20 @@ pub async fn get_materialized_view_columns(id: Value, params: &Value) -> Value {
     }
 }
 
-pub async fn get_materialized_view_definition(id: Value, _params: &Value) -> Value { not_implemented(id, "get_materialized_view_definition") }
+pub async fn get_materialized_view_definition(id: Value, _params: &Value) -> Value {
+    not_implemented(id, "get_materialized_view_definition")
+}
 
 pub async fn refresh_materialized_view(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let view_name = params.get("view_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = format!(
         "REFRESH MATERIALIZED VIEW {}",
@@ -538,13 +607,20 @@ pub async fn refresh_materialized_view(id: Value, params: &Value) -> Value {
     );
     match client::execute_typed(&conn_params, &query, &[]).await {
         Ok(_) => ok_response(id, Value::Null),
-        Err(e) => error_response(id, -32603, &format!("Failed to refresh materialized view: {}", e)),
+        Err(e) => error_response(
+            id,
+            -32603,
+            &format!("Failed to refresh materialized view: {}", e),
+        ),
     }
 }
 
 pub async fn get_routines(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     // PG 11+ uses prokind; older versions use proisagg/proiswindow flags.
     // CI runs PG 16, so we use the modern query.
@@ -583,8 +659,14 @@ pub async fn get_routines(id: Value, params: &Value) -> Value {
 
 pub async fn get_routine_parameters(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let routine_name = params.get("routine_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let routine_name = params
+        .get("routine_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let return_type_query = r#"
         SELECT data_type, routine_type
@@ -592,7 +674,13 @@ pub async fn get_routine_parameters(id: Value, params: &Value) -> Value {
         WHERE routine_schema = $1 AND routine_name = $2
         LIMIT 1
     "#;
-    let routine_info = match client::query_rows(&conn_params, return_type_query, &[&schema, &routine_name]).await {
+    let routine_info = match client::query_rows(
+        &conn_params,
+        return_type_query,
+        &[&schema, &routine_name],
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(e) => return error_response(id, -32603, &e),
     };
@@ -603,7 +691,8 @@ pub async fn get_routine_parameters(id: Value, params: &Value) -> Value {
         let routine_type: String = info.try_get("routine_type").unwrap_or_default();
         if routine_type == "FUNCTION" {
             let data_type: String = info.try_get("data_type").unwrap_or_default();
-            if !data_type.eq_ignore_ascii_case("void") && !data_type.eq_ignore_ascii_case("trigger") {
+            if !data_type.eq_ignore_ascii_case("void") && !data_type.eq_ignore_ascii_case("trigger")
+            {
                 parameters.push(json!({
                     "name": "",
                     "data_type": data_type,
@@ -643,8 +732,14 @@ pub async fn get_routine_parameters(id: Value, params: &Value) -> Value {
 
 pub async fn get_routine_definition(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let routine_name = params.get("routine_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let routine_name = params
+        .get("routine_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = r#"
         SELECT pg_get_functiondef(p.oid) as definition
@@ -668,7 +763,10 @@ pub async fn get_routine_definition(id: Value, params: &Value) -> Value {
 
 pub async fn get_triggers(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = r#"
         SELECT
@@ -708,9 +806,18 @@ pub async fn get_triggers(id: Value, params: &Value) -> Value {
 
 pub async fn get_trigger_definition(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let trigger_name = params.get("trigger_name").and_then(Value::as_str).unwrap_or("");
-    let table_name = params.get("table_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let trigger_name = params
+        .get("trigger_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let table_name = params
+        .get("table_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = r#"
         SELECT pg_get_triggerdef(t.oid, true) AS definition
@@ -738,7 +845,10 @@ pub async fn get_trigger_definition(id: Value, params: &Value) -> Value {
 
 pub async fn create_trigger(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let trigger_sql = params.get("trigger_sql").and_then(Value::as_str).unwrap_or("");
+    let trigger_sql = params
+        .get("trigger_sql")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     match client::execute_typed(&conn_params, trigger_sql, &[]).await {
         Ok(_) => ok_response(id, Value::Null),
@@ -748,9 +858,18 @@ pub async fn create_trigger(id: Value, params: &Value) -> Value {
 
 pub async fn drop_trigger(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let trigger_name = params.get("trigger_name").and_then(Value::as_str).unwrap_or("");
-    let table_name = params.get("table_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let trigger_name = params
+        .get("trigger_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let table_name = params
+        .get("table_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = format!(
         "DROP TRIGGER IF EXISTS {} ON {}",
@@ -763,6 +882,12 @@ pub async fn drop_trigger(id: Value, params: &Value) -> Value {
     }
 }
 
-pub async fn get_schema_snapshot(id: Value, _params: &Value) -> Value { not_implemented(id, "get_schema_snapshot") }
-pub async fn get_all_columns_batch(id: Value, _params: &Value) -> Value { not_implemented(id, "get_all_columns_batch") }
-pub async fn get_all_foreign_keys_batch(id: Value, _params: &Value) -> Value { not_implemented(id, "get_all_foreign_keys_batch") }
+pub async fn get_schema_snapshot(id: Value, _params: &Value) -> Value {
+    not_implemented(id, "get_schema_snapshot")
+}
+pub async fn get_all_columns_batch(id: Value, _params: &Value) -> Value {
+    not_implemented(id, "get_all_columns_batch")
+}
+pub async fn get_all_foreign_keys_batch(id: Value, _params: &Value) -> Value {
+    not_implemented(id, "get_all_foreign_keys_batch")
+}

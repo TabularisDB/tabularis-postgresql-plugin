@@ -68,7 +68,11 @@ pub fn bind_pg_value(
     // mismatch for json/jsonb columns.
     if let Some(ref bt) = base_type {
         if (bt == "JSON" || bt == "JSONB") && !matches!(value, Value::String(_) | Value::Null) {
-            let ty = if bt == "JSONB" { Type::JSONB } else { Type::JSON };
+            let ty = if bt == "JSONB" {
+                Type::JSONB
+            } else {
+                Type::JSON
+            };
             return Ok(BoundValue {
                 sql: format!("${}", placeholder_idx),
                 param: Some((Box::new(value), ty)),
@@ -169,18 +173,18 @@ fn bind_pg_string(
         match bt {
             "SMALLINT" | "INTEGER" | "BIGINT" | "INT2" | "INT4" | "INT8" | "SERIAL"
             | "BIGSERIAL" => {
-                let i: i64 = s
-                    .parse()
-                    .map_err(|_| format!("Cannot bind '{}' as integer for target type {}", s, bt))?;
+                let i: i64 = s.parse().map_err(|_| {
+                    format!("Cannot bind '{}' as integer for target type {}", s, bt)
+                })?;
                 return Ok(BoundValue {
                     sql: format!("CAST(${} AS bigint)", placeholder_idx),
                     param: Some((Box::new(i), Type::INT8)),
                 });
             }
             "NUMERIC" | "DECIMAL" => {
-                let d: Decimal = s
-                    .parse()
-                    .map_err(|_| format!("Cannot bind '{}' as numeric for target type {}", s, bt))?;
+                let d: Decimal = s.parse().map_err(|_| {
+                    format!("Cannot bind '{}' as numeric for target type {}", s, bt)
+                })?;
                 return Ok(BoundValue {
                     sql: format!("CAST(${} AS numeric)", placeholder_idx),
                     param: Some((Box::new(d), Type::NUMERIC)),
@@ -268,8 +272,8 @@ fn bind_pg_enum_string(s: &str, qualified_enum: &str, placeholder_idx: usize) ->
 fn decode_blob_wire_format(value: &str) -> Option<Vec<u8>> {
     let rest = value.strip_prefix("BLOB:")?;
     // Skip the size field, then the mime field.
-    let after_size = rest.splitn(2, ':').nth(1)?;
-    let base64_data = after_size.splitn(2, ':').nth(1)?;
+    let (_, after_size) = rest.split_once(':')?;
+    let (_, base64_data) = after_size.split_once(':')?;
     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data).ok()
 }
 
@@ -281,7 +285,13 @@ fn json_array_to_pg_literal(arr: &[Value]) -> Result<String, String> {
         let part = match elem {
             Value::String(s) => format!("'{}'", s.replace('\'', "''")),
             Value::Number(n) => n.to_string(),
-            Value::Bool(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+            Value::Bool(b) => {
+                if *b {
+                    "TRUE".to_string()
+                } else {
+                    "FALSE".to_string()
+                }
+            }
             Value::Null => "NULL".to_string(),
             Value::Array(nested) => json_array_to_pg_literal(nested)?,
             Value::Object(_) => return Err("Unsupported array element type".to_string()),
@@ -320,7 +330,7 @@ pub fn bind_pk_value(
             }
         }
         Value::String(s) => {
-            let is_uuid_type = base_type.as_deref().map_or(true, |t| t == "UUID");
+            let is_uuid_type = base_type.as_deref().is_none_or(|t| t == "UUID");
             if is_uuid_type {
                 if let Ok(uuid) = s.parse::<Uuid>() {
                     return Ok(BoundValue {
@@ -330,7 +340,7 @@ pub fn bind_pk_value(
                 }
             }
 
-            let is_int_type = base_type.as_deref().map_or(true, |t| {
+            let is_int_type = base_type.as_deref().is_none_or(|t| {
                 matches!(
                     t,
                     "SMALLINT" | "INTEGER" | "BIGINT" | "INT2" | "INT4" | "INT8"

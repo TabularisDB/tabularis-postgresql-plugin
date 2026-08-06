@@ -231,14 +231,18 @@ fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
     let key = connection_key(params);
 
     {
-        let pools = POOLS.lock().map_err(|_| "pool cache lock poisoned".to_string())?;
+        let pools = POOLS
+            .lock()
+            .map_err(|_| "pool cache lock poisoned".to_string())?;
         if let Some(pool) = pools.get(&key) {
             return Ok(pool.clone());
         }
     }
 
     let pool = build_pool(params)?;
-    let mut pools = POOLS.lock().map_err(|_| "pool cache lock poisoned".to_string())?;
+    let mut pools = POOLS
+        .lock()
+        .map_err(|_| "pool cache lock poisoned".to_string())?;
     // Another call may have raced us to create this pool between the read
     // above and this write — keep whichever is already cached.
     Ok(pools.entry(key).or_insert(pool).clone())
@@ -288,4 +292,3 @@ fn build_tls_connector() -> Result<rustls::ClientConfig, String> {
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod client_tests;
-

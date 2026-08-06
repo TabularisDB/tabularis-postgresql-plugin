@@ -5,20 +5,10 @@
 //! Reads newline-delimited JSON-RPC 2.0 requests from stdin and writes
 //! responses (one JSON object per line) to stdout. All handler logic is
 //! async (tokio) since the database pool requires an async runtime.
-#![allow(dead_code)]
 
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-mod binding;
-#[cfg(test)]
-mod binding_tests;
-mod client;
-mod error;
-mod extract;
-mod handlers;
-mod models;
-mod rpc;
-mod utils;
+use postgresql_plugin::rpc;
 
 #[tokio::main]
 async fn main() {

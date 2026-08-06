@@ -2,9 +2,9 @@
 
 use serde_json::Value;
 
-use crate::rpc::{ok_response, error_response};
-use crate::models::{ConnectionParams, inner_params};
 use crate::client;
+use crate::models::{inner_params, ConnectionParams};
+use crate::rpc::{error_response, ok_response};
 
 /// Receive plugin settings from the host. Currently a no-op.
 pub async fn initialize(id: Value, _params: &Value) -> Value {

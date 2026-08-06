@@ -16,32 +16,50 @@ use crate::rpc::{error_response, ok_response};
 use crate::utils::identifiers::qualified;
 
 pub async fn get_create_table_sql(id: Value, params: &Value) -> Value {
-    let table_name = params.get("table_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let table_name = params
+        .get("table_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
     let columns: Vec<ColumnDefinition> = params
         .get("columns")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    ok_response(id, Value::from(vec![build_create_table_sql(table_name, &columns, schema)]))
+    ok_response(
+        id,
+        Value::from(vec![build_create_table_sql(table_name, &columns, schema)]),
+    )
 }
 
 pub async fn get_add_column_sql(id: Value, params: &Value) -> Value {
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
     let column: Option<ColumnDefinition> = params
         .get("column")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     match column {
-        Some(column) => ok_response(id, Value::from(vec![build_add_column_sql(table, &column, schema)])),
+        Some(column) => ok_response(
+            id,
+            Value::from(vec![build_add_column_sql(table, &column, schema)]),
+        ),
         None => error_response(id, -32602, "Invalid params: missing or malformed 'column'"),
     }
 }
 
 pub async fn get_alter_column_sql(id: Value, params: &Value) -> Value {
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
     let old_column: Option<ColumnDefinition> = params
         .get("old_column")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -56,15 +74,28 @@ pub async fn get_alter_column_sql(id: Value, params: &Value) -> Value {
                 Err(e) => error_response(id, -32603, &e),
             }
         }
-        _ => error_response(id, -32602, "Invalid params: missing or malformed old_column/new_column"),
+        _ => error_response(
+            id,
+            -32602,
+            "Invalid params: missing or malformed old_column/new_column",
+        ),
     }
 }
 
 pub async fn get_create_index_sql(id: Value, params: &Value) -> Value {
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let index_name = params.get("index_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
-    let is_unique = params.get("is_unique").and_then(Value::as_bool).unwrap_or(false);
+    let index_name = params
+        .get("index_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
+    let is_unique = params
+        .get("is_unique")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let columns: Vec<String> = params
         .get("columns")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -72,7 +103,9 @@ pub async fn get_create_index_sql(id: Value, params: &Value) -> Value {
 
     ok_response(
         id,
-        Value::from(vec![build_create_index_sql(table, index_name, &columns, is_unique, schema)]),
+        Value::from(vec![build_create_index_sql(
+            table, index_name, &columns, is_unique, schema,
+        )]),
     )
 }
 
@@ -80,11 +113,20 @@ pub async fn get_create_foreign_key_sql(id: Value, params: &Value) -> Value {
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
     let fk_name = params.get("fk_name").and_then(Value::as_str).unwrap_or("");
     let column = params.get("column").and_then(Value::as_str).unwrap_or("");
-    let ref_table = params.get("ref_table").and_then(Value::as_str).unwrap_or("");
-    let ref_column = params.get("ref_column").and_then(Value::as_str).unwrap_or("");
+    let ref_table = params
+        .get("ref_table")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let ref_column = params
+        .get("ref_column")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let on_delete = params.get("on_delete").and_then(Value::as_str);
     let on_update = params.get("on_update").and_then(Value::as_str);
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     ok_response(
         id,
@@ -96,8 +138,14 @@ pub async fn get_create_foreign_key_sql(id: Value, params: &Value) -> Value {
 
 pub async fn drop_index(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
-    let index_name = params.get("index_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let index_name = params
+        .get("index_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = format!("DROP INDEX {}", qualified(schema, index_name));
     match client::execute_typed(&conn_params, &query, &[]).await {
@@ -110,7 +158,10 @@ pub async fn drop_foreign_key(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
     let fk_name = params.get("fk_name").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
 
     let query = format!(
         "ALTER TABLE {} DROP CONSTRAINT \"{}\"",
@@ -199,7 +250,12 @@ fn build_add_column_sql(table: &str, column: &ColumnDefinition, schema: &str) ->
 /// Normalize a data type string for cast-compatibility comparison:
 /// strip a trailing `(...)` and uppercase. E.g. `"varchar(255)"` -> `"VARCHAR"`.
 fn extract_base_type(data_type: &str) -> String {
-    data_type.split('(').next().unwrap_or(data_type).trim().to_uppercase()
+    data_type
+        .split('(')
+        .next()
+        .unwrap_or(data_type)
+        .trim()
+        .to_uppercase()
 }
 
 /// Whether an ALTER COLUMN TYPE from `old_type` to `new_type` can rely on
@@ -210,7 +266,14 @@ fn is_implicit_cast_compatible(old_type: &str, new_type: &str) -> bool {
     }
 
     const COMPATIBLE_GROUPS: &[&[&str]] = &[
-        &["SMALLINT", "INTEGER", "BIGINT", "SERIAL", "BIGSERIAL", "SMALLSERIAL"],
+        &[
+            "SMALLINT",
+            "INTEGER",
+            "BIGINT",
+            "SERIAL",
+            "BIGSERIAL",
+            "SMALLSERIAL",
+        ],
         &["REAL", "DOUBLE PRECISION", "NUMERIC", "DECIMAL", "MONEY"],
         &["CHAR", "VARCHAR", "TEXT", "NAME", "CITEXT"],
         &["TIMESTAMP", "TIMESTAMPTZ"],
@@ -236,7 +299,10 @@ fn build_alter_column_sql(
     let mut stmts = Vec::new();
 
     if old_column.name != new_column.name {
-        stmts.push(format!("ALTER TABLE {} RENAME COLUMN {} TO {}", tbl, old_name, new_name));
+        stmts.push(format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            tbl, old_name, new_name
+        ));
     }
 
     let col_ref = &new_name;
@@ -260,9 +326,15 @@ fn build_alter_column_sql(
 
     if old_column.is_nullable != new_column.is_nullable {
         if new_column.is_nullable {
-            stmts.push(format!("ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL", tbl, col_ref));
+            stmts.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL",
+                tbl, col_ref
+            ));
         } else {
-            stmts.push(format!("ALTER TABLE {} ALTER COLUMN {} SET NOT NULL", tbl, col_ref));
+            stmts.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
+                tbl, col_ref
+            ));
         }
     }
 
@@ -273,7 +345,10 @@ fn build_alter_column_sql(
                 tbl, col_ref, default
             ));
         } else {
-            stmts.push(format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT", tbl, col_ref));
+            stmts.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT",
+                tbl, col_ref
+            ));
         }
     }
 
@@ -283,7 +358,13 @@ fn build_alter_column_sql(
     Ok(stmts)
 }
 
-fn build_create_index_sql(table: &str, index_name: &str, columns: &[String], is_unique: bool, schema: &str) -> String {
+fn build_create_index_sql(
+    table: &str,
+    index_name: &str,
+    columns: &[String],
+    is_unique: bool,
+    schema: &str,
+) -> String {
     let unique = if is_unique { "UNIQUE " } else { "" };
     let cols: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
     format!(
@@ -295,6 +376,7 @@ fn build_create_index_sql(table: &str, index_name: &str, columns: &[String], is_
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_create_foreign_key_sql(
     table: &str,
     fk_name: &str,

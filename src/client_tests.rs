@@ -67,7 +67,11 @@ fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     let before = POOLS.lock().unwrap().len();
     get_or_create_pool(&p).expect("first call creates and caches a pool");
     let after_first = POOLS.lock().unwrap().len();
-    assert_eq!(after_first, before + 1, "first call should insert one entry");
+    assert_eq!(
+        after_first,
+        before + 1,
+        "first call should insert one entry"
+    );
     assert!(POOLS.lock().unwrap().contains_key(&key));
 
     get_or_create_pool(&p).expect("second call should hit the cache");

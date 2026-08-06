@@ -16,7 +16,10 @@ use crate::rpc::{error_response, ok_response};
 pub async fn insert_record(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
     let data = params
         .get("data")
         .and_then(Value::as_object)
@@ -35,7 +38,11 @@ async fn exec_insert(
     data: serde_json::Map<String, Value>,
     schema: &str,
 ) -> Result<u64, String> {
-    let qualified = format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\""));
+    let qualified = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        table.replace('"', "\"\"")
+    );
 
     // Stable column order: iterate the map once into a Vec (matches the
     // builtin's "lock in an arbitrary-but-consistent order" behavior).
@@ -46,8 +53,12 @@ async fn exec_insert(
         return client::execute_typed(conn_params, &query, &[]).await;
     }
 
-    let column_types = client::get_column_types_map(conn_params, table, schema).await.unwrap_or_default();
-    let enum_types = client::get_enum_column_types(conn_params, schema, table).await.unwrap_or_default();
+    let column_types = client::get_column_types_map(conn_params, table, schema)
+        .await
+        .unwrap_or_default();
+    let enum_types = client::get_enum_column_types(conn_params, schema, table)
+        .await
+        .unwrap_or_default();
 
     let mut cols: Vec<String> = Vec::with_capacity(entries.len());
     let mut sql_fragments: Vec<String> = Vec::with_capacity(entries.len());
@@ -88,7 +99,10 @@ async fn exec_insert(
 pub async fn update_record(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
     let col_name = params.get("col_name").and_then(Value::as_str).unwrap_or("");
     let new_val = params.get("new_val").cloned().unwrap_or(Value::Null);
     let pk_map = params
@@ -111,10 +125,18 @@ async fn exec_update(
     new_val: Value,
     schema: &str,
 ) -> Result<u64, String> {
-    let qualified = format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\""));
+    let qualified = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        table.replace('"', "\"\"")
+    );
 
-    let column_types = client::get_column_types_map(conn_params, table, schema).await.unwrap_or_default();
-    let enum_types = client::get_enum_column_types(conn_params, schema, table).await.unwrap_or_default();
+    let column_types = client::get_column_types_map(conn_params, table, schema)
+        .await
+        .unwrap_or_default();
+    let enum_types = client::get_enum_column_types(conn_params, schema, table)
+        .await
+        .unwrap_or_default();
 
     let options = BindOptions {
         column_type: column_types.get(col_name).map(String::as_str),
@@ -152,7 +174,10 @@ async fn exec_update(
 pub async fn delete_record(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let table = params.get("table").and_then(Value::as_str).unwrap_or("");
-    let schema = params.get("schema").and_then(Value::as_str).unwrap_or("public");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
     let pk_map = params
         .get("pk_map")
         .and_then(Value::as_object)
@@ -171,9 +196,15 @@ async fn exec_delete(
     pk_map: &serde_json::Map<String, Value>,
     schema: &str,
 ) -> Result<u64, String> {
-    let qualified = format!("\"{}\".\"{}\"", schema.replace('"', "\"\""), table.replace('"', "\"\""));
+    let qualified = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        table.replace('"', "\"\"")
+    );
 
-    let column_types = client::get_column_types_map(conn_params, table, schema).await.unwrap_or_default();
+    let column_types = client::get_column_types_map(conn_params, table, schema)
+        .await
+        .unwrap_or_default();
 
     let (predicate, owned_params) = build_pk_map_predicate(pk_map, &column_types, 1)?;
 

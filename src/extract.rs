@@ -21,10 +21,10 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
 
     // NULL check: try to get as Option first
     match col_type {
-        ref t if *t == Type::BOOL => try_extract::<bool>(row, index, |v| JsonValue::Bool(v)),
-        ref t if *t == Type::INT2 => try_extract::<i16>(row, index, |v| JsonValue::from(v)),
-        ref t if *t == Type::INT4 => try_extract::<i32>(row, index, |v| JsonValue::from(v)),
-        ref t if *t == Type::INT8 => try_extract::<i64>(row, index, |v| i64_to_json(v)),
+        ref t if *t == Type::BOOL => try_extract::<bool>(row, index, JsonValue::Bool),
+        ref t if *t == Type::INT2 => try_extract::<i16>(row, index, JsonValue::from),
+        ref t if *t == Type::INT4 => try_extract::<i32>(row, index, JsonValue::from),
+        ref t if *t == Type::INT8 => try_extract::<i64>(row, index, i64_to_json),
         ref t if *t == Type::FLOAT4 => try_extract::<f32>(row, index, |v| {
             serde_json::Number::from_f64(v as f64)
                 .map(JsonValue::Number)
@@ -35,15 +35,20 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
                 .map(JsonValue::Number)
                 .unwrap_or(JsonValue::Null)
         }),
-        ref t if *t == Type::NUMERIC => try_extract::<Decimal>(row, index, |v| {
-            JsonValue::String(v.to_string())
-        }),
-        ref t if *t == Type::TEXT || *t == Type::VARCHAR || *t == Type::BPCHAR || *t == Type::NAME => {
+        ref t if *t == Type::NUMERIC => {
+            try_extract::<Decimal>(row, index, |v| JsonValue::String(v.to_string()))
+        }
+        ref t
+            if *t == Type::TEXT
+                || *t == Type::VARCHAR
+                || *t == Type::BPCHAR
+                || *t == Type::NAME =>
+        {
             try_extract::<String>(row, index, JsonValue::String)
         }
-        ref t if *t == Type::UUID => try_extract::<Uuid>(row, index, |v| {
-            JsonValue::String(v.to_string())
-        }),
+        ref t if *t == Type::UUID => {
+            try_extract::<Uuid>(row, index, |v| JsonValue::String(v.to_string()))
+        }
         ref t if *t == Type::DATE => try_extract::<NaiveDate>(row, index, |v| {
             JsonValue::String(v.format("%Y-%m-%d").to_string())
         }),
@@ -65,19 +70,20 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         }
         ref t if *t == Type::BYTEA => try_extract::<Vec<u8>>(row, index, |v| {
             let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &v);
-            JsonValue::String(format!(
-                "BLOB:{}:application/octet-stream:{}",
-                v.len(),
-                b64
-            ))
+            JsonValue::String(format!("BLOB:{}:application/octet-stream:{}", v.len(), b64))
         }),
         ref t if *t == Type::INET || *t == Type::CIDR => {
             try_extract::<CidrOrInet>(row, index, JsonValue::from)
         }
         ref t if *t == Type::MACADDR => try_extract::<MacAddr>(row, index, JsonValue::from),
-        ref t if *t == Type::OID => try_extract::<u32>(row, index, |v| JsonValue::from(v)),
-        ref t if *t == Type::INT4_RANGE || *t == Type::INT8_RANGE || *t == Type::NUM_RANGE
-            || *t == Type::TS_RANGE || *t == Type::TSTZ_RANGE || *t == Type::DATE_RANGE =>
+        ref t if *t == Type::OID => try_extract::<u32>(row, index, JsonValue::from),
+        ref t
+            if *t == Type::INT4_RANGE
+                || *t == Type::INT8_RANGE
+                || *t == Type::NUM_RANGE
+                || *t == Type::TS_RANGE
+                || *t == Type::TSTZ_RANGE
+                || *t == Type::DATE_RANGE =>
         {
             try_extract_range(row, index)
         }
@@ -144,11 +150,7 @@ fn i64_to_json(v: i64) -> JsonValue {
 
 /// Helper: try to extract a typed value from the row, returning JsonValue::Null
 /// on any failure (NULL column, type mismatch, etc.).
-fn try_extract<'a, T>(
-    row: &'a Row,
-    index: usize,
-    map: impl FnOnce(T) -> JsonValue,
-) -> JsonValue
+fn try_extract<'a, T>(row: &'a Row, index: usize, map: impl FnOnce(T) -> JsonValue) -> JsonValue
 where
     T: tokio_postgres::types::FromSql<'a>,
 {
@@ -184,7 +186,10 @@ fn try_extract_range(row: &Row, index: usize) -> JsonValue {
 struct RangeValue(String);
 
 impl<'a> FromSql<'a> for RangeValue {
-    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         let subtype = match ty.kind() {
             Kind::Range(t) => t.clone(),
             _ => return Err("expected a range type".into()),
@@ -275,8 +280,12 @@ fn extract_range_bound(subtype: &Type, buf: &mut &[u8]) -> Option<String> {
 /// numeric, date/timestamp). Falls back to Null for anything else.
 fn extract_simple_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
     match *ty {
-        Type::INT4 => i32::from_sql(ty, buf).map(JsonValue::from).unwrap_or(JsonValue::Null),
-        Type::INT8 => i64::from_sql(ty, buf).map(i64_to_json).unwrap_or(JsonValue::Null),
+        Type::INT4 => i32::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        Type::INT8 => i64::from_sql(ty, buf)
+            .map(i64_to_json)
+            .unwrap_or(JsonValue::Null),
         Type::NUMERIC => Decimal::from_sql(ty, buf)
             .map(|v| JsonValue::String(v.to_string()))
             .unwrap_or(JsonValue::Null),
@@ -440,15 +449,27 @@ impl From<Interval> for JsonValue {
         let mut s = String::new();
 
         if v.years != 0 {
-            let unit = if v.years == 1 || v.years == -1 { "year" } else { "years" };
+            let unit = if v.years == 1 || v.years == -1 {
+                "year"
+            } else {
+                "years"
+            };
             s.push_str(&format!("{} {} ", v.years, unit));
         }
         if v.months != 0 {
-            let unit = if v.months == 1 || v.months == -1 { "month" } else { "months" };
+            let unit = if v.months == 1 || v.months == -1 {
+                "month"
+            } else {
+                "months"
+            };
             s.push_str(&format!("{} {} ", v.months, unit));
         }
         if v.days != 0 {
-            let unit = if v.days == 1 || v.days == -1 { "day" } else { "days" };
+            let unit = if v.days == 1 || v.days == -1 {
+                "day"
+            } else {
+                "days"
+            };
             s.push_str(&format!("{} {} ", v.days, unit));
         }
         if v.hours != 0 || v.minutes != 0 || v.seconds != 0 || v.microseconds != 0 {

@@ -67,4 +67,3 @@ pub struct ColumnDefinition {
     pub is_auto_increment: bool,
     pub default_value: Option<String>,
 }
-
