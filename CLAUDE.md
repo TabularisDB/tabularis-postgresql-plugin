@@ -2,16 +2,22 @@
 
 ## Status
 
-The plugin source has landed here as a **parallel copy** of the in-tree
-implementation at `TabularisDB/tabularis`'s `plugins/postgres-plugin/`,
-which remains the source of truth for now — nothing has been removed from
-there, and the two copies are kept in sync manually until a later, separate
-decision to deprecate the in-tree copy (see `docs/planning/
-04-phase-3-deprecate-builtin.md`). The org's CP-4 beta-release gate (80/80
-parity, 72 baseline, 26 golden, manual smoke, core-team sync — see
-`docs/planning/02-phase-1-plugin-build.md`) has not formally closed even
-though the latest source commit claims 82/82 parity; treat that as
-proceeding ahead of the documented trigger point, not as the gate being met.
+This repo is intended to become the **primary home** for the PostgreSQL
+plugin, pending sign-off. Once that happens, `TabularisDB/tabularis` PR #577
+pivots from building the plugin in-tree to removing the built-in driver —
+see `docs/planning/04-phase-3-deprecate-builtin.md`. For now, leave
+`tabularis`'s `plugins/postgres-plugin/` untouched; this repo only receives
+additions, nothing is removed from there.
+
+The plugin source has landed here as a copy of the in-tree implementation
+at commit `ad765f3a` (Phase 1 byte-for-byte parity proven: 82/82 parity,
+72/72 baseline, 26/26 golden tests, 72 plugin unit tests — see
+`docs/planning/02-phase-1-plugin-build.md` and
+[`tabularis` PR #577](https://github.com/TabularisDB/tabularis/pull/577)).
+Sign-off to promote this repo to primary is still pending several items
+from that PR's own checklist: cross-platform build verification (only
+macOS ARM confirmed so far), the 24-item manual smoke test, a security
+audit pass, and a frontend regression check (`pnpm test` in `tabularis`).
 
 ## Build & Test
 

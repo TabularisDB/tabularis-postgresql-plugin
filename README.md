@@ -22,14 +22,16 @@ directly into the Tabularis application. It is byte-for-byte behaviorally
 identical to that built-in driver, proven by an 82-test parity suite that runs
 both drivers against the same live database and compares every response.
 
-> ⚠️ **Work in progress** — the plugin source has landed here as a
-> parallel copy of the in-tree implementation at
-> [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin),
-> which remains the source of truth for now — nothing has been removed
-> from there yet, and the two copies are kept in sync manually. See
-> [the migration plan](./docs/planning/02-phase-1-plugin-build.md#repo-extraction--timing-and-open-question)
-> for background on the extraction timing and the CP-4 beta-release gate,
-> which has not yet formally closed.
+> ⚠️ **Work in progress** — this repo is intended to become the **primary
+> home** for the PostgreSQL plugin, pending sign-off. The plugin source has
+> landed here (Phase 1 byte-for-byte parity proven: 82/82 parity, 72/72
+> baseline, 26/26 golden tests — see
+> [the migration plan](./docs/planning/02-phase-1-plugin-build.md)), but
+> the [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin)
+> copy is left untouched for now. Once this repo is signed off as the beta
+> release source of truth, [`tabularis` PR #577](https://github.com/TabularisDB/tabularis/pull/577)
+> will pivot from building the plugin in-tree to removing the built-in
+> driver.
 
 ## Table of Contents
 
