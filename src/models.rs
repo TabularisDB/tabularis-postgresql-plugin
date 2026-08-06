@@ -19,6 +19,7 @@ pub struct ConnectionParams {
     pub ssl_cert: Option<String>,
     pub ssl_key: Option<String>,
     pub connection_string: Option<String>,
+    pub startup_script: Option<String>,
 }
 
 impl ConnectionParams {
@@ -46,6 +47,7 @@ impl ConnectionParams {
             ssl_cert: get_str("ssl_cert"),
             ssl_key: get_str("ssl_key"),
             connection_string: get_str("connection_string"),
+            startup_script: get_str("startup_script"),
         }
     }
 }

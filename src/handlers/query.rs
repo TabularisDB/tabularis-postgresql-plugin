@@ -44,7 +44,7 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     let schema = params.get("schema").and_then(Value::as_str);
 
     // Acquire ONE connection for the entire batch (session state must survive)
-    let pool = match client::build_pool_pub(&conn_params) {
+    let pool = match client::build_pool_pub(&conn_params).await {
         Ok(p) => p,
         Err(e) => return error_response(id, -32603, &e),
     };
@@ -124,7 +124,7 @@ async fn exec_query(
     page: u32,
     schema: Option<&str>,
 ) -> Result<Value, String> {
-    let pool = client::build_pool_pub(conn_params)?;
+    let pool = client::build_pool_pub(conn_params).await?;
     let pg_client = pool
         .get()
         .await

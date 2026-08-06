@@ -19,6 +19,7 @@
 //! that gap.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
@@ -33,7 +34,7 @@ static POOLS: LazyLock<Mutex<HashMap<String, Pool>>> = LazyLock::new(|| Mutex::n
 /// Build a connection pool from the given params and verify connectivity
 /// by acquiring one client and running `SELECT 1`.
 pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
-    let pool = get_or_create_pool(params)?;
+    let pool = get_or_create_pool(params).await?;
     let client = pool
         .get()
         .await
@@ -53,7 +54,7 @@ pub async fn query_strings(
     query_params: &[&(dyn ToSql + Sync)],
     column: &str,
 ) -> Result<Vec<String>, String> {
-    let pool = get_or_create_pool(params)?;
+    let pool = get_or_create_pool(params).await?;
     let client = pool
         .get()
         .await
@@ -76,7 +77,7 @@ pub async fn query_rows(
     query: &str,
     query_params: &[&(dyn ToSql + Sync)],
 ) -> Result<Vec<Row>, String> {
-    let pool = get_or_create_pool(params)?;
+    let pool = get_or_create_pool(params).await?;
     let client = pool
         .get()
         .await
@@ -96,7 +97,7 @@ pub async fn execute_typed(
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<u64, String> {
-    let pool = get_or_create_pool(params)?;
+    let pool = get_or_create_pool(params).await?;
     let client = pool
         .get()
         .await
@@ -120,7 +121,7 @@ pub async fn query_typed(
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<Vec<Row>, String> {
-    let pool = get_or_create_pool(params)?;
+    let pool = get_or_create_pool(params).await?;
     let client = pool
         .get()
         .await
@@ -208,26 +209,28 @@ fn quote_qualified_type(type_schema: &str, type_name: &str) -> String {
 /// Get the cached pool for these connection params, creating and caching one
 /// on first use. Public for use by query handlers that need direct pool
 /// access (e.g. to acquire one client for a multi-statement batch).
-pub fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
-    get_or_create_pool(params)
+pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
+    get_or_create_pool(params).await
 }
 
 /// Identifies a connection target for pool-cache purposes.
-/// Matches on host:port:database:user — sufficient for this plugin's scope
-/// (no per-connection TLS-mode/connection_id refinement, unlike the builtin).
+/// Matches on host:port:database:user (plus the startup script, so editing
+/// it forces a fresh pool) — sufficient for this plugin's scope (no
+/// per-connection TLS-mode/connection_id refinement, unlike the builtin).
 fn connection_key(params: &ConnectionParams) -> String {
     format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         params.host.as_deref().unwrap_or(""),
         params.port.unwrap_or(5432),
         params.database.as_deref().unwrap_or(""),
         params.username.as_deref().unwrap_or(""),
+        params.startup_script.as_deref().unwrap_or(""),
     )
 }
 
 /// Return the cached pool for this connection's identity, or build and cache
 /// a new one if this is the first request for that identity.
-fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
+async fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
     let key = connection_key(params);
 
     {
@@ -239,7 +242,7 @@ fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
         }
     }
 
-    let pool = build_pool(params)?;
+    let pool = build_pool(params).await?;
     let mut pools = POOLS
         .lock()
         .map_err(|_| "pool cache lock poisoned".to_string())?;
@@ -249,25 +252,142 @@ fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
 }
 
 /// Build a deadpool-postgres pool for the given connection parameters.
-fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
+///
+/// When `connection_string` is set, it takes precedence over the discrete
+/// host/port/database/username/password fields — matching the README's
+/// documented behavior ("as an alternative to the discrete fields above").
+async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
     let mut cfg = Config::new();
-    cfg.host = params.host.clone();
-    cfg.port = params.port;
-    cfg.dbname = params.database.clone();
-    cfg.user = params.username.clone();
-    cfg.password = params.password.clone();
+
+    match params
+        .connection_string
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(conn_str) => {
+            let parsed = tokio_postgres::Config::from_str(conn_str)
+                .map_err(|e| format!("Invalid connection string: {e}"))?;
+            let host = parsed.get_hosts().first().and_then(|h| match h {
+                tokio_postgres::config::Host::Tcp(host) => Some(host.clone()),
+                #[cfg(unix)]
+                tokio_postgres::config::Host::Unix(_) => None,
+            });
+            cfg.host = host;
+            cfg.port = parsed.get_ports().first().copied();
+            cfg.dbname = parsed.get_dbname().map(str::to_string);
+            cfg.user = parsed.get_user().map(str::to_string);
+            cfg.password = parsed
+                .get_password()
+                .map(|p| String::from_utf8_lossy(p).into_owned());
+        }
+        None => {
+            cfg.host = params.host.clone();
+            cfg.port = params.port;
+            cfg.dbname = params.database.clone();
+            cfg.user = params.username.clone();
+            cfg.password = params.password.clone();
+        }
+    }
+
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
 
+    let script = params
+        .startup_script
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     if needs_tls(params) {
-        let tls_config = build_tls_connector()?;
-        cfg.create_pool(Some(Runtime::Tokio1), MakeRustlsConnect::new(tls_config))
+        let tls_config = build_tls_connector(params)?;
+        let tls = MakeRustlsConnect::new(tls_config);
+        if let Some(script) = script {
+            preflight_startup_script(&cfg, tls.clone(), script).await?;
+        }
+        let mut builder = cfg
+            .builder(tls)
+            .map_err(|e| format!("Pool creation failed (TLS): {e}"))?
+            .runtime(Runtime::Tokio1);
+        if let Some(script) = script {
+            builder = builder.post_create(startup_script_hook(script));
+        }
+        builder
+            .build()
             .map_err(|e| format!("Pool creation failed (TLS): {e}"))
     } else {
-        cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+        if let Some(script) = script {
+            preflight_startup_script(&cfg, NoTls, script).await?;
+        }
+        let mut builder = cfg
+            .builder(NoTls)
+            .map_err(|e| format!("Pool creation failed: {e}"))?
+            .runtime(Runtime::Tokio1);
+        if let Some(script) = script {
+            builder = builder.post_create(startup_script_hook(script));
+        }
+        builder
+            .build()
             .map_err(|e| format!("Pool creation failed: {e}"))
     }
+}
+
+/// Format a startup-script execution failure so the surfaced error clearly
+/// names the startup script as the cause, instead of reading like a bad host
+/// or wrong credentials.
+fn startup_script_error(err: impl std::fmt::Display) -> String {
+    format!("Startup script failed: {err}")
+}
+
+/// Build the `post_create` hook that runs the startup script on every new
+/// pooled connection (matches the builtin driver's `post_create` hook — see
+/// `src-tauri/src/pool_manager.rs`).
+fn startup_script_hook(script: &str) -> deadpool_postgres::Hook {
+    let script = script.to_string();
+    deadpool_postgres::Hook::async_fn(move |client, _metrics| {
+        let script = script.clone();
+        Box::pin(async move {
+            client
+                .batch_execute(&script)
+                .await
+                .map_err(|e| deadpool_postgres::HookError::message(startup_script_error(e)))?;
+            Ok(())
+        })
+    })
+}
+
+/// Validate the startup script on a throwaway connection so a broken script
+/// fails fast with a clearly attributed error, **without** applying its side
+/// effects (the script runs inside a transaction that is rolled back). This
+/// preflight exists only for early, well-labelled failures — the per-pool
+/// `post_create` hook is the single place the script actually takes effect.
+/// Matches the builtin driver's `run_postgres_startup_script` preflight.
+async fn preflight_startup_script<T>(cfg: &Config, tls: T, script: &str) -> Result<(), String>
+where
+    T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone + Sync + Send + 'static,
+    T::Stream: Sync + Send,
+    T::TlsConnect: Sync + Send,
+    <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
+{
+    let pg_config = cfg
+        .get_pg_config()
+        .map_err(|e| format!("Pool creation failed: {e}"))?;
+    let (mut client, connection) = pg_config
+        .connect(tls)
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let outcome: Result<(), tokio_postgres::Error> = async {
+        let tx = client.transaction().await?;
+        tx.batch_execute(script).await?;
+        tx.rollback().await
+    }
+    .await;
+    drop(client);
+    driver.abort();
+    outcome.map_err(startup_script_error)
 }
 
 /// Determine whether TLS should be used based on ssl_mode.
@@ -278,15 +398,61 @@ fn needs_tls(params: &ConnectionParams) -> bool {
     )
 }
 
-/// Build a rustls ClientConfig using the platform certificate verifier.
-fn build_tls_connector() -> Result<rustls::ClientConfig, String> {
+/// Build a rustls ClientConfig. `verify-ca`/`verify-full` validate the
+/// server's certificate chain — against a caller-supplied CA bundle
+/// (`ssl_ca`) when present, or the platform trust store otherwise. `require`
+/// forces TLS without certificate validation (matches the builtin driver's
+/// `require` behavior — see `src-tauri/src/pool_manager.rs`).
+fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig, String> {
     use rustls_platform_verifier::BuilderVerifierExt;
+
+    let user_ca = params.ssl_ca.as_deref().filter(|s| !s.trim().is_empty());
+
+    let needs_cert_validation = matches!(
+        params.ssl_mode.as_deref(),
+        Some("verify-ca" | "verify-full")
+    );
+
+    if needs_cert_validation {
+        if let Some(ca_path) = user_ca {
+            let roots = load_roots_from_pem(ca_path)?;
+            let verifier =
+                rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots))
+                    .build()
+                    .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
+            return Ok(rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth());
+        }
+    }
 
     let config = rustls::ClientConfig::builder()
         .with_platform_verifier()
         .map_err(|e| format!("Failed to build platform TLS verifier: {e}"))?
         .with_no_client_auth();
     Ok(config)
+}
+
+/// Load root certificates from a PEM file (used for `ssl_ca`-pinned
+/// `verify-ca`/`verify-full` connections).
+fn load_roots_from_pem(path: &str) -> Result<rustls::RootCertStore, String> {
+    let pem =
+        std::fs::read(path).map_err(|e| format!("Failed to read ssl_ca file '{path}': {e}"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(&pem[..]);
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        let cert = cert.map_err(|e| format!("Failed to parse ssl_ca '{path}': {e}"))?;
+        roots
+            .add(cert)
+            .map_err(|e| format!("Failed to add ssl_ca cert from '{path}': {e}"))?;
+    }
+    if roots.is_empty() {
+        return Err(format!(
+            "ssl_ca '{path}' contained no PEM CERTIFICATE blocks"
+        ));
+    }
+    Ok(roots)
 }
 
 #[cfg(test)]

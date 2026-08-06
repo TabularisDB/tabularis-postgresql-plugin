@@ -17,6 +17,7 @@ fn params(host: &str, port: u16, db: &str, user: &str) -> ConnectionParams {
         ssl_cert: None,
         ssl_key: None,
         connection_string: None,
+        startup_script: None,
     }
 }
 
@@ -55,17 +56,20 @@ fn connection_key_is_stable_for_identical_params() {
     assert_eq!(a, b);
 }
 
-#[test]
-fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
+#[tokio::test]
+async fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     // deadpool's Pool::new is lazy (no connection attempt at creation
-    // time), so this exercises only the cache bookkeeping, not real
-    // connectivity. Use a key unlikely to collide with other tests
-    // running in the same process.
+    // time) as long as no startup script is set — this test's `params()`
+    // helper leaves startup_script as None, so this exercises only the
+    // cache bookkeeping, not real connectivity. Use a key unlikely to
+    // collide with other tests running in the same process.
     let p = params("cache-test-host-unique", 5432, "db", "user");
     let key = connection_key(&p);
 
     let before = POOLS.lock().unwrap().len();
-    get_or_create_pool(&p).expect("first call creates and caches a pool");
+    get_or_create_pool(&p)
+        .await
+        .expect("first call creates and caches a pool");
     let after_first = POOLS.lock().unwrap().len();
     assert_eq!(
         after_first,
@@ -74,7 +78,9 @@ fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     );
     assert!(POOLS.lock().unwrap().contains_key(&key));
 
-    get_or_create_pool(&p).expect("second call should hit the cache");
+    get_or_create_pool(&p)
+        .await
+        .expect("second call should hit the cache");
     let after_second = POOLS.lock().unwrap().len();
     assert_eq!(
         after_second, after_first,
