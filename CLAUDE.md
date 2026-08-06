@@ -2,16 +2,18 @@
 
 ## Status
 
-This repo currently holds only repo-level scaffolding (license, CI/release
-workflow shape, contributor docs). The plugin source itself
-(`Cargo.toml`, `src/`, `.tabularium`) has not been migrated yet — it still
-lives at `TabularisDB/tabularis`'s `plugins/postgres-plugin/`. Do not assume
-the CI workflow passes or that a `cargo build` will succeed until that
-migration lands.
+The plugin source has landed here as a **parallel copy** of the in-tree
+implementation at `TabularisDB/tabularis`'s `plugins/postgres-plugin/`,
+which remains the source of truth for now — nothing has been removed from
+there, and the two copies are kept in sync manually until a later, separate
+decision to deprecate the in-tree copy (see `docs/planning/
+04-phase-3-deprecate-builtin.md`). The org's CP-4 beta-release gate (80/80
+parity, 72 baseline, 26 golden, manual smoke, core-team sync — see
+`docs/planning/02-phase-1-plugin-build.md`) has not formally closed even
+though the latest source commit claims 82/82 parity; treat that as
+proceeding ahead of the documented trigger point, not as the gate being met.
 
 ## Build & Test
-
-Once the source has been migrated:
 
 ```bash
 cargo build              # Debug build
@@ -20,6 +22,35 @@ cargo test               # Run all tests
 cargo clippy --all-targets -- -D warnings  # Lint
 cargo fmt --all          # Format
 ```
+
+## Cross-Repo Parity Check
+
+This repo has no live-database parity suite of its own — the 82-test
+byte-for-byte comparison against the built-in driver lives in
+`tabularis`'s `src-tauri/tests/postgres_integration/parity*.rs` and is not
+duplicated here (see `docs/planning/02-phase-1-plugin-build.md`'s "Repo
+Extraction" section for the open question on where those tests should live
+long-term). That suite resolves the plugin binary purely through the
+`POSTGRES_PLUGIN_BIN` env var, so it can validate this repo's binary with
+zero changes on the `tabularis` side. Re-run this any time this repo's
+source diverges from the in-tree copy, to catch parity drift immediately:
+
+```bash
+# 1. Build the release binary from this repo
+cargo build --release
+STANDALONE_BIN="$PWD/target/release/postgresql-plugin"
+
+# 2. Point tabularis's existing (unmodified) parity suite at it
+cd /path/to/tabularis
+bash tests/fixtures/seed_postgres.sh
+POSTGRES_PLUGIN_BIN="$STANDALONE_BIN" RUST_TEST_THREADS=1 \
+  cargo test --manifest-path src-tauri/Cargo.toml --test postgres_integration parity -- --include-ignored
+```
+
+Expected result: the same 82/82 that the in-tree binary produces. Any test
+going RED here means the extraction changed behavior and must be fixed
+before merging — the same red→green discipline used throughout the
+migration, now applied across the repo boundary.
 
 ## Architecture Rules
 

@@ -1,7 +1,6 @@
 {
   "$schema": "https://registry.tabularis.dev/manifest.schema.json?kind=driver",
-  "id": "postgres-plugin",
-  "name": "postgres-plugin",
+  "name": "postgresql",
   "version": "0.1.0",
   "description": "PostgreSQL plugin driver for Tabularis (parity implementation)",
   "kind": "driver",

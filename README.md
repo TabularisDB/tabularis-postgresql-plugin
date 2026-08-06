@@ -22,14 +22,14 @@ directly into the Tabularis application. It is byte-for-byte behaviorally
 identical to that built-in driver, proven by an 82-test parity suite that runs
 both drivers against the same live database and compares every response.
 
-> ⚠️ **Work in progress** — this repo currently holds only the repo-level
-> basics (license, CI/release workflow shape, contributor docs). The actual
-> plugin source (`Cargo.toml`, `src/`, `.tabularium` manifest) has not been
-> migrated yet — it still lives at
-> [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin)
-> pending the CP-4 extraction (see
-> [the migration plan](https://github.com/TabularisDB/tabularis/blob/main/.github/planning/postgres-plugin/02-phase-1-plugin-build.md#repo-extraction--timing-and-open-question)).
-> The CI workflow in this repo will not pass until that source lands.
+> ⚠️ **Work in progress** — the plugin source has landed here as a
+> parallel copy of the in-tree implementation at
+> [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin),
+> which remains the source of truth for now — nothing has been removed
+> from there yet, and the two copies are kept in sync manually. See
+> [the migration plan](./docs/planning/02-phase-1-plugin-build.md#repo-extraction--timing-and-open-question)
+> for background on the extraction timing and the CP-4 beta-release gate,
+> which has not yet formally closed.
 
 ## Table of Contents
 
