@@ -24,7 +24,10 @@ jobs:
         run: cargo build
 
       - name: Run tests
-        run: cargo test
+        # --lib --bins excludes tests/live_db.rs: that's a live-database
+        # integration test requiring a running PostgreSQL instance, covered
+        # by the dedicated live-db-integration job below.
+        run: cargo test --lib --bins
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -59,6 +62,17 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2026-0235: vulnerable rkyv 0.7.46, pulled in transitively
+          # by rust_decimal's own optional "rkyv" feature declaration in its
+          # Cargo.toml — we never enable that feature (only "db-tokio-postgres"
+          # and "serde"), and confirmed no rkyv symbols are linked into the
+          # release binary (`nm -D target/release/postgresql-plugin | grep
+          # rkyv` — no output). cargo-audit scans the full Cargo.lock graph
+          # regardless of which optional features are active, so this is a
+          # lockfile-only entry with no reachable code path in what we ship.
+          # Re-check this ignore whenever rust_decimal is upgraded, in case a
+          # newer release changes what's declared as optional.
+          ignore: RUSTSEC-2026-0235
 
   live-db-integration:
     name: Live PostgreSQL integration

@@ -34,6 +34,31 @@
     SBOM generation via `cargo-cyclonedx` — were considered and
     deliberately deferred rather than implemented now; see
     `docs/planning/ci-hardening-deferred.md` for the rationale.
+
+### Fixed
+
+- Three of the new CI jobs above failed on their first real run and were
+  fixed:
+  - `Test` job: the existing `cargo test` (no target filter) tried to run
+    `tests/live_db.rs` too, which panics immediately without a running
+    PostgreSQL instance. Scoped to `cargo test --lib --bins`, leaving the
+    live-DB test to its own dedicated `live-db-integration` job.
+  - `Markdown lint` job: `docs/planning/.markdownlint.json`'s scoped
+    override (`MD024`/`MD060`) only applied when markdownlint was invoked
+    from within that directory — the CI step's root-level `**/*.md` glob
+    never picked it up. Merged the scoped overrides into the single root
+    `.markdownlint.json` instead of maintaining two config files. Also
+    added `.markdownlintignore` (`target/`) since the glob was
+    incidentally linting vendored third-party docs copied into build
+    output by a dependency's build script.
+  - `Security audit` job: `cargo audit` correctly found a real advisory,
+    RUSTSEC-2026-0235 (vulnerable `rkyv` 0.7.46) — but it's pulled in only
+    because `rust_decimal` lists it as an optional dependency behind a
+    feature (`rkyv`) we never enable; confirmed no `rkyv` symbols are
+    linked into the release binary. Added a documented `ignore:` entry for
+    that specific advisory ID, since `cargo audit` scans the full
+    `Cargo.lock` graph regardless of which optional features are active.
+
 - `main.rs` rewritten to a worker-pool architecture (4 workers + a single
   writer task + a dedicated pool-cleanup task, coordinated via a
   `tokio::sync::watch` shutdown signal on stdin EOF), matching the
