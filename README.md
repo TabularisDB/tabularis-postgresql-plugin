@@ -45,6 +45,7 @@ both drivers against the same live database and compares every response.
 - [Supported Operations](#supported-operations)
 - [Building from Source](#building-from-source)
 - [Development](#development)
+  - [Contributing: PR Titles & Versioning](#contributing-pr-titles--versioning)
 - [Changelog](#changelog)
 - [License](#license)
 
@@ -209,6 +210,31 @@ just fmt     # cargo fmt --all
 echo '{"jsonrpc":"2.0","method":"test_connection","params":{"params":{"host":"127.0.0.1","port":5432,"username":"postgres","password":"password","database":"testdb"}},"id":1}' \
   | ./target/release/postgresql-plugin
 ```
+
+### Contributing: PR Titles & Versioning
+
+PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/)
+(`type: subject`, `type(scope): subject`, or `type!: subject` for a breaking
+change) — enforced by CI on every PR. Add a `BREAKING CHANGE:` footer to the
+PR description for breaking changes that don't fit cleanly into the title.
+
+Every PR also needs exactly one `prerelease:alpha` / `prerelease:beta` /
+`prerelease:rc` / `prerelease:stable` label, so CI knows which release
+channel to target when suggesting the next version. There's no default —
+CI fails with a clear error if the label is missing, rather than guessing.
+
+| PR title type | Version impact |
+| --- | --- |
+| `feat` | minor |
+| `fix`, `refactor`, `perf` | patch |
+| `docs`, `style`, `chore`, `test`, `ci`, `build` | none — no release suggested |
+| any type with `!` or a `BREAKING CHANGE:` footer | major |
+
+CI posts a comment on the PR suggesting the next tag/version based on the
+title's type and the `prerelease:*` label — informational only, nothing is
+tagged or released automatically (yet). The suggestion updates (and marks
+the previous suggestion as outdated) only when the underlying
+classification actually changes, not on every edit to the title text.
 
 ### Tech Stack
 
