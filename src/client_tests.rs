@@ -1,8 +1,19 @@
 //! Unit tests for `client.rs`. Sibling test file per repo convention
 //! (`.rules/rust.md` #4/#5) — loaded via `#[cfg(test)] mod client_tests;`.
 
+use tokio::sync::Mutex;
+
 use super::{cleanup_idle_pools, connection_key, get_or_create_pool, POOLS};
 use crate::models::ConnectionParams;
+
+// `POOLS` is a single process-wide static, and Rust's test harness runs
+// `#[tokio::test]` fns concurrently on separate threads — without this,
+// `cleanup_idle_pools`'s sweep (which iterates every entry, not just its
+// own key) can race with and evict another concurrently-running test's
+// freshly-inserted pool. Serializes only the tests below that touch the
+// shared map; pure `connection_key` tests above are unaffected. An async
+// mutex (not std::sync::Mutex) since the guard must span `.await` points.
+static POOLS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn params(host: &str, port: u16, db: &str, user: &str) -> ConnectionParams {
     ConnectionParams {
@@ -63,6 +74,7 @@ async fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     // helper leaves startup_script as None, so this exercises only the
     // cache bookkeeping, not real connectivity. Use a key unlikely to
     // collide with other tests running in the same process.
+    let _guard = POOLS_TEST_LOCK.lock().await;
     let p = params("cache-test-host-unique", 5432, "db", "user");
     let key = connection_key(&p);
 
@@ -93,6 +105,7 @@ async fn cleanup_idle_pools_evicts_pools_with_no_checked_out_connections() {
     // A freshly-built, never-connected pool has status().size ==
     // status().available == 0 (deadpool's Pool::new is lazy) — no
     // checked-out connections, so it must be evicted as idle/unused.
+    let _guard = POOLS_TEST_LOCK.lock().await;
     let p = params("cleanup-test-host-unique", 5432, "db", "user");
     let key = connection_key(&p);
 

@@ -62,6 +62,18 @@
 
 ### Fixed
 
+- Flaky unit test: `get_or_create_pool_reuses_cached_entry_for_identical_params`
+  and `cleanup_idle_pools_evicts_pools_with_no_checked_out_connections`
+  both read/write the shared process-wide `POOLS` cache, and Rust's test
+  harness runs `#[tokio::test]` fns concurrently — `cleanup_idle_pools`'s
+  sweep (which iterates every cached pool, not just its own key) could
+  evict the other test's freshly-inserted, still-idle pool mid-assertion.
+  Reproduced locally at roughly 1-in-100 runs; hit for real in CI on the
+  first push after two other CI fixes made this job the last one standing
+  between failure and green. Serialized both tests behind a dedicated
+  `tokio::sync::Mutex` (an async mutex, since the guard must span
+  `.await` points — a `std::sync::Mutex` guard held across `.await`
+  fails `clippy::await_holding_lock`).
 - `Security audit` CI job was failing on every run — including, unnoticed,
   the very first `v1.0.0-beta.1`/`v1.0.0-beta.2` release builds — with
   `Resource not accessible by integration` when `rustsec/audit-check`
