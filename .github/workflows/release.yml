@@ -6,8 +6,25 @@ on:
       - "v*"
 
 jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tag matches manifest version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TABULARIUM_VERSION=$(jq -r .version .tabularium)
+
+          if [ "$TAG_VERSION" != "$TABULARIUM_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match .tabularium version ($TABULARIUM_VERSION)"
+            exit 1
+          fi
+
   build:
     name: ${{ matrix.platform-label }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

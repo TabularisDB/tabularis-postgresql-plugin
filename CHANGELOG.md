@@ -29,6 +29,19 @@
 
 ### Added
 
+- Two more CI checks:
+  - `release.yml`: a `validate` job gates the build matrix on the pushed
+    tag matching `.tabularium`'s `version` field (stripped of the `v`
+    prefix) — ported from the `tabularis-elasticsearch-plugin` sibling's
+    pattern. This isn't just convention: the registry's own manifest
+    schema documents this as a hard rule ("the registry rejects ingests
+    whose tag and manifest version disagree"), so this catches the
+    mismatch at tag-push time instead of at registry-submission time.
+  - `ci.yml`: a `pr-title` job enforces Conventional Commits PR titles via
+    `amannn/action-semantic-pull-request`, triggered on plain
+    `pull_request` (not `pull_request_target`) since this repo doesn't
+    need fork-PR support and the plain event avoids the elevated-
+    permission surface entirely.
 - CI hardening — deliberately set a higher bar than the sibling plugin
   repos and the org's own documented requirements (no sibling runs
   `cargo audit`; only 2 of 11 Rust siblings gate on clippy/fmt at all):
