@@ -128,6 +128,18 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Detect prerelease from tag
+        id: meta
+        run: |
+          # Auto-flag prerelease when the tag has a "-" suffix (semver
+          # pre-release, e.g. v1.0.0-beta.1) — matches tabularis's own
+          # release.yml convention.
+          if [[ "${{ github.ref_name }}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
@@ -136,3 +148,5 @@ jobs:
           files: |
             artifacts/*.zip
             .tabularium
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.meta.outputs.prerelease == 'false' }}

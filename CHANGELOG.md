@@ -27,6 +27,26 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `Security audit` CI job was failing on every run — including, unnoticed,
+  the very first `v1.0.0-beta.1`/`v1.0.0-beta.2` release builds — with
+  `Resource not accessible by integration` when `rustsec/audit-check`
+  tried to publish its Check Run result. The audit itself was passing
+  (0 vulnerabilities found, our `RUSTSEC-2026-0235` ignore working
+  correctly); the job had no `permissions:` block at all, so it inherited
+  read-only default permissions instead of the `checks: write` the action
+  needs. Added the missing `permissions:` block.
+- `release.yml` never set `prerelease` on published GitHub releases —
+  `softprops/action-gh-release` defaults to `false`, so both
+  `v1.0.0-beta.1` and `v1.0.0-beta.2` published as (and one incorrectly
+  displayed as "Latest") full stable releases despite being betas. Added
+  tag-based auto-detection (`-` suffix ⇒ prerelease), matching
+  `tabularis`'s own `release.yml` convention, plus `make_latest` wired to
+  the same check so only an actual stable tag can become "Latest".
+  Retroactively corrected both already-published releases via
+  `gh release edit --prerelease`.
+
 ### Added
 
 - CI hardening — deliberately set a higher bar than the sibling plugin
