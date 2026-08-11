@@ -170,55 +170,15 @@ fn bind_pg_string(
 
     // 5. Numeric column
     if let Some(bt) = base_type {
-        match bt {
-            "SMALLINT" | "INTEGER" | "BIGINT" | "INT2" | "INT4" | "INT8" | "SERIAL"
-            | "BIGSERIAL" => {
-                let i: i64 = s.parse().map_err(|_| {
-                    format!("Cannot bind '{}' as integer for target type {}", s, bt)
-                })?;
-                return Ok(BoundValue {
-                    sql: format!("CAST(${} AS bigint)", placeholder_idx),
-                    param: Some((Box::new(i), Type::INT8)),
-                });
-            }
-            "NUMERIC" | "DECIMAL" => {
-                let d: Decimal = s.parse().map_err(|_| {
-                    format!("Cannot bind '{}' as numeric for target type {}", s, bt)
-                })?;
-                return Ok(BoundValue {
-                    sql: format!("CAST(${} AS numeric)", placeholder_idx),
-                    param: Some((Box::new(d), Type::NUMERIC)),
-                });
-            }
-            "REAL" | "DOUBLE PRECISION" | "FLOAT4" | "FLOAT8" => {
-                let f: f64 = s
-                    .parse()
-                    .map_err(|_| format!("Cannot bind '{}' as float for target type {}", s, bt))?;
-                return Ok(BoundValue {
-                    sql: format!("CAST(${} AS double precision)", placeholder_idx),
-                    param: Some((Box::new(f), Type::FLOAT8)),
-                });
-            }
-            _ => {}
+        if let Some(bound) = bind_pg_numeric_string(s, bt, placeholder_idx) {
+            return bound;
         }
     }
 
     // 6. Temporal column
     if let Some(bt) = base_type {
-        let cast_target = match bt {
-            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => Some("timestamp"),
-            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => Some("timestamptz"),
-            "DATE" => Some("date"),
-            "TIME" | "TIME WITHOUT TIME ZONE" => Some("time"),
-            "TIMETZ" | "TIME WITH TIME ZONE" => Some("timetz"),
-            "INTERVAL" => Some("interval"),
-            _ => None,
-        };
-        if let Some(target) = cast_target {
-            return Ok(BoundValue {
-                sql: format!("CAST(${} AS {})", placeholder_idx, target),
-                param: Some((Box::new(s.to_string()), Type::TEXT)),
-            });
+        if let Some(bound) = bind_pg_temporal_string(s, bt, placeholder_idx) {
+            return bound;
         }
     }
 
@@ -301,6 +261,91 @@ fn json_array_to_pg_literal(arr: &[Value]) -> Result<String, String> {
     Ok(format!("ARRAY[{}]", parts.join(", ")))
 }
 
+/// Coerce a string value into a numeric PostgreSQL column (`smallint`
+/// through `bigint`, `numeric`/`decimal`, `real`/`double precision`).
+/// Returns `None` if the column is not numeric, so callers can fall through
+/// to the next coercion path. Shared by SET binding (`bind_pg_string`) and
+/// WHERE-predicate binding (`bind_pk_value`) — factored out to match the
+/// builtin driver's `bind_pg_numeric_string`.
+fn bind_pg_numeric_string(
+    s: &str,
+    base_type: &str,
+    placeholder_idx: usize,
+) -> Option<Result<BoundValue, String>> {
+    match base_type {
+        "SMALLINT" | "INTEGER" | "BIGINT" | "INT2" | "INT4" | "INT8" | "SERIAL" | "BIGSERIAL" => {
+            Some(s.parse::<i64>().map_or_else(
+                |_| {
+                    Err(format!(
+                        "Cannot bind '{}' as integer for target type {}",
+                        s, base_type
+                    ))
+                },
+                |i| {
+                    Ok(BoundValue {
+                        sql: format!("CAST(${} AS bigint)", placeholder_idx),
+                        param: Some((Box::new(i), Type::INT8)),
+                    })
+                },
+            ))
+        }
+        "NUMERIC" | "DECIMAL" => Some(s.parse::<Decimal>().map_or_else(
+            |_| {
+                Err(format!(
+                    "Cannot bind '{}' as numeric for target type {}",
+                    s, base_type
+                ))
+            },
+            |d| {
+                Ok(BoundValue {
+                    sql: format!("CAST(${} AS numeric)", placeholder_idx),
+                    param: Some((Box::new(d), Type::NUMERIC)),
+                })
+            },
+        )),
+        "REAL" | "DOUBLE PRECISION" | "FLOAT4" | "FLOAT8" => Some(s.parse::<f64>().map_or_else(
+            |_| {
+                Err(format!(
+                    "Cannot bind '{}' as float for target type {}",
+                    s, base_type
+                ))
+            },
+            |f| {
+                Ok(BoundValue {
+                    sql: format!("CAST(${} AS double precision)", placeholder_idx),
+                    param: Some((Box::new(f), Type::FLOAT8)),
+                })
+            },
+        )),
+        _ => None,
+    }
+}
+
+/// Coerce a string value into a temporal PostgreSQL column (`timestamp`,
+/// `timestamptz`, `date`, `time`, `timetz`, `interval`). Returns `None` if
+/// the column is not temporal. Shared by SET binding and WHERE-predicate
+/// binding — factored out to match the builtin driver's
+/// `bind_pg_temporal_string`.
+fn bind_pg_temporal_string(
+    s: &str,
+    base_type: &str,
+    placeholder_idx: usize,
+) -> Option<Result<BoundValue, String>> {
+    let cast_target = match base_type {
+        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => "timestamp",
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => "timestamptz",
+        "DATE" => "date",
+        "TIME" | "TIME WITHOUT TIME ZONE" => "time",
+        "TIMETZ" | "TIME WITH TIME ZONE" => "timetz",
+        "INTERVAL" => "interval",
+        _ => return None,
+    };
+    Some(Ok(BoundValue {
+        sql: format!("CAST(${} AS {})", placeholder_idx, cast_target),
+        param: Some((Box::new(s.to_string()), Type::TEXT)),
+    }))
+}
+
 /// Bind a WHERE-clause value from a PK map entry. Returns the SQL fragment
 /// (may include a CAST) plus the typed parameter — stricter than
 /// `bind_pg_value` for strings: UUID/integer string coercion is only applied
@@ -337,6 +382,22 @@ pub fn bind_pk_value(
                         sql: format!("${}", placeholder_idx),
                         param: Some((Box::new(uuid), Type::UUID)),
                     });
+                }
+            }
+
+            // Keyless tables identify rows by every column, so the WHERE
+            // predicate can target numeric/temporal columns whose values
+            // arrive as JSON strings (numeric serializes as string to
+            // preserve arbitrary precision). Route them through the same
+            // coercions as SET binding — a plain TEXT bind trips SQLSTATE
+            // 42883, e.g. "operator does not exist: numeric = text".
+            // Ported from the builtin driver's parity fix
+            // (TabularisDB/tabularis#618).
+            if let Some(bt) = base_type.as_deref() {
+                if let Some(bound) = bind_pg_numeric_string(s, bt, placeholder_idx)
+                    .or_else(|| bind_pg_temporal_string(s, bt, placeholder_idx))
+                {
+                    return bound;
                 }
             }
 

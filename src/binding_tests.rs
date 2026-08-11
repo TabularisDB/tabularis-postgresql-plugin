@@ -306,4 +306,47 @@ mod bind_pk_value_tests {
         let err = bind_pk_value(&json!({"a": 1}), 1, None).unwrap_err();
         assert!(err.contains("Unsupported PK type"));
     }
+
+    // Keyless tables identify rows by every column, so the WHERE predicate
+    // can target numeric/temporal columns whose values arrive as JSON
+    // strings (numeric serializes as string to preserve arbitrary
+    // precision). Ported from the builtin driver's parity fix
+    // (TabularisDB/tabularis#618): a plain TEXT bind trips SQLSTATE 42883,
+    // "operator does not exist: numeric = text". These mirror #618's own
+    // test cases for `build_pk_predicate`, adapted to `bind_pk_value`'s
+    // signature.
+
+    #[test]
+    fn numeric_column_string_value_casts_to_numeric() {
+        let bound = bind_pk_value(&json!("1500.00"), 2, Some("numeric")).unwrap();
+        assert_eq!(bound.sql, "CAST($2 AS numeric)");
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type, tokio_postgres::types::Type::NUMERIC);
+    }
+
+    #[test]
+    fn double_precision_column_string_value_casts_to_double() {
+        let bound = bind_pk_value(&json!("1.5"), 1, Some("double precision")).unwrap();
+        assert_eq!(bound.sql, "CAST($1 AS double precision)");
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type, tokio_postgres::types::Type::FLOAT8);
+    }
+
+    #[test]
+    fn numeric_column_unparsable_string_is_rejected() {
+        assert!(bind_pk_value(&json!("abc"), 1, Some("numeric")).is_err());
+    }
+
+    #[test]
+    fn timestamp_column_string_value_casts_through_text() {
+        let bound = bind_pk_value(
+            &json!("2024-05-01 10:30:00"),
+            3,
+            Some("timestamp without time zone"),
+        )
+        .unwrap();
+        assert_eq!(bound.sql, "CAST($3 AS timestamp)");
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type, tokio_postgres::types::Type::TEXT);
+    }
 }
