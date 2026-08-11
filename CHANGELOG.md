@@ -29,6 +29,30 @@
 
 ### Added
 
+- `ci.yml`: a `version-suggestion` job posts a PR comment suggesting the
+  next tag/version based on the PR title's Conventional Commits type
+  (`feat`→minor, `fix`/`refactor`/`perf`→patch, `docs`/`style`/`chore`/
+  `test`/`ci`/`build`→no release, `!`/`BREAKING CHANGE:`→major) and a
+  required `prerelease:alpha|beta|rc|stable` PR label (missing label fails
+  the job — no default channel is guessed). Purely informational, a
+  precursor to eventually automating tag/release creation: nothing is
+  tagged or released by this job. While the resolved baseline version
+  carries a prerelease suffix matching the label's channel, the suggestion
+  just increments that stage's counter (`1.0.0-beta.1` → `-beta.2`) rather
+  than computing a full patch/minor/major bump — there's no shipped stable
+  version yet to protect a SemVer contract against. Re-comments only when
+  the PR's *derived classification* changes (type + breaking + channel),
+  not on every title edit — tracked via a hidden marker in the comment
+  body — and marks the previous suggestion as outdated via GitHub's
+  `minimizeComment` API (same as the web UI's "Hide comment → Outdated")
+  before posting the new one. Also widens the shared `pull_request:`
+  trigger's `types:` to include `edited`/`labeled`/`unlabeled` (previously
+  defaulted to `opened`/`synchronize`/`reopened` only, so a title-only edit
+  never even re-ran CI). Checked precedent first: no sibling Tabularis
+  plugin repo or `tabularis` itself has anything like this; a separate
+  internal repo has a fuller PR-title-driven auto-tag/auto-release
+  pipeline, but porting that whole pipeline was judged too large a
+  behavioral change for this pass.
 - Two more CI checks:
   - `release.yml`: a `validate` job gates the build matrix on the pushed
     tag matching `.tabularium`'s `version` field (stripped of the `v`

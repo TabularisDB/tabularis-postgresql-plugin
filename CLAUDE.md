@@ -87,3 +87,9 @@ migration, now applied across the repo boundary.
   behavior. Extract pure logic (SQL builders, value binding, pagination
   math) into testable functions with unit tests in a sibling `_tests.rs`
   file.
+- **PR titles and versioning**: PR titles must be Conventional Commits
+  (`type: subject`) and every PR needs a `prerelease:alpha|beta|rc|stable`
+  label — both enforced by CI. See the README's "Contributing: PR Titles &
+  Versioning" section for the full convention and the type→bump mapping.
+  CI posts (and keeps up to date) a version-suggestion comment based on
+  these — informational only, nothing is tagged/released automatically yet.
