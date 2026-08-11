@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly cargo-audit sweep to catch newly-disclosed CVEs in deps that
+    # haven't otherwise changed. Off-peak minute, not :00/:30.
+    - cron: "17 6 * * 1"
 
 jobs:
   test:
@@ -20,10 +24,89 @@ jobs:
         run: cargo build
 
       - name: Run tests
-        run: cargo test
+        # --lib --bins excludes tests/live_db.rs: that's a live-database
+        # integration test requiring a running PostgreSQL instance, covered
+        # by the dedicated live-db-integration job below.
+        run: cargo test --lib --bins
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  validate-manifest:
+    name: Validate .tabularium manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate against the live registry schema
+        run: npx --yes @tabularium/cli validate .tabularium --registry https://registry.tabularis.dev --kind driver
+
+  markdownlint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run markdownlint
+        run: npx --yes markdownlint-cli "**/*.md"
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2026-0235: vulnerable rkyv 0.7.46, pulled in transitively
+          # by rust_decimal's own optional "rkyv" feature declaration in its
+          # Cargo.toml — we never enable that feature (only "db-tokio-postgres"
+          # and "serde"), and confirmed no rkyv symbols are linked into the
+          # release binary (`nm -D target/release/postgresql-plugin | grep
+          # rkyv` — no output). cargo-audit scans the full Cargo.lock graph
+          # regardless of which optional features are active, so this is a
+          # lockfile-only entry with no reachable code path in what we ship.
+          # Re-check this ignore whenever rust_decimal is upgraded, in case a
+          # newer release changes what's declared as optional.
+          ignore: RUSTSEC-2026-0235
+
+  live-db-integration:
+    name: Live PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        ports:
+          - 54320:5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build
+
+      - name: Run live-database integration test
+        env:
+          POSTGRES_PLUGIN_BIN: ${{ github.workspace }}/target/debug/postgresql-plugin
+          PGHOST: 127.0.0.1
+          PGPORT: 54320
+          PGUSER: postgres
+          PGPASSWORD: password
+          PGDATABASE: testdb
+        run: cargo test --test live_db -- --test-threads=1
+

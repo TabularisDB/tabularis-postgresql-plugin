@@ -22,14 +22,16 @@ directly into the Tabularis application. It is byte-for-byte behaviorally
 identical to that built-in driver, proven by an 82-test parity suite that runs
 both drivers against the same live database and compares every response.
 
-> ⚠️ **Work in progress** — this repo currently holds only the repo-level
-> basics (license, CI/release workflow shape, contributor docs). The actual
-> plugin source (`Cargo.toml`, `src/`, `.tabularium` manifest) has not been
-> migrated yet — it still lives at
-> [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin)
-> pending the CP-4 extraction (see
-> [the migration plan](https://github.com/TabularisDB/tabularis/blob/main/.github/planning/postgres-plugin/02-phase-1-plugin-build.md#repo-extraction--timing-and-open-question)).
-> The CI workflow in this repo will not pass until that source lands.
+> ⚠️ **Work in progress** — this repo is intended to become the **primary
+> home** for the PostgreSQL plugin, pending sign-off. The plugin source has
+> landed here (Phase 1 byte-for-byte parity proven: 82/82 parity, 72/72
+> baseline, 26/26 golden tests — see
+> [the migration plan](./docs/planning/02-phase-1-plugin-build.md)), but
+> the [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin)
+> copy is left untouched for now. Once this repo is signed off as the beta
+> release source of truth, [`tabularis` PR #577](https://github.com/TabularisDB/tabularis/pull/577)
+> will pivot from building the plugin in-tree to removing the built-in
+> driver.
 
 ## Table of Contents
 
@@ -81,8 +83,9 @@ both drivers against the same live database and compares every response.
 | `username` | Database user | Yes (unless using `connection_string`) |
 | `password` | Database password | If required by the server |
 | `ssl_mode` | `disable`, `require`, `verify-ca`, or `verify-full` | No |
-| `ssl_ca` / `ssl_cert` / `ssl_key` | Paths to SSL certificate material | If using `verify-ca`/`verify-full` |
+| `ssl_ca` | Path to a custom CA bundle PEM file, used to validate the server's certificate under `verify-ca`/`verify-full` instead of the system trust store | No |
 | `connection_string` | Full `postgres://user:pass@host:port/db` URL, as an alternative to the discrete fields above | No |
+| `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query | No |
 
 ## Supported PostgreSQL Data Types
 

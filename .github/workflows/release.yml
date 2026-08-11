@@ -79,6 +79,32 @@ jobs:
           Copy-Item ".tabularium" $stage
           Compress-Archive -Path "$stage\*" -DestinationPath "postgresql-plugin-${{ matrix.platform-label }}.zip"
 
+      # linux-arm64 is cross-compiled via `cross` on an x86_64 runner — that
+      # binary is a foreign architecture and cannot execute here without
+      # QEMU emulation, so this leg is skipped rather than adding that
+      # complexity for one platform.
+      - name: Smoke test binary (unix)
+        if: runner.os != 'Windows' && !matrix.cross
+        run: |
+          response=$(echo '{"jsonrpc":"2.0","method":"initialize","id":1}' | ./staging/postgresql-plugin${{ matrix.binary-suffix }})
+          echo "$response"
+          echo "$response" | jq -e 'has("error") | not' > /dev/null || {
+            echo "::error::Binary did not return a valid initialize response"
+            exit 1
+          }
+
+      - name: Smoke test binary (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $response = '{"jsonrpc":"2.0","method":"initialize","id":1}' | & ".\staging\postgresql-plugin${{ matrix.binary-suffix }}"
+          Write-Output $response
+          $parsed = $response | ConvertFrom-Json
+          if ($null -ne $parsed.error) {
+            Write-Error "Binary did not return a valid initialize response"
+            exit 1
+          }
+
       - name: Stash artifact
         uses: actions/upload-artifact@v7
         with:
