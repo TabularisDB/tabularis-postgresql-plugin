@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0-beta.1] - 2026-08-11
+
+### Changed
+
+- Version scheme reset from `0.1.0` to `1.0.0-beta.1`. The actual target
+  is `1.0.0` — Phase 1 byte-for-byte parity is complete per `tabularis`
+  PR #577's own "CP-4 Gate Met" status — not an independent `0.x`
+  development line, so SemVer's own prerelease mechanism
+  (`1.0.0-beta.1` → `-beta.2` → `-rc.1` → `1.0.0`) expresses that
+  relationship natively, which a bare `0.1.0` cannot.
+
 ## [Unreleased]
 
 ### Added
