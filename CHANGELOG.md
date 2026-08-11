@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.0-beta.2] - 2026-08-11
+
+### Fixed
+
+- Keyless-table numeric/temporal `WHERE` binding (port of `tabularis#618`):
+  updating or deleting a row in a table with no primary key failed with
+  `operator does not exist: numeric = text` (SQLSTATE 42883) whenever the
+  identifying column was numeric or temporal, since `bind_pk_value` bound
+  those JSON-string values as plain `TEXT` with no coercion. Factored the
+  numeric/temporal coercion already used for `SET` binding
+  (`bind_pg_string`) into two shared functions and routed `bind_pk_value`
+  through them too. See PR #4 for the full TDD trail and live-database
+  before/after verification.
+
 ## [1.0.0-beta.1] - 2026-08-11
 
 ### Changed
