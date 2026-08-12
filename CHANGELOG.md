@@ -99,6 +99,25 @@
 
 ### Fixed
 
+- `execute_query` returned `null` for every PostgreSQL enum column value,
+  even when the database genuinely held a non-null value (issue #7).
+  `extract.rs`'s `extract_value()` had no explicit match arm for enum
+  types (custom-OID types), so they fell into the generic catch-all,
+  which tries `row.try_get::<_, String>()` — `tokio_postgres`'s `FromSql
+  for String` enforces known-OID checks and can't decode an arbitrary
+  enum OID, so this always errored and silently nulled out, with no
+  secondary fallback (unlike `try_extract<T>`'s string retry used
+  elsewhere in the same file). Pre-existing since Sprint 5; the 82-test
+  parity suite never caught it because it only exercises enum *writes*
+  (`insert_record`/`update_record` binding) and enum *metadata*
+  (`get_columns`'s `pg_enum` lookup), nothing reads an enum value back
+  through `execute_query`. Fixed by decoding the raw label bytes directly
+  as UTF-8 on `Kind::Enum` columns, ported from the builtin driver's
+  `extract/enum.rs::extract_or_null` — bypasses `FromSql`'s OID
+  enforcement entirely rather than working around it. Genuinely-NULL enum
+  columns still correctly return `null`. Added unit tests for the new
+  `EnumLabel` decode path plus a `tests/live_db.rs` regression test
+  covering the full RPC round-trip.
 - Flaky unit test: `get_or_create_pool_reuses_cached_entry_for_identical_params`
   and `cleanup_idle_pools_evicts_pools_with_no_checked_out_connections`
   both read/write the shared process-wide `POOLS` cache, and Rust's test

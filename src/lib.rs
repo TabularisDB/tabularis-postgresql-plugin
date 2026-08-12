@@ -13,6 +13,8 @@ mod binding_tests;
 pub mod client;
 pub mod error;
 pub mod extract;
+#[cfg(test)]
+mod extract_tests;
 pub mod handlers;
 pub mod models;
 pub mod rpc;

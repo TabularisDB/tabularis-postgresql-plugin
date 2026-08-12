@@ -192,6 +192,66 @@ fn insert_record_persists_a_row() {
 }
 
 #[test]
+fn execute_query_returns_a_real_enum_value_not_null() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained: create (and reset) our own scratch enum type/table
+    // rather than depending on tabularis's seed fixtures, since this test
+    // must not require anything outside this repo (and CI's PostgreSQL
+    // service container starts empty — see GitHub issue #7, where this
+    // exact read path returned `null` for a non-null enum column).
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DO $$ BEGIN \
+                       CREATE TYPE live_db_test_mood AS ENUM ('happy', 'sad'); \
+                       EXCEPTION WHEN duplicate_object THEN null; END $$",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_db_enum_scratch \
+                       (id SERIAL PRIMARY KEY, current_mood live_db_test_mood)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "TRUNCATE live_db_enum_scratch RESTART IDENTITY" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_enum_scratch (current_mood) VALUES ('happy'), (NULL)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT id, current_mood FROM live_db_enum_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0][1],
+        json!("happy"),
+        "a non-null enum column must round-trip as its label string, not null"
+    );
+    assert_eq!(
+        rows[1][1],
+        Value::Null,
+        "a genuinely-NULL enum column must still come back as null"
+    );
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();
