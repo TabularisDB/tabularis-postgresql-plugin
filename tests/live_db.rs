@@ -192,6 +192,46 @@ fn insert_record_persists_a_row() {
 }
 
 #[test]
+fn execute_query_returns_a_real_enum_value_not_null() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Relies on `test_schema.with_enum` / `test_schema.mood`, seeded by
+    // tabularis's tests/fixtures/postgres_seed.sh against this same
+    // container — see GitHub issue #7, where this exact query returned
+    // `null` for a non-null enum column.
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT id, current_mood FROM test_schema.with_enum WHERE id = 1",
+            "schema": "test_schema",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][1],
+        json!("happy"),
+        "a non-null enum column must round-trip as its label string, not null"
+    );
+
+    // The genuinely-NULL case must still come back as null, not as the
+    // fix's happy-path string.
+    let null_result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT id, NULL::test_schema.mood AS current_mood \
+                       FROM test_schema.with_enum WHERE id = 1",
+            "schema": "test_schema",
+        }),
+    );
+    let null_rows = null_result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(null_rows[0][1], Value::Null);
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();

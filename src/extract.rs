@@ -126,6 +126,13 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         ref t if *t == Type::BOOL_ARRAY => try_extract::<Vec<bool>>(row, index, |v| {
             JsonValue::Array(v.into_iter().map(JsonValue::Bool).collect())
         }),
+        // Enums are custom-OID types, so tokio_postgres's built-in `FromSql for
+        // String` (which enforces known-OID checks) can't decode them — read the
+        // raw label bytes directly, matching the builtin driver's
+        // `extract/enum.rs::extract_or_null`.
+        ref t if matches!(t.kind(), Kind::Enum(_)) => {
+            try_extract::<EnumLabel>(row, index, |v| JsonValue::String(v.0))
+        }
         // For types not explicitly handled (ranges, composites, geometric, etc.),
         // fall back to text representation via the Display trait on the raw bytes.
         _ => {
@@ -299,6 +306,24 @@ fn extract_simple_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
             .map(|v| JsonValue::String(v.format("%Y-%m-%d %H:%M:%S").to_string()))
             .unwrap_or(JsonValue::Null),
         _ => JsonValue::Null,
+    }
+}
+
+/// PostgreSQL enum wire format is just the label's UTF-8 bytes — no length
+/// prefix, no OID-checked decoding. Matches
+/// `src-tauri/src/drivers/postgres/extract/enum.rs::extract_or_null`.
+pub(crate) struct EnumLabel(pub(crate) String);
+
+impl<'a> FromSql<'a> for EnumLabel {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(std::str::from_utf8(raw)?.to_string()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Enum(_))
     }
 }
 
