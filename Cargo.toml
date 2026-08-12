@@ -30,7 +30,7 @@ rust_decimal = { version = "1.36", features = ["db-tokio-postgres", "serde"] }
 async-trait = "0.1"
 log = "0.4"
 base64 = "0.22.1"
-infer = "0.16"
+infer = "0.22"
 
 [profile.release]
 lto = true
