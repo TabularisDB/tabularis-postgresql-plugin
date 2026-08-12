@@ -25,7 +25,7 @@
   (`1.0.0-beta.1` → `-beta.2` → `-rc.1` → `1.0.0`) expresses that
   relationship natively, which a bare `0.1.0` cannot.
 
-## [Unreleased]
+## [1.0.0-beta.3] - 2026-08-12
 
 ### Added
 
