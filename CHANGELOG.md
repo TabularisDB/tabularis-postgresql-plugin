@@ -4,6 +4,11 @@
 
 ### Added
 
+- `.tabularium`: `screenshots` array (7 real captures, not mockups —
+  fresh install, database picker, connection form, successful test,
+  saved connection, multi-schema browser, and a live data grid showing a
+  real enum value) plus a matching "Screenshots" section in the README,
+  for the plugin's eventual Tabularium registry submission.
 - `.tabularium`: registry-listing metadata fields — `category`, `tags`,
   `license`, `readme`, `homepage`, `documentation_url`, `support.issues_url`,
   `color` — needed for the plugin's eventual Tabularium registry submission.

@@ -8,6 +8,43 @@
   "license": "Apache-2.0",
   "icon": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/postgresql-icon.svg",
   "color": "#336791",
+  "screenshots": [
+    {
+      "url": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/01-fresh-install.png",
+      "caption": "Database Manager on first launch",
+      "alt": "Tabularis Database Manager showing no active connections"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/02-database-picker.png",
+      "caption": "PostgreSQL listed in the database picker",
+      "alt": "Choose a database dialog showing PostgreSQL installed under SQL and Relational categories"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/03-connection-form.png",
+      "caption": "Connection configuration form",
+      "alt": "PostgreSQL connection form with host, port, username, password, and database name fields filled in"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/04-test-connection-success.png",
+      "caption": "Successful connection test",
+      "alt": "Connection form showing a green Connection successful message"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/05-connections-list.png",
+      "caption": "Saved connection in the Database Manager",
+      "alt": "Database Manager showing one saved PostgreSQL connection card"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/06-schema-browser.png",
+      "caption": "Multi-schema browsing with tables, views, and materialized views",
+      "alt": "Sidebar schema tree showing multiple schemas with tables, views, materialized views, and triggers"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/07-table-data.png",
+      "caption": "Data grid with filtering, sorting, and enum column support",
+      "alt": "Data grid showing a table row with a PostgreSQL enum column value, a WHERE filter, and sort controls"
+    }
+  ],
   "readme": "README.md",
   "homepage": "https://github.com/TabularisDB/tabularis-postgresql-plugin",
   "documentation_url": "https://github.com/TabularisDB/tabularis-postgresql-plugin#readme",

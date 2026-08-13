@@ -35,6 +35,7 @@ both drivers against the same live database and compares every response.
 ## Table of Contents
 
 - [Features](#features)
+- [Screenshots](#screenshots)
 - [Connection Configuration](#connection-configuration)
 - [Supported PostgreSQL Data Types](#supported-postgresql-data-types)
 - [Installation](#installation)
@@ -72,6 +73,19 @@ both drivers against the same live database and compares every response.
   MIME-sniffed data URL.
 - **Cross-platform** — Pre-built binaries for Linux (x86_64/aarch64), macOS
   (x86_64/aarch64), and Windows (x86_64).
+
+## Screenshots
+
+<table>
+<tr>
+<td><img src="assets/screenshots/02-database-picker.png" alt="PostgreSQL listed in the Choose a database picker" width="400" /><br />PostgreSQL in the database picker</td>
+<td><img src="assets/screenshots/03-connection-form.png" alt="PostgreSQL connection form" width="400" /><br />Connection configuration</td>
+</tr>
+<tr>
+<td><img src="assets/screenshots/06-schema-browser.png" alt="Schema browser showing tables, views, and materialized views" width="400" /><br />Multi-schema browsing</td>
+<td><img src="assets/screenshots/07-table-data.png" alt="Data grid with a PostgreSQL enum column value" width="400" /><br />Data grid with enum support</td>
+</tr>
+</table>
 
 ## Connection Configuration
 
