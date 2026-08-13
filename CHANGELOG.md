@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `.tabularium`: registry-listing metadata fields — `category`, `tags`,
+  `license`, `readme`, `homepage`, `documentation_url`, `support.issues_url`,
+  `color` — needed for the plugin's eventual Tabularium registry submission.
+  These are purely presentational for the registry's plugin-card/detail
+  page; the builtin driver's own definition
+  (`tabularis`'s `src/hooks/useDrivers.ts`) has none of them, confirming
+  they carry no runtime behavior. No version bump warranted.
+
+### Fixed
+
+- README's release badge showed "no releases or repo not found" because
+  every published release so far (`v1.0.0-beta.1` through `.4`) is flagged
+  `prerelease: true`, and GitHub's `/releases/latest` API — which the
+  unqualified `img.shields.io/github/release/...` badge queries — excludes
+  prereleases by design. Switched to `img.shields.io/github/v/release/...
+  ?include_prereleases`, confirmed rendering `v1.0.0-beta.4` correctly.
+- README's installation section and work-in-progress banner were stale:
+  described a hypothetical "Automatic (via Tabularis)" install path with
+  no registry to install from yet, and the banner's sign-off checklist
+  didn't reflect that `tabularis` PR #577's checklist is now fully checked
+  (though the PR itself remains open/unmerged). Updated both to describe
+  the actual current state — manual install only, registry submission
+  pending — and added a "From the Tabularium registry" placeholder section
+  matching the pattern used by already-published sibling plugins
+  (`tabularis-elasticsearch-plugin`, `tabularis-duckdb-plugin`).
+
 ## [1.0.0-beta.4] - 2026-08-13
 
 ### Fixed

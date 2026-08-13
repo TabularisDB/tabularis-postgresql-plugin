@@ -3,7 +3,17 @@
   "name": "postgresql",
   "version": "1.0.0-beta.4",
   "description": "PostgreSQL plugin driver for Tabularis (parity implementation)",
+  "category": "database",
+  "tags": ["driver", "postgresql", "postgres", "sql", "relational", "database-driver"],
+  "license": "Apache-2.0",
   "icon": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/postgresql-icon.svg",
+  "color": "#336791",
+  "readme": "README.md",
+  "homepage": "https://github.com/TabularisDB/tabularis-postgresql-plugin",
+  "documentation_url": "https://github.com/TabularisDB/tabularis-postgresql-plugin#readme",
+  "support": {
+    "issues_url": "https://github.com/TabularisDB/tabularis-postgresql-plugin/issues"
+  },
   "kind": "driver",
   "engine": "postgresql",
   "paradigms": ["relational"],
