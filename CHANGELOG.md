@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Plugin had no `icon` declared in `.tabularium`, so every connection using
+  it fell through to the generic fallback icon in the sidebar, connection
+  list/cards, and the new-connection engine picker (`getDriverIcon`/
+  `getConnectionIcon` in `tabularis`'s `src/utils/driverUI.tsx` only render
+  the branded PostgreSQL mark for the literal built-in driver id
+  `"postgres"`; anything else needs a manifest-declared `icon` URL).
+  Added `postgresql-icon.svg` — the exact same Slonik elephant path/viewBox
+  already used by the builtin driver's `PostgreSQLIcon` component
+  (`tabularis`'s `src/utils/driverIcons.tsx`), extracted as a standalone
+  file and colored to PostgreSQL's brand blue (`#336791`) — and pointed
+  `.tabularium`'s `icon` field at its raw GitHub URL, matching the
+  mongodb/dynamodb sibling plugins' convention. Verified against the live
+  registry schema, which documents `icon` as a hosted image URL.
+
 ## [1.0.0-beta.2] - 2026-08-11
 
 ### Fixed
