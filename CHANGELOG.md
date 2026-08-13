@@ -4,6 +4,13 @@
 
 ### Added
 
+- README header: a plus icon between the Tabularis and PostgreSQL logos
+  (`assets/plus.svg`, a lucide-style glyph matching the icon set
+  `tabularis`'s own frontend uses) to read as "Tabularis + PostgreSQL" at
+  a glance. Self-hosted a copy of the PostgreSQL project's 3-colors logo
+  (`assets/postgresql-logo-3colors.png`) instead of hotlinking
+  `wiki.postgresql.org`, for the same reliability reason `postgresql-icon.svg`
+  is already self-hosted rather than pointed at a third party.
 - `.tabularium`: `screenshots` array (7 real captures, not mockups —
   fresh install, database picker, connection form, successful test,
   saved connection, multi-schema browser, and a live data grid showing a

@@ -1,6 +1,7 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
-  <img src="https://wiki.postgresql.org/images/3/30/PostgreSQL_logo.3colors.120x120.png" width="120" height="120" alt="PostgreSQL logo" />
+  <img src="assets/plus.svg" width="40" height="40" alt="plus" />
+  <img src="assets/postgresql-logo-3colors.png" width="120" height="120" alt="PostgreSQL logo" />
 </div>
 
 # tabularis-postgresql-plugin
