@@ -3,6 +3,7 @@
   "name": "postgresql",
   "version": "1.0.0-beta.3",
   "description": "PostgreSQL plugin driver for Tabularis (parity implementation)",
+  "icon": "https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/postgresql-icon.svg",
   "kind": "driver",
   "engine": "postgresql",
   "paradigms": ["relational"],
