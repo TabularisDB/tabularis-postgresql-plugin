@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- `.tabularium`'s `description` rewritten from the internal-facing
+  "PostgreSQL plugin driver for Tabularis (parity implementation)" to a
+  capability-focused tagline (schemas/tables/views/routines/triggers,
+  EXPLAIN plans, type-aware row editing, DDL generation) matching the
+  style of the strongest sibling plugin descriptions on the Tabularium
+  registry (`mongodb`, `firestore`). Synced the GitHub repo's own
+  description field to match, since it was still the old wording.
+
 ## [1.0.0-beta.5] - 2026-08-14
 
 ### Added
