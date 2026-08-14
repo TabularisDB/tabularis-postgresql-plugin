@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- README's header logo/plus-icon and screenshot-gallery images used
+  repo-relative `src` paths (`assets/plus.svg`, `assets/screenshots/*.png`).
+  GitHub auto-resolves those against the repo's raw-content base, so they
+  rendered fine there — but the Tabularium registry serves the README's
+  HTML standalone, with no such resolution, so all 6 images 404'd on the
+  plugin's registry page once the README actually synced. Switched to
+  absolute `raw.githubusercontent.com` URLs, matching the pattern already
+  used for `postgresql-icon.svg` and the `.tabularium` `screenshots` array.
+
 ### Changed
 
 - `.tabularium`'s `description` rewritten from the internal-facing
