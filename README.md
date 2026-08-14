@@ -1,13 +1,14 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
-  <img src="https://wiki.postgresql.org/images/3/30/PostgreSQL_logo.3colors.120x120.png" width="120" height="120" alt="PostgreSQL logo" />
+  <img src="assets/plus.svg" width="40" height="40" alt="plus" />
+  <img src="assets/postgresql-logo-3colors.png" width="120" height="120" alt="PostgreSQL logo" />
 </div>
 
 # tabularis-postgresql-plugin
 
 <p align="center">
 
-![Release](https://img.shields.io/github/release/TabularisDB/tabularis-postgresql-plugin.svg?style=flat)
+![Release](https://img.shields.io/github/v/release/TabularisDB/tabularis-postgresql-plugin?include_prereleases&style=flat)
 ![Downloads](https://img.shields.io/github/downloads/TabularisDB/tabularis-postgresql-plugin/total.svg?style=flat)
 ![CI](https://github.com/TabularisDB/tabularis-postgresql-plugin/workflows/CI/badge.svg)
 
@@ -23,24 +24,24 @@ identical to that built-in driver, proven by an 82-test parity suite that runs
 both drivers against the same live database and compares every response.
 
 > ⚠️ **Work in progress** — this repo is intended to become the **primary
-> home** for the PostgreSQL plugin, pending sign-off. The plugin source has
-> landed here (Phase 1 byte-for-byte parity proven: 82/82 parity, 72/72
-> baseline, 26/26 golden tests — see
-> [the migration plan](./docs/planning/02-phase-1-plugin-build.md)), but
-> the [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin)
-> copy is left untouched for now. Once this repo is signed off as the beta
-> release source of truth, [`tabularis` PR #577](https://github.com/TabularisDB/tabularis/pull/577)
-> will pivot from building the plugin in-tree to removing the built-in
-> driver.
+> home** for the PostgreSQL plugin. The sign-off checklist from
+> [`tabularis` PR #577](https://github.com/TabularisDB/tabularis/pull/577)
+> — security audit, CI hardening, cross-platform build, the 24-item manual
+> smoke test, and the full frontend/backend regression pass — is now
+> complete, but that PR (which pivots `tabularis` from building the plugin
+> in-tree to removing the built-in driver) is still open and unmerged. The
+> [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin)
+> copy remains untouched until it merges.
 
 ## Table of Contents
 
 - [Features](#features)
+- [Screenshots](#screenshots)
 - [Connection Configuration](#connection-configuration)
 - [Supported PostgreSQL Data Types](#supported-postgresql-data-types)
 - [Installation](#installation)
-  - [Automatic (via Tabularis)](#automatic-via-tabularis)
-  - [Manual Installation](#manual-installation)
+  - [From the Tabularium registry](#from-the-tabularium-registry)
+  - [Manual Installation (current path)](#manual-installation-current-path)
 - [How It Works](#how-it-works)
 - [Supported Operations](#supported-operations)
 - [Building from Source](#building-from-source)
@@ -74,6 +75,19 @@ both drivers against the same live database and compares every response.
 - **Cross-platform** — Pre-built binaries for Linux (x86_64/aarch64), macOS
   (x86_64/aarch64), and Windows (x86_64).
 
+## Screenshots
+
+<table>
+<tr>
+<td><img src="assets/screenshots/02-database-picker.png" alt="PostgreSQL listed in the Choose a database picker" width="400" /><br />PostgreSQL in the database picker</td>
+<td><img src="assets/screenshots/03-connection-form.png" alt="PostgreSQL connection form" width="400" /><br />Connection configuration</td>
+</tr>
+<tr>
+<td><img src="assets/screenshots/06-schema-browser.png" alt="Schema browser showing tables, views, and materialized views" width="400" /><br />Multi-schema browsing</td>
+<td><img src="assets/screenshots/07-table-data.png" alt="Data grid with a PostgreSQL enum column value" width="400" /><br />Data grid with enum support</td>
+</tr>
+</table>
+
 ## Connection Configuration
 
 | Parameter | Description | Required |
@@ -101,15 +115,28 @@ both drivers against the same live database and compares every response.
 
 ## Installation
 
-### Automatic (via Tabularis)
+### From the Tabularium registry
 
-If your version of Tabularis supports plugin management, the PostgreSQL plugin
-can be installed directly from the application.
+Not yet published — this plugin is being prepared for its first public
+release on the [Tabularium registry](https://registry.tabularis.dev), the
+same one the [DuckDB](https://github.com/TabularisDB/tabularis-duckdb-plugin)
+and [Elasticsearch](https://github.com/TabularisDB/tabularis-elasticsearch-plugin)
+plugins already ship through. Once submitted and approved, it'll be
+installable directly from Tabularis's in-app plugin browser (**Settings →
+Plugins**) — search for **PostgreSQL** and install from there. Track
+progress in this repo's issues.
 
-### Manual Installation
+If you point Tabularis at a different Tabularium instance via
+`tabulariumRegistryUrl` in `config.json`, make sure that registry has
+ingested this plugin's releases first.
+
+### Manual Installation (current path)
 
 1. Download the latest release for your platform from the
-   [Releases page](https://github.com/TabularisDB/tabularis-postgresql-plugin/releases).
+   [Releases page](https://github.com/TabularisDB/tabularis-postgresql-plugin/releases) —
+   look for the most recent `1.0.0-beta.N` tag; every release published so
+   far, including the first public one, ships on the `beta` prerelease
+   channel (see [Contributing: PR Titles & Versioning](#contributing-pr-titles--versioning)).
 2. Extract the archive.
 3. Copy `postgresql-plugin` (or `postgresql-plugin.exe` on Windows) and
    `.tabularium` into the Tabularis plugins directory:

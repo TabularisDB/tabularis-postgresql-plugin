@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `.tabularium`: `min_runtime_version: "0.20.0"` — per debba's guidance,
+  `tabularis` 0.20.0 is the first release expected to ship the #614/#577
+  host-side fixes (capability-driven identifier quoting, etc.) this
+  plugin depends on for correct behavior under a non-`"postgres"` driver
+  id. Older runtimes will be refused rather than silently misbehaving.
+- README header: a plus icon between the Tabularis and PostgreSQL logos
+  (`assets/plus.svg`, a lucide-style glyph matching the icon set
+  `tabularis`'s own frontend uses) to read as "Tabularis + PostgreSQL" at
+  a glance. Self-hosted a copy of the PostgreSQL project's 3-colors logo
+  (`assets/postgresql-logo-3colors.png`) instead of hotlinking
+  `wiki.postgresql.org`, for the same reliability reason `postgresql-icon.svg`
+  is already self-hosted rather than pointed at a third party.
+- `.tabularium`: `screenshots` array (7 real captures, not mockups —
+  fresh install, database picker, connection form, successful test,
+  saved connection, multi-schema browser, and a live data grid showing a
+  real enum value) plus a matching "Screenshots" section in the README,
+  for the plugin's eventual Tabularium registry submission.
+- `.tabularium`: registry-listing metadata fields — `category`, `tags`,
+  `license`, `readme`, `homepage`, `documentation_url`, `support.issues_url`,
+  `color` — needed for the plugin's eventual Tabularium registry submission.
+  These are purely presentational for the registry's plugin-card/detail
+  page; the builtin driver's own definition
+  (`tabularis`'s `src/hooks/useDrivers.ts`) has none of them, confirming
+  they carry no runtime behavior. No version bump warranted.
+
+### Fixed
+
+- README's release badge showed "no releases or repo not found" because
+  every published release so far (`v1.0.0-beta.1` through `.4`) is flagged
+  `prerelease: true`, and GitHub's `/releases/latest` API — which the
+  unqualified `img.shields.io/github/release/...` badge queries — excludes
+  prereleases by design. Switched to `img.shields.io/github/v/release/...
+  ?include_prereleases`, confirmed rendering `v1.0.0-beta.4` correctly.
+- README's installation section and work-in-progress banner were stale:
+  described a hypothetical "Automatic (via Tabularis)" install path with
+  no registry to install from yet, and the banner's sign-off checklist
+  didn't reflect that `tabularis` PR #577's checklist is now fully checked
+  (though the PR itself remains open/unmerged). Updated both to describe
+  the actual current state — manual install only, registry submission
+  pending — and added a "From the Tabularium registry" placeholder section
+  matching the pattern used by already-published sibling plugins
+  (`tabularis-elasticsearch-plugin`, `tabularis-duckdb-plugin`).
+
 ## [1.0.0-beta.4] - 2026-08-13
 
 ### Fixed
