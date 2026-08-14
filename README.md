@@ -1,7 +1,7 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
-  <img src="assets/plus.svg" width="40" height="40" alt="plus" />
-  <img src="assets/postgresql-logo-3colors.png" width="120" height="120" alt="PostgreSQL logo" />
+  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/plus.svg" width="40" height="40" alt="plus" />
+  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgresql-logo-3colors.png" width="120" height="120" alt="PostgreSQL logo" />
 </div>
 
 # tabularis-postgresql-plugin
@@ -79,12 +79,12 @@ both drivers against the same live database and compares every response.
 
 <table>
 <tr>
-<td><img src="assets/screenshots/02-database-picker.png" alt="PostgreSQL listed in the Choose a database picker" width="400" /><br />PostgreSQL in the database picker</td>
-<td><img src="assets/screenshots/03-connection-form.png" alt="PostgreSQL connection form" width="400" /><br />Connection configuration</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/02-database-picker.png" alt="PostgreSQL listed in the Choose a database picker" width="400" /><br />PostgreSQL in the database picker</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/03-connection-form.png" alt="PostgreSQL connection form" width="400" /><br />Connection configuration</td>
 </tr>
 <tr>
-<td><img src="assets/screenshots/06-schema-browser.png" alt="Schema browser showing tables, views, and materialized views" width="400" /><br />Multi-schema browsing</td>
-<td><img src="assets/screenshots/07-table-data.png" alt="Data grid with a PostgreSQL enum column value" width="400" /><br />Data grid with enum support</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/06-schema-browser.png" alt="Schema browser showing tables, views, and materialized views" width="400" /><br />Multi-schema browsing</td>
+<td><img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/screenshots/07-table-data.png" alt="Data grid with a PostgreSQL enum column value" width="400" /><br />Data grid with enum support</td>
 </tr>
 </table>
 
