@@ -4,6 +4,11 @@
 
 ### Added
 
+- `.tabularium`: `min_runtime_version: "0.20.0"` — per debba's guidance,
+  `tabularis` 0.20.0 is the first release expected to ship the #614/#577
+  host-side fixes (capability-driven identifier quoting, etc.) this
+  plugin depends on for correct behavior under a non-`"postgres"` driver
+  id. Older runtimes will be refused rather than silently misbehaving.
 - README header: a plus icon between the Tabularis and PostgreSQL logos
   (`assets/plus.svg`, a lucide-style glyph matching the icon set
   `tabularis`'s own frontend uses) to read as "Tabularis + PostgreSQL" at

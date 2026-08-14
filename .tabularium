@@ -48,6 +48,7 @@
   "readme": "README.md",
   "homepage": "https://github.com/TabularisDB/tabularis-postgresql-plugin",
   "documentation_url": "https://github.com/TabularisDB/tabularis-postgresql-plugin#readme",
+  "min_runtime_version": "0.20.0",
   "support": {
     "issues_url": "https://github.com/TabularisDB/tabularis-postgresql-plugin/issues"
   },
