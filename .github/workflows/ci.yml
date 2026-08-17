@@ -274,6 +274,11 @@ jobs:
     permissions:
       contents: read
       checks: write
+      # rustsec/audit-check only files a tracking issue for informational
+      # warnings (e.g. "unmaintained") on cron-scheduled runs, not push/PR
+      # runs — which is why this permission gap went unnoticed until the
+      # first scheduled run hit an unmaintained-crate warning.
+      issues: write
     steps:
       - uses: actions/checkout@v7
 

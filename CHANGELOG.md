@@ -1,5 +1,35 @@
 # Changelog
 
+## [Unreleased]
+
+### Removed
+
+- `rustls-pemfile` dependency. It's unmaintained (RUSTSEC-2025-0134 —
+  archived upstream, no CVE) and was our only source of the
+  `Security audit` job's `unmaintained` warning below. Its one call site
+  (`load_roots_from_pem` in `client.rs`, parsing a user-supplied `ssl_ca`
+  bundle for `verify-ca`/`verify-full` connections) migrated to
+  `rustls::pki_types::CertificateDer::pem_slice_iter`, the maintained
+  replacement the advisory itself recommends — already in our dependency
+  tree transitively via `rustls`, so this is a dependency removal, not an
+  addition. Verified against a disposable self-signed-cert Postgres
+  container (`verify-ca` connects correctly; an invalid PEM file still
+  produces the same clear error) and added 3 unit tests for
+  `load_roots_from_pem` directly, which had zero coverage before this.
+
+### Fixed
+
+- `Security audit` CI job failed on its first scheduled (cron) run with
+  `Resource not accessible by integration` when `rustsec/audit-check`
+  tried to file a tracking issue for an informational `unmaintained`
+  warning (`rustls-pemfile`, RUSTSEC-2025-0134 — no CVE, just an
+  archived-upstream notice). The job's `permissions:` block already had
+  `checks: write` from a prior fix (CI publishing its pass/fail status),
+  but not `issues: write` — a separate permission the action only
+  exercises on cron-triggered runs when it has a warning to report, which
+  is why push/PR runs of this same job never surfaced the gap. Added the
+  missing `issues: write` permission.
+
 ## [1.0.0-beta.6] - 2026-08-14
 
 ### Fixed
