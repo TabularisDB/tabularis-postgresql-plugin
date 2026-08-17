@@ -449,11 +449,12 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
 /// Load root certificates from a PEM file (used for `ssl_ca`-pinned
 /// `verify-ca`/`verify-full` connections).
 fn load_roots_from_pem(path: &str) -> Result<rustls::RootCertStore, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+
     let pem =
         std::fs::read(path).map_err(|e| format!("Failed to read ssl_ca file '{path}': {e}"))?;
     let mut roots = rustls::RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(&pem[..]);
-    for cert in rustls_pemfile::certs(&mut cursor) {
+    for cert in CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.map_err(|e| format!("Failed to parse ssl_ca '{path}': {e}"))?;
         roots
             .add(cert)
