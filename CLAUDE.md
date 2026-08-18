@@ -51,12 +51,12 @@ migration, now applied across the repo boundary.
 
 - All RPC handlers are async and return `serde_json::Value`.
 - Handlers live in `src/handlers/`, organized by domain (connection, metadata,
-  crud, ddl, blob, query).
+  crud, ddl, blob).
 - PostgreSQL access goes through `src/client.rs` (deadpool-postgres pool,
-  cached by `host:port:database:user:startup_script`).
+  cached by `host:port:database:user`).
 - Value binding for INSERT/UPDATE lives in `src/binding.rs` — a strict
-  ordered cascade (DEFAULT sentinel, BLOB wire format, enum CAST, boolean,
-  numeric, temporal, UUID shape, PG array literal, TEXT fallback). Order
+  ordered cascade (DEFAULT sentinel, BLOB wire format, boolean, numeric,
+  temporal, enum CAST, UUID shape, PG array literal, TEXT fallback). Order
   matters; do not reorder without understanding why each earlier step must
   run first.
 - Never write to `stdout` outside the JSON-RPC response loop in `main.rs` —
