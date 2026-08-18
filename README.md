@@ -38,6 +38,7 @@ both drivers against the same live database and compares every response.
   - [Manual Installation (alternative)](#manual-installation-alternative)
 - [How It Works](#how-it-works)
 - [Supported Operations](#supported-operations)
+- [Known Limitations](#known-limitations)
 - [Building from Source](#building-from-source)
 - [Development](#development)
   - [Contributing: PR Titles & Versioning](#contributing-pr-titles--versioning)
@@ -168,12 +169,22 @@ reconnecting.
 | `get_foreign_keys` | Foreign key metadata, including cross-schema references |
 | `get_views` / `get_view_definition` / `create_view` / `alter_view` / `drop_view` | View lifecycle |
 | `get_materialized_views` / `refresh_materialized_view` | Materialized view lifecycle |
-| `get_routines` / `get_routine_parameters` / `get_routine_definition` / `drop_routine` | Function/procedure metadata |
+| `get_routines` / `get_routine_parameters` / `get_routine_definition` | Function/procedure metadata |
 | `get_triggers` / `get_trigger_definition` / `create_trigger` / `drop_trigger` | Trigger lifecycle |
 | `execute_query` / `execute_query_batch` / `explain_query` | Query execution, multi-statement batches, and query plans |
 | `insert_record` / `update_record` / `delete_record` | Row-level CRUD with type-aware value binding |
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
 | `save_blob_to_file` / `fetch_blob_as_data_url` | BLOB (`bytea`) export and preview |
+
+## Known Limitations
+
+A few RPC methods are registered but not yet implemented — they return a
+"not implemented" error rather than real data: `get_schema_snapshot`,
+`get_all_columns_batch`, `get_all_foreign_keys_batch`,
+`get_materialized_view_definition`. Tracked in
+[#9](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/9)
+alongside the other planned PostgreSQL-specific features (sequences, JSONB
+inline editing, extension-aware types, and more).
 
 ## Building from Source
 
