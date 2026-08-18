@@ -182,9 +182,10 @@ A few RPC methods are registered but not yet implemented — they return a
 "not implemented" error rather than real data: `get_schema_snapshot`,
 `get_all_columns_batch`, `get_all_foreign_keys_batch`,
 `get_materialized_view_definition`. Tracked in
-[#9](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/9)
-alongside the other planned PostgreSQL-specific features (sequences, JSONB
-inline editing, extension-aware types, and more).
+[#32](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/32),
+part of the [Phase 2](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/9)
+set of planned PostgreSQL-specific features (sequences, JSONB inline
+editing, extension-aware types, and more).
 
 ## Building from Source
 
