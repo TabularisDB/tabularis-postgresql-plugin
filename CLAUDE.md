@@ -2,26 +2,11 @@
 
 ## Status
 
-This repo is intended to become the **primary home** for the PostgreSQL
-plugin. The sign-off checklist from `TabularisDB/tabularis` PR #577 —
-security audit, CI hardening, cross-platform build, the 24-item manual
-smoke test, and the full frontend/backend regression pass — is now
-complete, but that PR (which pivots from building the plugin in-tree to
-removing the built-in driver — see
-`docs/planning/04-phase-3-deprecate-builtin.md`) is still open and
-unmerged. For now, leave `tabularis`'s `plugins/postgres-plugin/`
-untouched; this repo only receives additions, nothing is removed from
-there.
-
-The plugin source has landed here as a copy of the in-tree implementation
-at commit `ad765f3a` (Phase 1 byte-for-byte parity proven: 82/82 parity,
-72/72 baseline, 26/26 golden tests, 72 plugin unit tests — see
-`docs/planning/02-phase-1-plugin-build.md` and
-[`tabularis` PR #577](https://github.com/TabularisDB/tabularis/pull/577)).
-Sign-off to promote this repo to primary is still pending several items
-from that PR's own checklist: cross-platform build verification (only
-macOS ARM confirmed so far), the 24-item manual smoke test, a security
-audit pass, and a frontend regression check (`pnpm test` in `tabularis`).
+This repo is the **primary home** for the PostgreSQL plugin, published to
+the Tabularium registry. It requires Tabularis v0.20.0 or later (the
+release that introduced the plugin runtime this repo depends on) — see
+`.tabularium`'s `min_runtime_version` field and the README's version
+requirement note.
 
 ## Build & Test
 

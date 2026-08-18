@@ -23,15 +23,9 @@ directly into the Tabularis application. It is byte-for-byte behaviorally
 identical to that built-in driver, proven by an 82-test parity suite that runs
 both drivers against the same live database and compares every response.
 
-> ⚠️ **Work in progress** — this repo is intended to become the **primary
-> home** for the PostgreSQL plugin. The sign-off checklist from
-> [`tabularis` PR #577](https://github.com/TabularisDB/tabularis/pull/577)
-> — security audit, CI hardening, cross-platform build, the 24-item manual
-> smoke test, and the full frontend/backend regression pass — is now
-> complete, but that PR (which pivots `tabularis` from building the plugin
-> in-tree to removing the built-in driver) is still open and unmerged. The
-> [`TabularisDB/tabularis` `plugins/postgres-plugin/`](https://github.com/TabularisDB/tabularis/tree/main/plugins/postgres-plugin)
-> copy remains untouched until it merges.
+> **Requires Tabularis v0.20.0 or later.** This plugin relies on the plugin
+> runtime introduced in that release; it will not load on earlier versions of
+> [Tabularis](https://github.com/TabularisDB/tabularis).
 
 ## Table of Contents
 
