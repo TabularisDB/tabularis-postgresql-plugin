@@ -9,9 +9,12 @@ build:
 release:
     cargo build --release
 
-# Run unit tests.
+# Run unit tests. Excludes tests/live_db.rs (a live-database integration
+# test requiring POSTGRES_PLUGIN_BIN and a running PostgreSQL instance —
+# see the "Live PostgreSQL integration" CI job, or run it directly per
+# tests/live_db.rs's own doc comment).
 test:
-    cargo test
+    cargo test --lib --bins
 
 # Launch the local REPL that simulates Tabularis JSON-RPC calls over stdio.
 repl:
