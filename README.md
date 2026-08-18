@@ -35,7 +35,7 @@ both drivers against the same live database and compares every response.
 - [Supported PostgreSQL Data Types](#supported-postgresql-data-types)
 - [Installation](#installation)
   - [From the Tabularium registry](#from-the-tabularium-registry)
-  - [Manual Installation (current path)](#manual-installation-current-path)
+  - [Manual Installation (alternative)](#manual-installation-alternative)
 - [How It Works](#how-it-works)
 - [Supported Operations](#supported-operations)
 - [Building from Source](#building-from-source)
@@ -111,20 +111,17 @@ both drivers against the same live database and compares every response.
 
 ### From the Tabularium registry
 
-Not yet published — this plugin is being prepared for its first public
-release on the [Tabularium registry](https://registry.tabularis.dev), the
-same one the [DuckDB](https://github.com/TabularisDB/tabularis-duckdb-plugin)
+This plugin is published on the [Tabularium registry](https://registry.tabularis.dev) —
+the same one the [DuckDB](https://github.com/TabularisDB/tabularis-duckdb-plugin)
 and [Elasticsearch](https://github.com/TabularisDB/tabularis-elasticsearch-plugin)
-plugins already ship through. Once submitted and approved, it'll be
-installable directly from Tabularis's in-app plugin browser (**Settings →
-Plugins**) — search for **PostgreSQL** and install from there. Track
-progress in this repo's issues.
+plugins ship through. Install it from Tabularis's in-app plugin browser:
+**Settings → Plugins**, search for **PostgreSQL**, and install.
 
 If you point Tabularis at a different Tabularium instance via
 `tabulariumRegistryUrl` in `config.json`, make sure that registry has
 ingested this plugin's releases first.
 
-### Manual Installation (current path)
+### Manual Installation (alternative)
 
 1. Download the latest release for your platform from the
    [Releases page](https://github.com/TabularisDB/tabularis-postgresql-plugin/releases) —
@@ -135,13 +132,13 @@ ingested this plugin's releases first.
 3. Copy `postgresql-plugin` (or `postgresql-plugin.exe` on Windows) and
    `.tabularium` into the Tabularis plugins directory:
 
-| OS | Plugins Directory |
-| --- | --- |
-| **Linux** | `~/.local/share/tabularis/plugins/postgresql/` |
-| **macOS** | `~/Library/Application Support/com.debba.tabularis/plugins/postgresql/` |
-| **Windows** | `%APPDATA%\debba\tabularis\data\plugins\postgresql\` |
+   | OS | Plugins Directory |
+   | --- | --- |
+   | **Linux** | `~/.local/share/tabularis/plugins/postgresql/` |
+   | **macOS** | `~/Library/Application Support/com.debba.tabularis/plugins/postgresql/` |
+   | **Windows** | `%APPDATA%\debba\tabularis\data\plugins\postgresql\` |
 
-1. Restart Tabularis.
+4. Restart Tabularis.
 
 ## How It Works
 
