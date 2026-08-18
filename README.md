@@ -35,9 +35,10 @@ both drivers against the same live database and compares every response.
 - [Supported PostgreSQL Data Types](#supported-postgresql-data-types)
 - [Installation](#installation)
   - [From the Tabularium registry](#from-the-tabularium-registry)
-  - [Manual Installation (current path)](#manual-installation-current-path)
+  - [Manual Installation (alternative)](#manual-installation-alternative)
 - [How It Works](#how-it-works)
 - [Supported Operations](#supported-operations)
+- [Known Limitations](#known-limitations)
 - [Building from Source](#building-from-source)
 - [Development](#development)
   - [Contributing: PR Titles & Versioning](#contributing-pr-titles--versioning)
@@ -111,20 +112,17 @@ both drivers against the same live database and compares every response.
 
 ### From the Tabularium registry
 
-Not yet published — this plugin is being prepared for its first public
-release on the [Tabularium registry](https://registry.tabularis.dev), the
-same one the [DuckDB](https://github.com/TabularisDB/tabularis-duckdb-plugin)
+This plugin is published on the [Tabularium registry](https://registry.tabularis.dev) —
+the same one the [DuckDB](https://github.com/TabularisDB/tabularis-duckdb-plugin)
 and [Elasticsearch](https://github.com/TabularisDB/tabularis-elasticsearch-plugin)
-plugins already ship through. Once submitted and approved, it'll be
-installable directly from Tabularis's in-app plugin browser (**Settings →
-Plugins**) — search for **PostgreSQL** and install from there. Track
-progress in this repo's issues.
+plugins ship through. Install it from Tabularis's in-app plugin browser:
+**Settings → Plugins**, search for **PostgreSQL**, and install.
 
 If you point Tabularis at a different Tabularium instance via
 `tabulariumRegistryUrl` in `config.json`, make sure that registry has
 ingested this plugin's releases first.
 
-### Manual Installation (current path)
+### Manual Installation (alternative)
 
 1. Download the latest release for your platform from the
    [Releases page](https://github.com/TabularisDB/tabularis-postgresql-plugin/releases) —
@@ -135,13 +133,13 @@ ingested this plugin's releases first.
 3. Copy `postgresql-plugin` (or `postgresql-plugin.exe` on Windows) and
    `.tabularium` into the Tabularis plugins directory:
 
-| OS | Plugins Directory |
-| --- | --- |
-| **Linux** | `~/.local/share/tabularis/plugins/postgresql/` |
-| **macOS** | `~/Library/Application Support/com.debba.tabularis/plugins/postgresql/` |
-| **Windows** | `%APPDATA%\debba\tabularis\data\plugins\postgresql\` |
+   | OS | Plugins Directory |
+   | --- | --- |
+   | **Linux** | `~/.local/share/tabularis/plugins/postgresql/` |
+   | **macOS** | `~/Library/Application Support/com.debba.tabularis/plugins/postgresql/` |
+   | **Windows** | `%APPDATA%\debba\tabularis\data\plugins\postgresql\` |
 
-1. Restart Tabularis.
+4. Restart Tabularis.
 
 ## How It Works
 
@@ -171,12 +169,23 @@ reconnecting.
 | `get_foreign_keys` | Foreign key metadata, including cross-schema references |
 | `get_views` / `get_view_definition` / `create_view` / `alter_view` / `drop_view` | View lifecycle |
 | `get_materialized_views` / `refresh_materialized_view` | Materialized view lifecycle |
-| `get_routines` / `get_routine_parameters` / `get_routine_definition` / `drop_routine` | Function/procedure metadata |
+| `get_routines` / `get_routine_parameters` / `get_routine_definition` | Function/procedure metadata |
 | `get_triggers` / `get_trigger_definition` / `create_trigger` / `drop_trigger` | Trigger lifecycle |
 | `execute_query` / `execute_query_batch` / `explain_query` | Query execution, multi-statement batches, and query plans |
 | `insert_record` / `update_record` / `delete_record` | Row-level CRUD with type-aware value binding |
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
 | `save_blob_to_file` / `fetch_blob_as_data_url` | BLOB (`bytea`) export and preview |
+
+## Known Limitations
+
+A few RPC methods are registered but not yet implemented — they return a
+"not implemented" error rather than real data: `get_schema_snapshot`,
+`get_all_columns_batch`, `get_all_foreign_keys_batch`,
+`get_materialized_view_definition`. Tracked in
+[#32](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/32),
+part of the [Phase 2](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/9)
+set of planned PostgreSQL-specific features (sequences, JSONB inline
+editing, extension-aware types, and more).
 
 ## Building from Source
 
