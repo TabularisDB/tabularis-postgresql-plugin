@@ -311,3 +311,23 @@ fn broken_startup_script_fails_fast_with_clear_attribution() {
         "error should be clearly attributed to the startup script, got: {error}"
     );
 }
+
+// Coverage for #43: build_pool never called cfg.ssl_mode(...), so
+// tokio_postgres's own default (SslMode::Prefer) applied regardless of the
+// plugin's ssl_mode value, letting ssl_mode=require silently connect over
+// plaintext instead of failing. CI's live-db-integration fixture runs a
+// plain `postgres:16` container with no SSL configured (see
+// .github/workflows/ci.yml), so this must fail here just like it would
+// against any server that hasn't been configured to offer TLS.
+#[test]
+fn ssl_mode_require_fails_against_a_server_without_tls() {
+    let mut plugin = Plugin::spawn();
+    let mut params = conn_params();
+    params["ssl_mode"] = json!("require");
+
+    let response = plugin.call("test_connection", json!({ "params": params }));
+    assert!(
+        response.get("error").is_some(),
+        "ssl_mode=require must fail against a server with no TLS, not silently connect over plaintext"
+    );
+}

@@ -5,9 +5,10 @@ use tokio::sync::Mutex;
 
 use super::{
     build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
-    load_client_cert_from_pem, load_roots_from_pem, VerifyCaCertVerifier, POOLS,
+    load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode, VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
+use deadpool_postgres::SslMode;
 
 // `POOLS` is a single process-wide static, and Rust's test harness runs
 // `#[tokio::test]` fns concurrently on separate threads — without this,
@@ -591,4 +592,39 @@ fn build_tls_connector_verify_ca_attaches_a_configured_client_cert() {
         config.client_auth_cert_resolver.has_certs(),
         "verify-ca must attach the configured client cert, not silently drop it"
     );
+}
+
+// Coverage for #43: build_pool never called cfg.ssl_mode(...), so
+// tokio_postgres's own default (SslMode::Prefer) applied regardless of
+// ssl_mode=require/verify-ca/verify-full, letting connections silently
+// fall back to plaintext instead of enforcing TLS at the protocol level.
+// resolve_ssl_mode maps this plugin's ssl_mode strings to
+// tokio_postgres::config::SslMode, matching the builtin driver's
+// build_postgres_configurations mapping exactly.
+
+#[test]
+fn resolve_ssl_mode_maps_disable() {
+    assert_eq!(resolve_ssl_mode(Some("disable")), Some(SslMode::Disable));
+}
+
+#[test]
+fn resolve_ssl_mode_maps_allow_and_prefer_to_prefer() {
+    assert_eq!(resolve_ssl_mode(Some("allow")), Some(SslMode::Prefer));
+    assert_eq!(resolve_ssl_mode(Some("prefer")), Some(SslMode::Prefer));
+}
+
+#[test]
+fn resolve_ssl_mode_maps_require_verify_ca_and_verify_full_to_require() {
+    assert_eq!(resolve_ssl_mode(Some("require")), Some(SslMode::Require));
+    assert_eq!(resolve_ssl_mode(Some("verify-ca")), Some(SslMode::Require));
+    assert_eq!(
+        resolve_ssl_mode(Some("verify-full")),
+        Some(SslMode::Require)
+    );
+}
+
+#[test]
+fn resolve_ssl_mode_leaves_unset_or_unknown_values_unmapped() {
+    assert_eq!(resolve_ssl_mode(None), None);
+    assert_eq!(resolve_ssl_mode(Some("bogus")), None);
 }
