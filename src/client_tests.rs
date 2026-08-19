@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use super::{
     build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
-    load_client_cert_from_pem, load_roots_from_pem, POOLS,
+    load_client_cert_from_pem, load_roots_from_pem, VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 
@@ -307,6 +307,50 @@ yORfscWKlsDf+tv4Zb2jYQ==
 -----END PRIVATE KEY-----
 ";
 
+// Self-signed CA + a server leaf cert it issued for CN/SAN
+// `cert-hostname.example` (100-year validity, generated via `openssl req
+// -x509`/`openssl x509 -req`) — used to prove `verify-ca` validates the
+// chain but must NOT reject a hostname mismatch (that's what distinguishes
+// it from `verify-full`; see issue #38).
+const FIXTURE_CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIICyjCCAbKgAwIBAgIJAMUP8ld3x16kMA0GCSqGSIb3DQEBCwUAMBkxFzAVBgNV
+BAMMDlRlc3QgUGFyaXR5IENBMCAXDTI2MDgxOTEzMDMxMVoYDzIxMjYwNzI2MTMw
+MzExWjAZMRcwFQYDVQQDDA5UZXN0IFBhcml0eSBDQTCCASIwDQYJKoZIhvcNAQEB
+BQADggEPADCCAQoCggEBANO7mxf1C4m0QXiWFez1OIwX0SLM35IRrpIEki4yIMlA
+3c1SGzuXchNROu0QEz1A0WJosZHZNR1LRwxYpk6x9G7h/ojlzlpEYkyEE1y/i0VV
+q5m+VxzARr54YcEny18tAFmKV73HeIRDrrM2k+L5GAObtCGJpsmkJQV87OMXrRWy
+WsASq4hZS1/rFd+mwyUeVp5U7o8LkFMp+Kxc4UOUtXu5EAda7x26H3ARXtpYgUdX
+l07k8SZ7jNR1immup/FVUpuCualtguEH5dLfmi4d+nAakIktGz61TSUQtSrPTFJH
+c7c8UYG0ogqk1RZiNxMnSFjhDCgKblrPXq4EUloAiy8CAwEAAaMTMBEwDwYDVR0T
+AQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAOB2iKUnYvx6BhczwsULe8ASU
+wJeN2u6uj0EwxPpcAacDb7ccz0/muD5GyPFs2f7DkiYOg7aI6XVmWIIb0hN4gvwy
++480mQj4+y51ZqtPDykXkhyUerrU/ZRrP/AgpjtTw1tJ2I2xQWFLHtyb55zKguxW
+r8sWnR/o6ZqaMQk6mcAQUkmOAUoTONPhrZD6LyKgxEC4/SN4TullHzPyaA0Grn1d
+NdpSUD6Q5w8D7iXzeWS14pGG9JBKoa/f3/RBSXIqO3HsMttltNbUXpQE/uT+LDZe
+yYrwHa9ZAVl3uV5ToMwfbGRK58IILIEDmmSkq97YoYAunqUcC/nAu9SmVQMteQ==
+-----END CERTIFICATE-----
+";
+
+const FIXTURE_SERVER_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIC4jCCAcqgAwIBAgIJAPgkrGMQ7ApvMA0GCSqGSIb3DQEBCwUAMBkxFzAVBgNV
+BAMMDlRlc3QgUGFyaXR5IENBMCAXDTI2MDgxOTEzMDMxMVoYDzIxMjYwNzI2MTMw
+MzExWjAgMR4wHAYDVQQDDBVjZXJ0LWhvc3RuYW1lLmV4YW1wbGUwggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDClp6Zk39KW/t8Pg2EzKn+OEOxL7WlxMCS
+T1Je/FWZLHxV2EoyBLBQDvLsbREJnqxoAZ2bYd2Lq8YJWEP/SqnjWFpyPrLxIIb4
+HJzI7sqENF6fZpcLLo7hCnVHzWkWOPB1p3QOFYrot1Pnf51Qdw7QkqOp4J2GR3Zf
+TbwCSZt2Kkn30IisFzp6Gl/FHPqKEnm6PK9RYtXOCtDjY4tECrSIpQIhkFE/CytI
+sq71boNUBL5bpCIQkqVIvMT1pd5b2VRe1p15mOE3QsBBMu9SFk5FSljS/n3NrIQK
+AimBqRY5Hx+Se/FpGFADVjzEF4YaalLRHGjVjzaoNVhgcCsWsjwVAgMBAAGjJDAi
+MCAGA1UdEQQZMBeCFWNlcnQtaG9zdG5hbWUuZXhhbXBsZTANBgkqhkiG9w0BAQsF
+AAOCAQEAKJseOSTJEdEq+pGXPNHsXrizteuF7WlFYBr3Cup/MO4b+nMkJarzmbqp
+MFZk3l/3nssmCSlJ4lXDToWadkTkvFF6+IbSENS25OE5v01BNDYpx3P0eKrJ45G2
+/FWtAQr/yqVuCdPJSlaeTnn9RsPwZuH/RjWcH7tASPtAy1QaBclTZlX4jz2LzvoJ
+QSukREcPVQohSKwAM4pU+YNa7ktLFa0APCQcQ8pks9rY98vxxib0FQNr5kh3ZcCT
+GEWslhtuCliQjxnE4A1E8PxtF6I6huONjlJ0Z/uQrZc1B5uJf0dsPlAb0Y3Op5R+
+NV3jgQrSEPlHBW/Z+aJ152TvH0IG4w==
+-----END CERTIFICATE-----
+";
+
 fn params_with_ssl(ssl_mode: &str) -> ConnectionParams {
     ConnectionParams {
         driver: Some("postgres-plugin".to_string()),
@@ -442,5 +486,109 @@ fn build_tls_connector_errors_when_ssl_key_is_set_without_ssl_cert() {
     assert!(
         err.contains("ssl_cert") && err.contains("ssl_key"),
         "unexpected error message: {err}"
+    );
+}
+
+/// Constructs a `VerifyCaCertVerifier` from `FIXTURE_CA_CERT_PEM` and runs
+/// it against a leaf cert issued by that CA (`FIXTURE_SERVER_CERT_PEM`),
+/// checked against a hostname that deliberately does not match the leaf's
+/// CN/SAN (`cert-hostname.example`). Returns the verifier's
+/// `verify_server_cert` result so tests can assert accept-vs-reject
+/// without a live TLS server.
+fn probe_verify_ca_verifier_against_mismatched_hostname() -> Result<(), rustls::Error> {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(FIXTURE_CA_CERT_PEM.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let verifier = VerifyCaCertVerifier::new(roots).expect("verifier should build from valid CA");
+
+    let end_entity: CertificateDer =
+        CertificateDer::pem_slice_iter(FIXTURE_SERVER_CERT_PEM.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+    let server_name = ServerName::try_from("totally-unrelated-hostname.internal").unwrap();
+
+    verifier
+        .verify_server_cert(&end_entity, &[], &server_name, &[], UnixTime::now())
+        .map(|_| ())
+}
+
+#[test]
+fn verify_ca_cert_verifier_accepts_a_chain_valid_cert_with_mismatched_hostname() {
+    probe_verify_ca_verifier_against_mismatched_hostname().expect(
+        "verify-ca must validate the chain but skip hostname verification — \
+         that's the entire distinction from verify-full (matches libpq semantics)",
+    );
+}
+
+#[test]
+fn verify_ca_cert_verifier_still_rejects_a_cert_from_an_untrusted_ca() {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
+
+    // Empty root store: the fixture server cert's issuer is not in it, so
+    // chain validation itself (not hostname) must reject this.
+    let untrusted_ca_pem = FIXTURE_CERT_PEM; // unrelated CA from load_roots_from_pem's fixtures above
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(untrusted_ca_pem.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let verifier = VerifyCaCertVerifier::new(roots).expect("verifier should build");
+
+    let end_entity: CertificateDer =
+        CertificateDer::pem_slice_iter(FIXTURE_SERVER_CERT_PEM.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+    let server_name = ServerName::try_from("cert-hostname.example").unwrap();
+
+    let result = verifier.verify_server_cert(&end_entity, &[], &server_name, &[], UnixTime::now());
+    assert!(
+        result.is_err(),
+        "a cert signed by a CA not in the root store must still be rejected"
+    );
+}
+
+#[test]
+fn build_tls_connector_verify_ca_uses_the_hostname_skipping_verifier() {
+    let ca_path = write_temp_file(FIXTURE_CA_CERT_PEM);
+    let mut params = params_with_ssl("verify-ca");
+    params.ssl_ca = Some(ca_path.to_str().unwrap().to_string());
+
+    let result = build_tls_connector(&params);
+    std::fs::remove_file(&ca_path).ok();
+
+    result.expect("verify-ca with a valid ssl_ca file should build a connector successfully");
+}
+
+// Regression coverage for a merge-time bug (#38's VerifyCaCertVerifier
+// branch initially dropped #35's client_auth entirely, always calling
+// .with_no_client_auth() regardless of ssl_cert/ssl_key): verify-ca must
+// actually attach the client cert, not silently ignore it. Checking
+// `has_certs()` distinguishes "attached" from merely "built successfully"
+// — the buggy version also built successfully, just with no client cert.
+#[test]
+fn build_tls_connector_verify_ca_attaches_a_configured_client_cert() {
+    let ca_path = write_temp_file(FIXTURE_CA_CERT_PEM);
+    let cert_path = write_temp_file(FIXTURE_CLIENT_CERT_PEM);
+    let key_path = write_temp_file(FIXTURE_CLIENT_KEY_PEM);
+
+    let mut params = params_with_ssl("verify-ca");
+    params.ssl_ca = Some(ca_path.to_str().unwrap().to_string());
+    params.ssl_cert = Some(cert_path.to_str().unwrap().to_string());
+    params.ssl_key = Some(key_path.to_str().unwrap().to_string());
+
+    let config = build_tls_connector(&params).expect("connector should build");
+    std::fs::remove_file(&ca_path).ok();
+    std::fs::remove_file(&cert_path).ok();
+    std::fs::remove_file(&key_path).ok();
+
+    assert!(
+        config.client_auth_cert_resolver.has_certs(),
+        "verify-ca must attach the configured client cert, not silently drop it"
     );
 }
