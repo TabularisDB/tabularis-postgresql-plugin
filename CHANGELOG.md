@@ -28,6 +28,21 @@
   staged, so this was a parity miss during extraction, not a later
   upstream change. Folded all four TLS params into `connection_key`,
   matching the builtin's TLS-param keying.
+- `ssl_mode=verify-ca` incorrectly enforced hostname verification —
+  `build_tls_connector` wrapped `rustls::client::WebPkiServerVerifier` for
+  `verify-ca`, whose `verify_server_cert` unconditionally checks the
+  hostname with no way to opt out, making `verify-ca` behave identically to
+  `verify-full`. `verify-ca` is supposed to validate the certificate chain
+  but skip hostname verification — that's the entire distinction from
+  `verify-full` (matches libpq `sslmode=verify-ca` semantics). Added a
+  dedicated `VerifyCaCertVerifier`, ported from the builtin driver's
+  `src-tauri/src/pool_manager.rs`, using
+  `rustls::client::verify_server_cert_signed_by_trust_anchor` directly
+  instead. Proved the bug and the fix with a chain-valid cert whose
+  hostname deliberately doesn't match the connection target: rejected
+  before this fix, accepted after (while a CA-untrusted cert is still
+  correctly rejected, and `verify-full` still correctly rejects the
+  hostname mismatch).
 
 ## [1.0.0-beta.7] - 2026-08-17
 

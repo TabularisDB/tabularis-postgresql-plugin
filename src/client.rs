@@ -419,12 +419,15 @@ fn needs_tls(params: &ConnectionParams) -> bool {
 
 /// Build a rustls ClientConfig. `verify-ca`/`verify-full` validate the
 /// server's certificate chain — against a caller-supplied CA bundle
-/// (`ssl_ca`) when present, or the platform trust store otherwise. `require`
-/// forces TLS without certificate validation (matches the builtin driver's
-/// `require` behavior — see `src-tauri/src/pool_manager.rs`). When
-/// `ssl_cert`/`ssl_key` are both supplied, presents them as a client
-/// certificate for servers requiring mTLS (e.g. Google Cloud SQL) — matches
-/// the builtin driver's `build_postgres_tls_connector` client-auth handling.
+/// (`ssl_ca`) when present, or the platform trust store otherwise.
+/// `verify-ca` deliberately skips hostname verification (that's the entire
+/// distinction from `verify-full` — matches libpq `sslmode=verify-ca`
+/// semantics, see `VerifyCaCertVerifier` below). `require` forces TLS
+/// without certificate validation (matches the builtin driver's `require`
+/// behavior — see `src-tauri/src/pool_manager.rs`). When `ssl_cert`/
+/// `ssl_key` are both supplied, presents them as a client certificate for
+/// servers requiring mTLS (e.g. Google Cloud SQL) — matches the builtin
+/// driver's `build_postgres_tls_connector` client-auth handling.
 fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig, String> {
     use rustls_platform_verifier::BuilderVerifierExt;
 
@@ -457,6 +460,18 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
     if needs_cert_validation {
         if let Some(ca_path) = user_ca {
             let roots = load_roots_from_pem(ca_path)?;
+            if params.ssl_mode.as_deref() == Some("verify-ca") {
+                let verifier = VerifyCaCertVerifier::new(roots)?;
+                let builder = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
+                return match client_auth {
+                    Some((certs, key)) => builder
+                        .with_client_auth_cert(certs, key)
+                        .map_err(|e| format!("Failed to configure client certificate: {e}")),
+                    None => Ok(builder.with_no_client_auth()),
+                };
+            }
             let verifier =
                 rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots))
                     .build()
@@ -481,6 +496,87 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
             .with_client_auth_cert(certs, key)
             .map_err(|e| format!("Failed to configure client certificate: {e}")),
         None => Ok(builder.with_no_client_auth()),
+    }
+}
+
+/// Validates the certificate chain against a custom root store but skips
+/// hostname verification — matches libpq `sslmode=verify-ca` behavior (the
+/// builtin driver's `src-tauri/src/pool_manager.rs::VerifyCaCertVerifier`).
+///
+/// Uses `verify_server_cert_signed_by_trust_anchor` directly rather than
+/// wrapping `rustls::client::WebPkiServerVerifier` — the latter's
+/// `verify_server_cert` unconditionally checks the hostname via
+/// `verify_server_name`, with no way to opt out, which would make
+/// `verify-ca` behave identically to `verify-full` (see issue #38).
+#[derive(Debug)]
+struct VerifyCaCertVerifier {
+    roots: std::sync::Arc<rustls::RootCertStore>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl VerifyCaCertVerifier {
+    fn new(roots: rustls::RootCertStore) -> Result<Self, String> {
+        let provider = match rustls::crypto::CryptoProvider::get_default() {
+            Some(provider) => provider.clone(),
+            None => {
+                let provider = rustls::crypto::ring::default_provider();
+                let supported = provider.signature_verification_algorithms;
+                // Ignore the error from losing an install race — another
+                // caller's install still leaves a usable default installed.
+                let _ = provider.install_default();
+                return Ok(Self {
+                    roots: std::sync::Arc::new(roots),
+                    supported,
+                });
+            }
+        };
+        Ok(Self {
+            roots: std::sync::Arc::new(roots),
+            supported: provider.signature_verification_algorithms,
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for VerifyCaCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
+            intermediates,
+            now,
+            self.supported.all,
+        )?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
     }
 }
 
