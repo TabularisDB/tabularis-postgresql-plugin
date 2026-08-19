@@ -43,6 +43,16 @@
   before this fix, accepted after (while a CA-untrusted cert is still
   correctly rejected, and `verify-full` still correctly rejects the
   hostname mismatch).
+- MONEY columns always read as `null` — `extract_value` had no case for
+  `Type::MONEY`, so it fell through to the generic string fallback, but
+  `String`'s `FromSql::accepts` returns `false` for `Type::MONEY` (confirmed
+  directly), making that fallback fail every time regardless of the actual
+  value. MONEY is listed as a supported numeric type in the README and
+  `ddl.rs`'s implicit-cast-compatible group, but reading it back was
+  silently broken. Added a `Money` wrapper (`src/extract.rs`) that decodes
+  the same 8-byte big-endian i64 wire format `INT8` uses and reuses the
+  existing `i64_to_json` JS-safe-integer stringification, matching the
+  builtin driver's `extract/advanced_types.rs::Money`.
 
 ## [1.0.0-beta.7] - 2026-08-17
 
