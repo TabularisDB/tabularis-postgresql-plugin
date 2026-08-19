@@ -13,10 +13,10 @@
 //! transient connection hiccup on one call (e.g. a setup step in a test) is
 //! silently swallowed by the caller and never retried, unlike a persistent
 //! pool where a single connection failure doesn't affect already-established
-//! connections. Caching by `host:port:database:user` (matches the builtin's
-//! `build_connection_key` pattern in `src-tauri/src/pool_manager.rs`, minus
-//! the TLS/connection_id refinements that plugin doesn't need yet) closes
-//! that gap.
+//! connections. Caching by `host:port:database:user:startup_script` plus
+//! every TLS param (matches the builtin's `build_connection_key` pattern in
+//! `src-tauri/src/pool_manager.rs`, minus the per-connection_id refinement
+//! that plugin doesn't need yet) closes that gap.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -214,17 +214,24 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 }
 
 /// Identifies a connection target for pool-cache purposes.
-/// Matches on host:port:database:user (plus the startup script, so editing
-/// it forces a fresh pool) — sufficient for this plugin's scope (no
-/// per-connection TLS-mode/connection_id refinement, unlike the builtin).
+/// Matches on host:port:database:user:startup_script, plus every TLS param
+/// (ssl_mode/ssl_ca/ssl_cert/ssl_key) — otherwise two connections differing
+/// only in TLS configuration would incorrectly share a pool and its
+/// already-negotiated TLS setup. Matches the builtin's `build_connection_key`
+/// TLS-param keying in `src-tauri/src/pool_manager.rs`, minus the
+/// per-connection_id refinement that plugin doesn't need yet.
 fn connection_key(params: &ConnectionParams) -> String {
     format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         params.host.as_deref().unwrap_or(""),
         params.port.unwrap_or(5432),
         params.database.as_deref().unwrap_or(""),
         params.username.as_deref().unwrap_or(""),
         params.startup_script.as_deref().unwrap_or(""),
+        params.ssl_mode.as_deref().unwrap_or(""),
+        params.ssl_ca.as_deref().unwrap_or(""),
+        params.ssl_cert.as_deref().unwrap_or(""),
+        params.ssl_key.as_deref().unwrap_or(""),
     )
 }
 
