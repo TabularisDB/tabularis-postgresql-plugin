@@ -471,6 +471,15 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
         (None, None) => None,
     };
 
+    if params.ssl_mode.as_deref() == Some("verify-ca") && user_ca.is_none() {
+        return Err(
+            "verify-ca mode requires an explicit CA file via ssl_ca. Platform \
+             root certificates are not used for this mode — for automatic \
+             platform trust, use verify-full instead."
+                .to_string(),
+        );
+    }
+
     let needs_cert_validation = matches!(
         params.ssl_mode.as_deref(),
         Some("verify-ca" | "verify-full")

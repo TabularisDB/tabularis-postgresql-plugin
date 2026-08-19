@@ -670,3 +670,20 @@ fn build_tls_connector_require_builds_successfully_with_no_ssl_ca() {
     build_tls_connector(&params)
         .expect("require mode must build a connector without needing ssl_ca set");
 }
+
+// Coverage for #46: verify-ca without an explicit ssl_ca silently fell
+// through to with_platform_verifier() instead of erroring — the builtin
+// driver's build_postgres_tls_connector errors instead ("verify-ca mode
+// requires an explicit CA file..."), since platform roots are deliberately
+// not used for this mode (macOS EKU checks reject them).
+#[test]
+fn build_tls_connector_verify_ca_without_ssl_ca_returns_a_clear_error() {
+    let params = params_with_ssl("verify-ca");
+
+    let err = build_tls_connector(&params)
+        .expect_err("verify-ca without ssl_ca must be rejected as a config error");
+    assert!(
+        err.contains("verify-ca") && err.contains("ssl_ca"),
+        "unexpected error message: {err}"
+    );
+}
