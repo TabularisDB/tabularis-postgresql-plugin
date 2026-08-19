@@ -17,6 +17,17 @@
   via the same trait. Both TLS branches now present the client cert via
   `.with_client_auth_cert(...)` when `ssl_cert`/`ssl_key` are set, and
   `build_tls_connector` errors clearly if only one of the pair is provided.
+- Pool cache key ignored every TLS param (`ssl_mode`/`ssl_ca`/`ssl_cert`/
+  `ssl_key`) — `connection_key` matched only on
+  `host:port:database:user:startup_script`, so two connections to the same
+  target differing only in TLS configuration (e.g. `require` vs.
+  `verify-full`, or different client certs) could incorrectly share a
+  cached pool and its already-negotiated TLS setup. This wasn't inherited
+  from the builtin driver: the builtin's `build_connection_key` already
+  keyed on `ssl_mode`/`ssl_ca` before this plugin's `client.rs` was even
+  staged, so this was a parity miss during extraction, not a later
+  upstream change. Folded all four TLS params into `connection_key`,
+  matching the builtin's TLS-param keying.
 
 ## [1.0.0-beta.7] - 2026-08-17
 

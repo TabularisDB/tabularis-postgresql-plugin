@@ -70,6 +70,65 @@ fn connection_key_is_stable_for_identical_params() {
     assert_eq!(a, b);
 }
 
+#[test]
+fn connection_key_differs_by_ssl_mode() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.ssl_mode = Some("require".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.ssl_mode = Some("verify-full".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different ssl_mode values must not share a cache key"
+    );
+}
+
+#[test]
+fn connection_key_differs_by_ssl_ca() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.ssl_mode = Some("verify-ca".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.ssl_mode = Some("verify-ca".to_string());
+    b.ssl_ca = Some("/tmp/ca.pem".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different ssl_ca values must not share a cache key"
+    );
+}
+
+#[test]
+fn connection_key_differs_by_ssl_cert() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.ssl_mode = Some("require".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.ssl_mode = Some("require".to_string());
+    b.ssl_cert = Some("/tmp/client-cert.pem".to_string());
+    b.ssl_key = Some("/tmp/client-key.pem".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different ssl_cert/ssl_key values must not share a cache key"
+    );
+}
+
+#[test]
+fn connection_key_differs_by_ssl_key_alone() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.ssl_mode = Some("require".to_string());
+    a.ssl_cert = Some("/tmp/client-cert.pem".to_string());
+    a.ssl_key = Some("/tmp/client-key-a.pem".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.ssl_mode = Some("require".to_string());
+    b.ssl_cert = Some("/tmp/client-cert.pem".to_string());
+    b.ssl_key = Some("/tmp/client-key-b.pem".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different ssl_key values must not share a cache key even with an identical ssl_cert"
+    );
+}
+
 #[tokio::test]
 async fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     // deadpool's Pool::new is lazy (no connection attempt at creation
