@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 
-use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime, SslMode};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{NoTls, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -311,6 +311,7 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
+    cfg.ssl_mode = resolve_ssl_mode(params.ssl_mode.as_deref());
 
     let script = params
         .startup_script
@@ -415,6 +416,23 @@ fn needs_tls(params: &ConnectionParams) -> bool {
         params.ssl_mode.as_deref(),
         Some("require" | "verify-ca" | "verify-full")
     )
+}
+
+/// Map this plugin's `ssl_mode` strings to `deadpool_postgres::SslMode`,
+/// so `require`/`verify-ca`/`verify-full` actually force TLS at the protocol
+/// level instead of leaving `tokio_postgres`'s own default (`SslMode::Prefer`)
+/// in effect, which silently accepts a plaintext connection when the server
+/// doesn't offer TLS. Matches the builtin driver's `ssl_mode` mapping in
+/// `build_postgres_configurations` (`src-tauri/src/pool_manager.rs`) exactly.
+/// Certificate/hostname verification is unaffected — that's handled
+/// separately by `build_tls_connector`.
+fn resolve_ssl_mode(ssl_mode: Option<&str>) -> Option<SslMode> {
+    match ssl_mode {
+        Some("disable") => Some(SslMode::Disable),
+        Some("allow" | "prefer") => Some(SslMode::Prefer),
+        Some("require" | "verify-ca" | "verify-full") => Some(SslMode::Require),
+        _ => None,
+    }
 }
 
 /// Build a rustls ClientConfig. `verify-ca`/`verify-full` validate the

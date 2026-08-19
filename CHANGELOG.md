@@ -53,6 +53,21 @@
   the same 8-byte big-endian i64 wire format `INT8` uses and reuses the
   existing `i64_to_json` JS-safe-integer stringification, matching the
   builtin driver's `extract/advanced_types.rs::Money`.
+- `ssl_mode=require`/`verify-ca`/`verify-full` silently allowed plaintext
+  connections — `build_pool` never called `cfg.ssl_mode(...)` on the
+  `deadpool_postgres::Config`, so the underlying `tokio_postgres::Config`
+  kept its own default (`SslMode::Prefer`: negotiate TLS if offered, but
+  accept plaintext otherwise) regardless of what this plugin's `ssl_mode`
+  was actually set to. A user opting into "TLS or nothing" got an
+  unencrypted connection with no error if the server couldn't/wouldn't
+  negotiate TLS — a security-relevant gap, not just a correctness one.
+  Added `resolve_ssl_mode`, mapping this plugin's `ssl_mode` strings to
+  `deadpool_postgres::SslMode` to match the builtin driver's
+  `build_postgres_configurations` mapping exactly (`disable`→`Disable`,
+  `allow`/`prefer`→`Prefer`, `require`/`verify-ca`/`verify-full`→`Require`),
+  and wired it into `build_pool`. Proved the bug and the fix with a live
+  test against a real non-SSL PostgreSQL instance: `ssl_mode=require`
+  connected successfully before this fix, and now correctly fails.
 
 ## [1.0.0-beta.7] - 2026-08-17
 
