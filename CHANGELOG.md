@@ -85,6 +85,15 @@
   before this fix, and now connects successfully; confirmed no regression
   in `verify-ca`/`verify-full` (still correctly validate) or `require`
   against a non-SSL server (still correctly fails, per the previous entry).
+- `verify-ca` without an explicit `ssl_ca` file silently fell through to
+  `with_platform_verifier()` — full OS-trust-store validation — instead of
+  erroring, unlike the builtin driver's `build_postgres_tls_connector`,
+  which requires an explicit CA file for this mode (platform roots aren't
+  used, since macOS's strict EKU check rejects them) and errors clearly
+  otherwise. `build_tls_connector` now returns the same class of error when
+  `verify-ca` is set with no `ssl_ca`; `verify-full` without `ssl_ca`
+  continues to use the platform verifier unchanged, since that's the
+  documented distinction between the two modes.
 
 ## [1.0.0-beta.7] - 2026-08-17
 
