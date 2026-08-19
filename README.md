@@ -94,6 +94,8 @@ both drivers against the same live database and compares every response.
 | `password` | Database password | If required by the server |
 | `ssl_mode` | `disable`, `require`, `verify-ca`, or `verify-full` | No |
 | `ssl_ca` | Path to a custom CA bundle PEM file, used to validate the server's certificate under `verify-ca`/`verify-full` instead of the system trust store | No |
+| `ssl_cert` | Path to a client certificate PEM file, for servers requiring mutual TLS (e.g. Google Cloud SQL). Must be set together with `ssl_key` | No |
+| `ssl_key` | Path to the private key PEM file matching `ssl_cert`. Must be set together with `ssl_cert` | No |
 | `connection_string` | Full `postgres://user:pass@host:port/db` URL, as an alternative to the discrete fields above | No |
 | `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query | No |
 
