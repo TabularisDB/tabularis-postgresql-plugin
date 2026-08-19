@@ -72,6 +72,32 @@ migration, now applied across the repo boundary.
   built-in's implementation first and match its SQL/behavior exactly —
   don't improve on it silently; behavioral differences are regressions here,
   not fixes.
+- **Parity gaps beyond SQL text**: the 82-test parity suite (see "Cross-Repo
+  Parity Check" above) and this repo's own SQL-builder unit tests cover
+  query text well, but four gaps found by a full source-level audit against
+  the builtin (`src-tauri/src/pool_manager.rs` and
+  `src-tauri/src/drivers/postgres/`) all lived in code paths that suite
+  doesn't exercise directly: TLS/pool-config semantics (issues #34, #36,
+  #38 — mTLS client-cert not honored, pool cache key ignoring TLS params
+  entirely, `verify-ca` incorrectly enforcing hostname checks) and
+  wire-format type coverage in `extract.rs` (#39 — `MONEY` silently
+  decoding to `null`). When auditing for parity, read the builtin's actual
+  Rust source for the subsystem (not just its SQL strings) — connection/TLS
+  config and `extract.rs`'s `Type::` dispatch table are the areas most
+  likely to silently diverge, since they're exercised by config values and
+  column types rather than by query shape.
+- **TDD for parity bugs without a live database**: prove the divergence
+  with a standalone unit test *before* fixing it, even when the real bug
+  only manifests during a live TLS handshake or a live column read. For
+  TLS/verifier bugs, construct the verifier type directly and call
+  `verify_server_cert` against a real (but locally-generated, long-validity)
+  cert/CA fixture — no live server needed (see `#38`'s
+  `verify_ca_cert_verifier_accepts_a_chain_valid_cert_with_mismatched_hostname`
+  test in `src/client_tests.rs`). For wire-format bugs, call the type's
+  `FromSql::from_sql`/`accepts` directly with hand-built wire bytes (see
+  `#39`'s `money_decodes_the_same_8_byte_wire_format_as_int8` in
+  `src/extract_tests.rs`). Confirm the test fails against the current code
+  for the right reason before implementing the fix.
 - **Testing**: prefer real PostgreSQL over mocks for integration-level
   behavior. Extract pure logic (SQL builders, value binding, pagination
   math) into testable functions with unit tests in a sibling `_tests.rs`
