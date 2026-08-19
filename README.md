@@ -48,7 +48,7 @@ both drivers against the same live database and compares every response.
 ## Features
 
 - **Connection** — Host/port or connection-string connections, with SSL (`disable`,
-  `require`, `verify-ca`, `verify-full`) via `rustls`.
+  `allow`, `prefer`, `require`, `verify-ca`, `verify-full`) via `rustls`.
 - **Schema Browsing** — Databases, schemas, tables, views, materialized views,
   routines (functions/procedures), and triggers.
 - **Column & Key Metadata** — Column types (including enum labels and pgvector-style
@@ -92,8 +92,8 @@ both drivers against the same live database and compares every response.
 | `database` | Database name to connect to | Yes (unless using `connection_string`) |
 | `username` | Database user | Yes (unless using `connection_string`) |
 | `password` | Database password | If required by the server |
-| `ssl_mode` | `disable`, `require`, `verify-ca`, or `verify-full` | No |
-| `ssl_ca` | Path to a custom CA bundle PEM file, used to validate the server's certificate under `verify-ca`/`verify-full` instead of the system trust store | No |
+| `ssl_mode` | `disable`, `allow`, `prefer`, `require`, `verify-ca`, or `verify-full` | No |
+| `ssl_ca` | Path to a custom CA bundle PEM file. Required for `verify-ca` (platform roots aren't used for this mode); optional for `verify-full`, where it overrides the system trust store | No |
 | `ssl_cert` | Path to a client certificate PEM file, for servers requiring mutual TLS (e.g. Google Cloud SQL). Must be set together with `ssl_key` | No |
 | `ssl_key` | Path to the private key PEM file matching `ssl_cert`. Must be set together with `ssl_cert` | No |
 | `connection_string` | Full `postgres://user:pass@host:port/db` URL, as an alternative to the discrete fields above | No |
@@ -154,9 +154,11 @@ The plugin is a standalone Rust binary that communicates with Tabularis through
    / [`deadpool-postgres`](https://crates.io/crates/deadpool-postgres) and writes
    responses to `stdout`.
 
-Connection pools are cached in-process, keyed by `host:port:database:user`, so
-repeated calls against the same target reuse an existing pool instead of
-reconnecting.
+Connection pools are cached in-process, keyed by
+`host:port:database:user:startup_script` plus every TLS param
+(`ssl_mode`/`ssl_ca`/`ssl_cert`/`ssl_key`), so repeated calls against the
+same target with identical connection settings reuse an existing pool
+instead of reconnecting.
 
 ## Supported Operations
 
