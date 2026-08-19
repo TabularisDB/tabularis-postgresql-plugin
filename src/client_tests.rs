@@ -3,7 +3,10 @@
 
 use tokio::sync::Mutex;
 
-use super::{cleanup_idle_pools, connection_key, get_or_create_pool, load_roots_from_pem, POOLS};
+use super::{
+    build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
+    load_client_cert_from_pem, load_roots_from_pem, POOLS,
+};
 use crate::models::ConnectionParams;
 
 // `POOLS` is a single process-wide static, and Rust's test harness runs
@@ -186,6 +189,199 @@ fn load_roots_from_pem_reports_a_clear_error_for_a_missing_file() {
     let err = result.expect_err("a missing file should be rejected");
     assert!(
         err.contains("Failed to read ssl_ca file"),
+        "unexpected error message: {err}"
+    );
+}
+
+// Self-signed RSA client cert + matching PKCS#8 private key (CN=test-client)
+// — a real X.509v3 cert/key pair (openssl req -x509 -newkey rsa:2048 -nodes
+// -addext basicConstraints=CA:FALSE -addext keyUsage=digitalSignature), not
+// a real trust anchor, just shaped like what a user's ssl_cert/ssl_key
+// files hold for mTLS. rustls's client-auth path requires v3 (basic
+// constraints present) — a v1 cert is rejected with UnsupportedCertVersion.
+const FIXTURE_CLIENT_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIICyTCCAbGgAwIBAgIJAL2rJBvvf1YfMA0GCSqGSIb3DQEBCwUAMBYxFDASBgNV
+BAMMC3Rlc3QtY2xpZW50MB4XDTI2MDgxOTEyMDU1MVoXDTM2MDgxNjEyMDU1MVow
+FjEUMBIGA1UEAwwLdGVzdC1jbGllbnQwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAw
+ggEKAoIBAQDYG5QxpH4lT6J+dmSZKn905KrDi++om1OV8K3cPIG5sni3phLVWcX/
+I2MOH8DkLtQgR3gnjSOHFk6RKE4ezMfCMMQ+6nXIRP/B3lt06Ub3uTvGmRApk3hh
+5JE6ae8+xhowh4IXdC2wYEi81PIh/RGyyylsitmUyAt/4j3q9Kt/StPmLbrXMl02
+mYSC3Z8QabSnAh+Yd9MFRfaJDXRYpoUtOror9S4u1JU6+FLyvjIeUWbCFZU6EvDP
+MleiG3pbiZX/EPK3t3gwYg40AAS+LIijhJ+1T2LlOE+6wPJjEYiMPzNdnSnh6MzT
+tXCX1a5AqRRajb5jdZv20Eqf1E/7HRFpAgMBAAGjGjAYMAkGA1UdEwQCMAAwCwYD
+VR0PBAQDAgeAMA0GCSqGSIb3DQEBCwUAA4IBAQBPCAEFChrzv2oY1KSS5/Z2qc9D
+0PDjquvTLyDOcxQywBpLxEhWPTQVMoryZlSyqoKn2n1aj1+CASsuBcemoL3714IJ
+hcU0GLDcRmJnWvU8JZfJgI4tdFvpFiBfn9hixpgTSnS8J/9/3CrE/c/tqakrYncd
++PwDBIyo36f78sToa853LmWabC/KelfzhFpJFsTygu3KtAeyAvm/0S5tkqh9GOkg
+U3d2kk7Mb7fmDTzT83A4vIGVbTG4wP4HDr4AkapAmFb9BvQBjtU1nywhqkM2PQ8z
+1T+5CI0B8rJ2pTrZo25nc7EaPWzojE9hce6FGuIPOexbFzFBcxLt/yP3h8eJ
+-----END CERTIFICATE-----
+";
+
+const FIXTURE_CLIENT_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDYG5QxpH4lT6J+
+dmSZKn905KrDi++om1OV8K3cPIG5sni3phLVWcX/I2MOH8DkLtQgR3gnjSOHFk6R
+KE4ezMfCMMQ+6nXIRP/B3lt06Ub3uTvGmRApk3hh5JE6ae8+xhowh4IXdC2wYEi8
+1PIh/RGyyylsitmUyAt/4j3q9Kt/StPmLbrXMl02mYSC3Z8QabSnAh+Yd9MFRfaJ
+DXRYpoUtOror9S4u1JU6+FLyvjIeUWbCFZU6EvDPMleiG3pbiZX/EPK3t3gwYg40
+AAS+LIijhJ+1T2LlOE+6wPJjEYiMPzNdnSnh6MzTtXCX1a5AqRRajb5jdZv20Eqf
+1E/7HRFpAgMBAAECggEADVC1stFVzGq5sl0NGbram5MzSlUm8RaQ8d4geD9qJszu
+TzJ2Wprrbir6AXbHZcfU3iBJMParR7mCIcN//LnVXQuwK8g6dZp6v7E5pVxyOPU6
+z6PCsS0a770rjZPVX+LI3lCbHWLVJdbo5GmieaGkI4YNCVkMyvQAcWK5Oe7VWkRf
+BXeZVXswocBzTOTjGRK1ZtoINWuLKZjb6J8QkB46SwcQrvW6MUP+YocxMDPt7tyk
+YBGuRoWcFYxnNzxrlubQJshHIK0vYD/zidvxA/7z1lG3torpgpsVVyjZqEL4vKEw
+5wy5VbUWLUPNMTGeRuerqz3XjYUD9s+PaWEll4j2GQKBgQDzdcBxhVBDPZPG2myg
+1w4XnofqOCP523aUc7lvUBovMmeMTqso+2jk609Gx+UjUx6TvcmK1xmqOSQ4N3z0
+IKoDGWAkxmtArSTU8NIGGf69QcLiRwGMvT9m/a01loHoq+wia6ua18OLHNJwCh8v
+1Vy5VIaFPycmNvjkXQzEIaus6wKBgQDjPSmG37vtyckxVkQbpKOaZfYlsDlwGrhW
+c3m6yHdjd6Hfwb+dCfJeHVlwHtu2PYgURXdh/UqDX+HzD5pqH9cjeD0sN8ayqrcW
+Z9tEw19hzrPKWPZ4nJYjjmd/XA25Ac2UiyLbmMOBN3VsA1Phacew7tsMS/UaFliX
+BHzNXAHV+wKBgAZe93lBBterndlfT+ZpmknN8TqU24QnVRQPbzPVgcnoZMNML7hz
+08vhyIJOqtVg0HUHS2XhuR82PZdnBFMTI7/PAzATLS1VGpij8KsONRdYyDPJreWz
+8hvM2aKEXMPs89H2xVfY+5oBWBRsf2JuD+4doyOLgofCeoLnWHUteGOfAoGAIaWk
+yHvIb+U5DT0gyJcQQoRmdh4p4xeRw/tFQwr74paMOX2Oycn3QUhHPfrTvaBOzfGb
+Q78lkV5ZLoxY6O3eBTqAlFON8Fam1YJ7TStArFLW/Fc/54wIDyu+13Th80r5Dc2s
+U6fDCxcTI/M6MF5hWymC9ccpe7tjUrkvYZkGDJECgYBKg1inw1umpsMLr+CbOdEz
+c2YEH/DT1A4OSvsksNTGR9pySU5xIKQx0hOVA8eLQ6m97yxFwhU8mCnyAKqahsMz
+5dY86Z3aBuAfLt3FUk2jnAx0pEA/Lf7HeR/EPCdgUWG05ZymXUnnU5OgQ0qow6wm
+yORfscWKlsDf+tv4Zb2jYQ==
+-----END PRIVATE KEY-----
+";
+
+fn params_with_ssl(ssl_mode: &str) -> ConnectionParams {
+    ConnectionParams {
+        driver: Some("postgres-plugin".to_string()),
+        host: Some("localhost".to_string()),
+        port: Some(5432),
+        database: Some("db".to_string()),
+        username: Some("user".to_string()),
+        password: None,
+        ssl_mode: Some(ssl_mode.to_string()),
+        ssl_ca: None,
+        ssl_cert: None,
+        ssl_key: None,
+        connection_string: None,
+        startup_script: None,
+    }
+}
+
+#[test]
+fn load_client_cert_from_pem_accepts_a_valid_cert_and_key() {
+    let cert_path = write_temp_file(FIXTURE_CLIENT_CERT_PEM);
+    let key_path = write_temp_file(FIXTURE_CLIENT_KEY_PEM);
+    let result = load_client_cert_from_pem(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+    std::fs::remove_file(&cert_path).ok();
+    std::fs::remove_file(&key_path).ok();
+
+    let (certs, _key) = result.expect("valid client cert/key PEM should load successfully");
+    assert_eq!(
+        certs.len(),
+        1,
+        "cert chain should contain the one leaf cert"
+    );
+}
+
+#[test]
+fn load_client_cert_from_pem_rejects_a_cert_file_with_no_certificate_blocks() {
+    let cert_path = write_temp_file("not a real certificate\n");
+    let key_path = write_temp_file(FIXTURE_CLIENT_KEY_PEM);
+    let result = load_client_cert_from_pem(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+    std::fs::remove_file(&cert_path).ok();
+    std::fs::remove_file(&key_path).ok();
+
+    let err = result.expect_err("non-PEM cert content should be rejected");
+    assert!(
+        err.contains("contained no PEM CERTIFICATE blocks"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn load_client_cert_from_pem_rejects_a_key_file_with_no_private_key() {
+    let cert_path = write_temp_file(FIXTURE_CLIENT_CERT_PEM);
+    let key_path = write_temp_file("not a real private key\n");
+    let result = load_client_cert_from_pem(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+    std::fs::remove_file(&cert_path).ok();
+    std::fs::remove_file(&key_path).ok();
+
+    let err = result.expect_err("non-PEM key content should be rejected");
+    assert!(
+        err.contains("Failed to parse ssl_key"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn load_client_cert_from_pem_reports_a_clear_error_for_a_missing_cert_file() {
+    let key_path = write_temp_file(FIXTURE_CLIENT_KEY_PEM);
+    let result = load_client_cert_from_pem(
+        "/nonexistent/path/does-not-exist.pem",
+        key_path.to_str().unwrap(),
+    );
+    std::fs::remove_file(&key_path).ok();
+
+    let err = result.expect_err("a missing cert file should be rejected");
+    assert!(
+        err.contains("Failed to read ssl_cert file"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn load_client_cert_from_pem_reports_a_clear_error_for_a_missing_key_file() {
+    let cert_path = write_temp_file(FIXTURE_CLIENT_CERT_PEM);
+    let result = load_client_cert_from_pem(
+        cert_path.to_str().unwrap(),
+        "/nonexistent/path/does-not-exist.pem",
+    );
+    std::fs::remove_file(&cert_path).ok();
+
+    let err = result.expect_err("a missing key file should be rejected");
+    assert!(
+        err.contains("Failed to read ssl_key file"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn build_tls_connector_succeeds_with_valid_client_cert_and_key() {
+    let cert_path = write_temp_file(FIXTURE_CLIENT_CERT_PEM);
+    let key_path = write_temp_file(FIXTURE_CLIENT_KEY_PEM);
+
+    let mut params = params_with_ssl("require");
+    params.ssl_cert = Some(cert_path.to_str().unwrap().to_string());
+    params.ssl_key = Some(key_path.to_str().unwrap().to_string());
+    let result = build_tls_connector(&params);
+    std::fs::remove_file(&cert_path).ok();
+    std::fs::remove_file(&key_path).ok();
+
+    result.expect("connector should build successfully with a valid client cert/key pair");
+}
+
+#[test]
+fn build_tls_connector_errors_when_ssl_cert_is_set_without_ssl_key() {
+    let mut params = params_with_ssl("require");
+    params.ssl_cert = Some("/path/to/cert.pem".to_string());
+    params.ssl_key = None;
+
+    let err = build_tls_connector(&params)
+        .expect_err("ssl_cert without ssl_key must be rejected as a config error");
+    assert!(
+        err.contains("ssl_cert") && err.contains("ssl_key"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn build_tls_connector_errors_when_ssl_key_is_set_without_ssl_cert() {
+    let mut params = params_with_ssl("require");
+    params.ssl_cert = None;
+    params.ssl_key = Some("/path/to/key.pem".to_string());
+
+    let err = build_tls_connector(&params)
+        .expect_err("ssl_key without ssl_cert must be rejected as a config error");
+    assert!(
+        err.contains("ssl_cert") && err.contains("ssl_key"),
         "unexpected error message: {err}"
     );
 }

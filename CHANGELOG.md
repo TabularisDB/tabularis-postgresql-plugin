@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Client certificate authentication (mTLS) for PostgreSQL servers requiring
+  it (e.g. Google Cloud SQL). `ConnectionParams` already carried `ssl_cert`
+  and `ssl_key`, but `build_tls_connector` never read them — every TLS
+  branch called `.with_no_client_auth()` unconditionally, so connections
+  failed with "connection requires a valid client certificate" the same way
+  the builtin driver's `pool_manager.rs` did before it was fixed upstream
+  (TabularisDB/tabularis#666). Added `load_client_cert_from_pem`, reusing
+  the same `rustls::pki_types::pem::PemObject` machinery as the existing
+  `load_roots_from_pem` (rather than reintroducing `rustls-pemfile`, removed
+  above for being unmaintained) — `PrivateKeyDer` supports PKCS1/SEC1/PKCS8
+  via the same trait. Both TLS branches now present the client cert via
+  `.with_client_auth_cert(...)` when `ssl_cert`/`ssl_key` are set, and
+  `build_tls_connector` errors clearly if only one of the pair is provided.
+
 ## [1.0.0-beta.7] - 2026-08-17
 
 ### Removed

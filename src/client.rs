@@ -414,11 +414,33 @@ fn needs_tls(params: &ConnectionParams) -> bool {
 /// server's certificate chain — against a caller-supplied CA bundle
 /// (`ssl_ca`) when present, or the platform trust store otherwise. `require`
 /// forces TLS without certificate validation (matches the builtin driver's
-/// `require` behavior — see `src-tauri/src/pool_manager.rs`).
+/// `require` behavior — see `src-tauri/src/pool_manager.rs`). When
+/// `ssl_cert`/`ssl_key` are both supplied, presents them as a client
+/// certificate for servers requiring mTLS (e.g. Google Cloud SQL) — matches
+/// the builtin driver's `build_postgres_tls_connector` client-auth handling.
 fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig, String> {
     use rustls_platform_verifier::BuilderVerifierExt;
 
     let user_ca = params.ssl_ca.as_deref().filter(|s| !s.trim().is_empty());
+    let user_cert = params.ssl_cert.as_deref().filter(|s| !s.trim().is_empty());
+    let user_key = params.ssl_key.as_deref().filter(|s| !s.trim().is_empty());
+
+    let client_auth = match (user_cert, user_key) {
+        (Some(cert), Some(key)) => Some(load_client_cert_from_pem(cert, key)?),
+        (Some(_), None) => {
+            return Err(
+                "Client certificate provided (ssl_cert) without a client private key (ssl_key)"
+                    .to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "Client private key provided (ssl_key) without a client certificate (ssl_cert)"
+                    .to_string(),
+            );
+        }
+        (None, None) => None,
+    };
 
     let needs_cert_validation = matches!(
         params.ssl_mode.as_deref(),
@@ -432,18 +454,27 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
                 rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots))
                     .build()
                     .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
-            return Ok(rustls::ClientConfig::builder()
+            let builder = rustls::ClientConfig::builder()
                 .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth());
+                .with_custom_certificate_verifier(verifier);
+            return match client_auth {
+                Some((certs, key)) => builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| format!("Failed to configure client certificate: {e}")),
+                None => Ok(builder.with_no_client_auth()),
+            };
         }
     }
 
-    let config = rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder()
         .with_platform_verifier()
-        .map_err(|e| format!("Failed to build platform TLS verifier: {e}"))?
-        .with_no_client_auth();
-    Ok(config)
+        .map_err(|e| format!("Failed to build platform TLS verifier: {e}"))?;
+    match client_auth {
+        Some((certs, key)) => builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| format!("Failed to configure client certificate: {e}")),
+        None => Ok(builder.with_no_client_auth()),
+    }
 }
 
 /// Load root certificates from a PEM file (used for `ssl_ca`-pinned
@@ -466,6 +497,43 @@ fn load_roots_from_pem(path: &str) -> Result<rustls::RootCertStore, String> {
         ));
     }
     Ok(roots)
+}
+
+/// Load a client certificate chain and private key from PEM files, for
+/// mTLS-required servers (e.g. Google Cloud SQL). Uses the same
+/// `pki_types::pem::PemObject` machinery as `load_roots_from_pem` rather than
+/// `rustls_pemfile` — deliberately avoided as a dependency here after it was
+/// removed for being unmaintained (RUSTSEC-2025-0134); `PrivateKeyDer`
+/// supports PKCS1/SEC1/PKCS8 via the same trait.
+fn load_client_cert_from_pem(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| format!("Failed to read ssl_cert file '{cert_path}': {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to parse ssl_cert '{cert_path}': {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "ssl_cert '{cert_path}' contained no PEM CERTIFICATE blocks"
+        ));
+    }
+
+    let key_pem = std::fs::read(key_path)
+        .map_err(|e| format!("Failed to read ssl_key file '{key_path}': {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| format!("Failed to parse ssl_key '{key_path}': {e}"))?;
+
+    Ok((certs, key))
 }
 
 #[cfg(test)]
