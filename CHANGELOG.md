@@ -68,6 +68,23 @@
   and wired it into `build_pool`. Proved the bug and the fix with a live
   test against a real non-SSL PostgreSQL instance: `ssl_mode=require`
   connected successfully before this fix, and now correctly fails.
+- `ssl_mode=require` validated the server certificate against the platform
+  trust store instead of skipping validation entirely. `build_tls_connector`'s
+  own doc comment already said `require` should force TLS "without
+  certificate validation," but `needs_cert_validation` only matched
+  `verify-ca`/`verify-full` — `require` fell through to the final
+  `with_platform_verifier()` fallback, which does validate against the OS
+  trust store, defeating the entire point of `require` vs. `verify-full`
+  (the standard `require` use case is self-signed certs / private CAs the
+  user hasn't configured `ssl_ca` for). Added `NoCertVerifier`, ported from
+  the builtin driver's `src-tauri/src/pool_manager.rs::NoCertVerifier`
+  (accepts any certificate unconditionally — no chain, hostname, or even
+  TLS 1.2/1.3 signature verification), and routed `require` mode to it.
+  Proved the bug and the fix live against a real self-signed-cert
+  SSL-enabled PostgreSQL instance: `require` failed the TLS handshake
+  before this fix, and now connects successfully; confirmed no regression
+  in `verify-ca`/`verify-full` (still correctly validate) or `require`
+  against a non-SSL server (still correctly fails, per the previous entry).
 
 ## [1.0.0-beta.7] - 2026-08-17
 

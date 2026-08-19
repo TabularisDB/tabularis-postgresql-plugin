@@ -441,11 +441,12 @@ fn resolve_ssl_mode(ssl_mode: Option<&str>) -> Option<SslMode> {
 /// `verify-ca` deliberately skips hostname verification (that's the entire
 /// distinction from `verify-full` — matches libpq `sslmode=verify-ca`
 /// semantics, see `VerifyCaCertVerifier` below). `require` forces TLS
-/// without certificate validation (matches the builtin driver's `require`
-/// behavior — see `src-tauri/src/pool_manager.rs`). When `ssl_cert`/
-/// `ssl_key` are both supplied, presents them as a client certificate for
-/// servers requiring mTLS (e.g. Google Cloud SQL) — matches the builtin
-/// driver's `build_postgres_tls_connector` client-auth handling.
+/// without any certificate validation at all (matches the builtin driver's
+/// `require` behavior — see `src-tauri/src/pool_manager.rs::NoCertVerifier`).
+/// When `ssl_cert`/`ssl_key` are both supplied, presents them as a client
+/// certificate for servers requiring mTLS (e.g. Google Cloud SQL) —
+/// matches the builtin driver's `build_postgres_tls_connector` client-auth
+/// handling.
 fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig, String> {
     use rustls_platform_verifier::BuilderVerifierExt;
 
@@ -504,6 +505,19 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
                 None => Ok(builder.with_no_client_auth()),
             };
         }
+    }
+
+    if params.ssl_mode.as_deref() == Some("require") {
+        let verifier = NoCertVerifier::new();
+        let builder = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
+        return match client_auth {
+            Some((certs, key)) => builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| format!("Failed to configure client certificate: {e}")),
+            None => Ok(builder.with_no_client_auth()),
+        };
     }
 
     let builder = rustls::ClientConfig::builder()
@@ -591,6 +605,75 @@ impl rustls::client::danger::ServerCertVerifier for VerifyCaCertVerifier {
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
+/// Accepts any server certificate unconditionally — no chain validation,
+/// no hostname check, not even TLS 1.2/1.3 signature verification. Used
+/// for `require` mode, which forces TLS (encryption) without validating
+/// who's on the other end — the standard use case is self-signed certs or
+/// private CAs the user hasn't configured `ssl_ca` for. Matches the
+/// builtin driver's `src-tauri/src/pool_manager.rs::NoCertVerifier`
+/// exactly, including its signature-check bypass (more permissive than
+/// `VerifyCaCertVerifier` above, which still validates the chain) — this
+/// is the builtin's own deliberate choice for this mode, not something to
+/// improve on silently.
+#[derive(Debug)]
+struct NoCertVerifier {
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl NoCertVerifier {
+    fn new() -> Self {
+        let provider = match rustls::crypto::CryptoProvider::get_default() {
+            Some(provider) => provider.clone(),
+            None => {
+                let provider = rustls::crypto::ring::default_provider();
+                let supported = provider.signature_verification_algorithms;
+                // Ignore the error from losing an install race — another
+                // caller's install still leaves a usable default installed.
+                let _ = provider.install_default();
+                return Self { supported };
+            }
+        };
+        Self {
+            supported: provider.signature_verification_algorithms,
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {

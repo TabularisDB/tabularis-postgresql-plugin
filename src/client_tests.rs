@@ -5,7 +5,8 @@ use tokio::sync::Mutex;
 
 use super::{
     build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
-    load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode, VerifyCaCertVerifier, POOLS,
+    load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode, NoCertVerifier,
+    VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use deadpool_postgres::SslMode;
@@ -627,4 +628,45 @@ fn resolve_ssl_mode_maps_require_verify_ca_and_verify_full_to_require() {
 fn resolve_ssl_mode_leaves_unset_or_unknown_values_unmapped() {
     assert_eq!(resolve_ssl_mode(None), None);
     assert_eq!(resolve_ssl_mode(Some("bogus")), None);
+}
+
+// Coverage for #44: build_tls_connector's `require` branch fell through to
+// with_platform_verifier(), which DOES validate the server cert against the
+// OS trust store — contradicting the function's own doc comment ("require
+// forces TLS without certificate validation") and the builtin's actual
+// behavior (NoCertVerifier: no validation at all for this mode). Unlike
+// VerifyCaCertVerifier (which still skips hostname but validates the
+// chain), NoCertVerifier accepts anything — not even a hostname check —
+// matching the builtin's own NoCertVerifier exactly.
+
+#[test]
+fn no_cert_verifier_accepts_a_cert_with_no_matching_hostname_or_chain() {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
+
+    let verifier = NoCertVerifier::new();
+
+    let end_entity: CertificateDer =
+        CertificateDer::pem_slice_iter(FIXTURE_SERVER_CERT_PEM.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+    // Deliberately mismatched hostname vs. the cert's CN/SAN
+    // (cert-hostname.example) — proves this verifier doesn't even do the
+    // hostname check VerifyCaCertVerifier skips deliberately; it does no
+    // checking of any kind.
+    let server_name = ServerName::try_from("totally-unrelated-hostname.internal").unwrap();
+
+    let result = verifier.verify_server_cert(&end_entity, &[], &server_name, &[], UnixTime::now());
+    assert!(
+        result.is_ok(),
+        "require mode must accept any certificate, matching the builtin's NoCertVerifier"
+    );
+}
+
+#[test]
+fn build_tls_connector_require_builds_successfully_with_no_ssl_ca() {
+    let params = params_with_ssl("require");
+    build_tls_connector(&params)
+        .expect("require mode must build a connector without needing ssl_ca set");
 }
