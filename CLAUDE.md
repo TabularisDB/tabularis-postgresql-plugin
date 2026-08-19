@@ -53,7 +53,8 @@ migration, now applied across the repo boundary.
 - Handlers live in `src/handlers/`, organized by domain (connection, metadata,
   crud, ddl, blob, query).
 - PostgreSQL access goes through `src/client.rs` (deadpool-postgres pool,
-  cached by `host:port:database:user:startup_script`).
+  cached by `host:port:database:user:startup_script` plus every TLS param —
+  `ssl_mode`/`ssl_ca`/`ssl_cert`/`ssl_key`).
 - Value binding for INSERT/UPDATE lives in `src/binding.rs` — a strict
   ordered cascade (DEFAULT sentinel, BLOB wire format, enum CAST, boolean,
   numeric, temporal, UUID shape, PG array literal, TEXT fallback). Order

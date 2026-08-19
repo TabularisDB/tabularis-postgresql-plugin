@@ -13,10 +13,10 @@
 //! transient connection hiccup on one call (e.g. a setup step in a test) is
 //! silently swallowed by the caller and never retried, unlike a persistent
 //! pool where a single connection failure doesn't affect already-established
-//! connections. Caching by `host:port:database:user` (matches the builtin's
-//! `build_connection_key` pattern in `src-tauri/src/pool_manager.rs`, minus
-//! the TLS/connection_id refinements that plugin doesn't need yet) closes
-//! that gap.
+//! connections. Caching by `host:port:database:user:startup_script` plus
+//! every TLS param (matches the builtin's `build_connection_key` pattern in
+//! `src-tauri/src/pool_manager.rs`, minus the per-connection_id refinement
+//! that plugin doesn't need yet) closes that gap.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -214,17 +214,24 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 }
 
 /// Identifies a connection target for pool-cache purposes.
-/// Matches on host:port:database:user (plus the startup script, so editing
-/// it forces a fresh pool) — sufficient for this plugin's scope (no
-/// per-connection TLS-mode/connection_id refinement, unlike the builtin).
+/// Matches on host:port:database:user:startup_script, plus every TLS param
+/// (ssl_mode/ssl_ca/ssl_cert/ssl_key) — otherwise two connections differing
+/// only in TLS configuration would incorrectly share a pool and its
+/// already-negotiated TLS setup. Matches the builtin's `build_connection_key`
+/// TLS-param keying in `src-tauri/src/pool_manager.rs`, minus the
+/// per-connection_id refinement that plugin doesn't need yet.
 fn connection_key(params: &ConnectionParams) -> String {
     format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         params.host.as_deref().unwrap_or(""),
         params.port.unwrap_or(5432),
         params.database.as_deref().unwrap_or(""),
         params.username.as_deref().unwrap_or(""),
         params.startup_script.as_deref().unwrap_or(""),
+        params.ssl_mode.as_deref().unwrap_or(""),
+        params.ssl_ca.as_deref().unwrap_or(""),
+        params.ssl_cert.as_deref().unwrap_or(""),
+        params.ssl_key.as_deref().unwrap_or(""),
     )
 }
 
@@ -412,13 +419,38 @@ fn needs_tls(params: &ConnectionParams) -> bool {
 
 /// Build a rustls ClientConfig. `verify-ca`/`verify-full` validate the
 /// server's certificate chain — against a caller-supplied CA bundle
-/// (`ssl_ca`) when present, or the platform trust store otherwise. `require`
-/// forces TLS without certificate validation (matches the builtin driver's
-/// `require` behavior — see `src-tauri/src/pool_manager.rs`).
+/// (`ssl_ca`) when present, or the platform trust store otherwise.
+/// `verify-ca` deliberately skips hostname verification (that's the entire
+/// distinction from `verify-full` — matches libpq `sslmode=verify-ca`
+/// semantics, see `VerifyCaCertVerifier` below). `require` forces TLS
+/// without certificate validation (matches the builtin driver's `require`
+/// behavior — see `src-tauri/src/pool_manager.rs`). When `ssl_cert`/
+/// `ssl_key` are both supplied, presents them as a client certificate for
+/// servers requiring mTLS (e.g. Google Cloud SQL) — matches the builtin
+/// driver's `build_postgres_tls_connector` client-auth handling.
 fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig, String> {
     use rustls_platform_verifier::BuilderVerifierExt;
 
     let user_ca = params.ssl_ca.as_deref().filter(|s| !s.trim().is_empty());
+    let user_cert = params.ssl_cert.as_deref().filter(|s| !s.trim().is_empty());
+    let user_key = params.ssl_key.as_deref().filter(|s| !s.trim().is_empty());
+
+    let client_auth = match (user_cert, user_key) {
+        (Some(cert), Some(key)) => Some(load_client_cert_from_pem(cert, key)?),
+        (Some(_), None) => {
+            return Err(
+                "Client certificate provided (ssl_cert) without a client private key (ssl_key)"
+                    .to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "Client private key provided (ssl_key) without a client certificate (ssl_cert)"
+                    .to_string(),
+            );
+        }
+        (None, None) => None,
+    };
 
     let needs_cert_validation = matches!(
         params.ssl_mode.as_deref(),
@@ -428,22 +460,124 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
     if needs_cert_validation {
         if let Some(ca_path) = user_ca {
             let roots = load_roots_from_pem(ca_path)?;
+            if params.ssl_mode.as_deref() == Some("verify-ca") {
+                let verifier = VerifyCaCertVerifier::new(roots)?;
+                let builder = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
+                return match client_auth {
+                    Some((certs, key)) => builder
+                        .with_client_auth_cert(certs, key)
+                        .map_err(|e| format!("Failed to configure client certificate: {e}")),
+                    None => Ok(builder.with_no_client_auth()),
+                };
+            }
             let verifier =
                 rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots))
                     .build()
                     .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
-            return Ok(rustls::ClientConfig::builder()
+            let builder = rustls::ClientConfig::builder()
                 .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth());
+                .with_custom_certificate_verifier(verifier);
+            return match client_auth {
+                Some((certs, key)) => builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| format!("Failed to configure client certificate: {e}")),
+                None => Ok(builder.with_no_client_auth()),
+            };
         }
     }
 
-    let config = rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder()
         .with_platform_verifier()
-        .map_err(|e| format!("Failed to build platform TLS verifier: {e}"))?
-        .with_no_client_auth();
-    Ok(config)
+        .map_err(|e| format!("Failed to build platform TLS verifier: {e}"))?;
+    match client_auth {
+        Some((certs, key)) => builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| format!("Failed to configure client certificate: {e}")),
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
+/// Validates the certificate chain against a custom root store but skips
+/// hostname verification — matches libpq `sslmode=verify-ca` behavior (the
+/// builtin driver's `src-tauri/src/pool_manager.rs::VerifyCaCertVerifier`).
+///
+/// Uses `verify_server_cert_signed_by_trust_anchor` directly rather than
+/// wrapping `rustls::client::WebPkiServerVerifier` — the latter's
+/// `verify_server_cert` unconditionally checks the hostname via
+/// `verify_server_name`, with no way to opt out, which would make
+/// `verify-ca` behave identically to `verify-full` (see issue #38).
+#[derive(Debug)]
+struct VerifyCaCertVerifier {
+    roots: std::sync::Arc<rustls::RootCertStore>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl VerifyCaCertVerifier {
+    fn new(roots: rustls::RootCertStore) -> Result<Self, String> {
+        let provider = match rustls::crypto::CryptoProvider::get_default() {
+            Some(provider) => provider.clone(),
+            None => {
+                let provider = rustls::crypto::ring::default_provider();
+                let supported = provider.signature_verification_algorithms;
+                // Ignore the error from losing an install race — another
+                // caller's install still leaves a usable default installed.
+                let _ = provider.install_default();
+                return Ok(Self {
+                    roots: std::sync::Arc::new(roots),
+                    supported,
+                });
+            }
+        };
+        Ok(Self {
+            roots: std::sync::Arc::new(roots),
+            supported: provider.signature_verification_algorithms,
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for VerifyCaCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
+            intermediates,
+            now,
+            self.supported.all,
+        )?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
+    }
 }
 
 /// Load root certificates from a PEM file (used for `ssl_ca`-pinned
@@ -466,6 +600,43 @@ fn load_roots_from_pem(path: &str) -> Result<rustls::RootCertStore, String> {
         ));
     }
     Ok(roots)
+}
+
+/// Load a client certificate chain and private key from PEM files, for
+/// mTLS-required servers (e.g. Google Cloud SQL). Uses the same
+/// `pki_types::pem::PemObject` machinery as `load_roots_from_pem` rather than
+/// `rustls_pemfile` — deliberately avoided as a dependency here after it was
+/// removed for being unmaintained (RUSTSEC-2025-0134); `PrivateKeyDer`
+/// supports PKCS1/SEC1/PKCS8 via the same trait.
+fn load_client_cert_from_pem(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|e| format!("Failed to read ssl_cert file '{cert_path}': {e}"))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to parse ssl_cert '{cert_path}': {e}"))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "ssl_cert '{cert_path}' contained no PEM CERTIFICATE blocks"
+        ));
+    }
+
+    let key_pem = std::fs::read(key_path)
+        .map_err(|e| format!("Failed to read ssl_key file '{key_path}': {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| format!("Failed to parse ssl_key '{key_path}': {e}"))?;
+
+    Ok((certs, key))
 }
 
 #[cfg(test)]

@@ -1,5 +1,59 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Client certificate authentication (mTLS) for PostgreSQL servers requiring
+  it (e.g. Google Cloud SQL). `ConnectionParams` already carried `ssl_cert`
+  and `ssl_key`, but `build_tls_connector` never read them — every TLS
+  branch called `.with_no_client_auth()` unconditionally, so connections
+  failed with "connection requires a valid client certificate" the same way
+  the builtin driver's `pool_manager.rs` did before it was fixed upstream
+  (TabularisDB/tabularis#666). Added `load_client_cert_from_pem`, reusing
+  the same `rustls::pki_types::pem::PemObject` machinery as the existing
+  `load_roots_from_pem` (rather than reintroducing `rustls-pemfile`, removed
+  above for being unmaintained) — `PrivateKeyDer` supports PKCS1/SEC1/PKCS8
+  via the same trait. Both TLS branches now present the client cert via
+  `.with_client_auth_cert(...)` when `ssl_cert`/`ssl_key` are set, and
+  `build_tls_connector` errors clearly if only one of the pair is provided.
+- Pool cache key ignored every TLS param (`ssl_mode`/`ssl_ca`/`ssl_cert`/
+  `ssl_key`) — `connection_key` matched only on
+  `host:port:database:user:startup_script`, so two connections to the same
+  target differing only in TLS configuration (e.g. `require` vs.
+  `verify-full`, or different client certs) could incorrectly share a
+  cached pool and its already-negotiated TLS setup. This wasn't inherited
+  from the builtin driver: the builtin's `build_connection_key` already
+  keyed on `ssl_mode`/`ssl_ca` before this plugin's `client.rs` was even
+  staged, so this was a parity miss during extraction, not a later
+  upstream change. Folded all four TLS params into `connection_key`,
+  matching the builtin's TLS-param keying.
+- `ssl_mode=verify-ca` incorrectly enforced hostname verification —
+  `build_tls_connector` wrapped `rustls::client::WebPkiServerVerifier` for
+  `verify-ca`, whose `verify_server_cert` unconditionally checks the
+  hostname with no way to opt out, making `verify-ca` behave identically to
+  `verify-full`. `verify-ca` is supposed to validate the certificate chain
+  but skip hostname verification — that's the entire distinction from
+  `verify-full` (matches libpq `sslmode=verify-ca` semantics). Added a
+  dedicated `VerifyCaCertVerifier`, ported from the builtin driver's
+  `src-tauri/src/pool_manager.rs`, using
+  `rustls::client::verify_server_cert_signed_by_trust_anchor` directly
+  instead. Proved the bug and the fix with a chain-valid cert whose
+  hostname deliberately doesn't match the connection target: rejected
+  before this fix, accepted after (while a CA-untrusted cert is still
+  correctly rejected, and `verify-full` still correctly rejects the
+  hostname mismatch).
+- MONEY columns always read as `null` — `extract_value` had no case for
+  `Type::MONEY`, so it fell through to the generic string fallback, but
+  `String`'s `FromSql::accepts` returns `false` for `Type::MONEY` (confirmed
+  directly), making that fallback fail every time regardless of the actual
+  value. MONEY is listed as a supported numeric type in the README and
+  `ddl.rs`'s implicit-cast-compatible group, but reading it back was
+  silently broken. Added a `Money` wrapper (`src/extract.rs`) that decodes
+  the same 8-byte big-endian i64 wire format `INT8` uses and reuses the
+  existing `i64_to_json` JS-safe-integer stringification, matching the
+  builtin driver's `extract/advanced_types.rs::Money`.
+
 ## [1.0.0-beta.7] - 2026-08-17
 
 ### Removed

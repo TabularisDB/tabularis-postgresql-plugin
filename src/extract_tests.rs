@@ -9,7 +9,7 @@
 //! nulls out), the same way the builtin driver unit-tests
 //! `extract/enum.rs::extract_or_null`.
 
-use crate::extract::EnumLabel;
+use crate::extract::{EnumLabel, Money};
 use tokio_postgres::types::{FromSql, Kind, Type};
 
 fn enum_type() -> Type {
@@ -39,4 +39,31 @@ fn accepts_only_enum_kinds() {
     assert!(EnumLabel::accepts(&enum_type()));
     assert!(!EnumLabel::accepts(&Type::TEXT));
     assert!(!EnumLabel::accepts(&Type::INT4));
+}
+
+#[test]
+fn money_accepts_only_the_money_type() {
+    assert!(Money::accepts(&Type::MONEY));
+    assert!(!Money::accepts(&Type::INT8));
+    assert!(!Money::accepts(&Type::NUMERIC));
+}
+
+#[test]
+fn money_decodes_the_same_8_byte_wire_format_as_int8() {
+    // MONEY is wire-encoded identically to INT8 (big-endian i64, smallest
+    // fractional unit e.g. cents) — 12345 = $123.45.
+    let bytes = 12_345_i64.to_be_bytes();
+    let money = Money::from_sql(&Type::MONEY, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(money), serde_json::json!(12_345));
+}
+
+#[test]
+fn money_above_js_safe_integer_becomes_a_string() {
+    let above_safe = crate::extract::JS_MAX_SAFE_INTEGER + 1;
+    let bytes = above_safe.to_be_bytes();
+    let money = Money::from_sql(&Type::MONEY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(money),
+        serde_json::json!(above_safe.to_string())
+    );
 }

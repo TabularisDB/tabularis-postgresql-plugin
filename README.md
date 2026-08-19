@@ -94,6 +94,8 @@ both drivers against the same live database and compares every response.
 | `password` | Database password | If required by the server |
 | `ssl_mode` | `disable`, `require`, `verify-ca`, or `verify-full` | No |
 | `ssl_ca` | Path to a custom CA bundle PEM file, used to validate the server's certificate under `verify-ca`/`verify-full` instead of the system trust store | No |
+| `ssl_cert` | Path to a client certificate PEM file, for servers requiring mutual TLS (e.g. Google Cloud SQL). Must be set together with `ssl_key` | No |
+| `ssl_key` | Path to the private key PEM file matching `ssl_cert`. Must be set together with `ssl_cert` | No |
 | `connection_string` | Full `postgres://user:pass@host:port/db` URL, as an alternative to the discrete fields above | No |
 | `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query | No |
 
@@ -182,9 +184,10 @@ A few RPC methods are registered but not yet implemented — they return a
 "not implemented" error rather than real data: `get_schema_snapshot`,
 `get_all_columns_batch`, `get_all_foreign_keys_batch`,
 `get_materialized_view_definition`. Tracked in
-[#9](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/9)
-alongside the other planned PostgreSQL-specific features (sequences, JSONB
-inline editing, extension-aware types, and more).
+[#32](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/32),
+part of the [Phase 2](https://github.com/TabularisDB/tabularis-postgresql-plugin/issues/9)
+set of planned PostgreSQL-specific features (sequences, JSONB inline
+editing, extension-aware types, and more).
 
 ## Building from Source
 

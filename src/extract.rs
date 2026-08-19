@@ -12,7 +12,7 @@ use tokio_postgres::Row;
 use uuid::Uuid;
 
 /// JavaScript's Number.MAX_SAFE_INTEGER (2^53 - 1).
-const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+pub(crate) const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 /// Extract a single column value from a row as a JSON value.
 /// Matches the builtin driver's extraction behavior exactly.
@@ -77,6 +77,7 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         }
         ref t if *t == Type::MACADDR => try_extract::<MacAddr>(row, index, JsonValue::from),
         ref t if *t == Type::OID => try_extract::<u32>(row, index, JsonValue::from),
+        ref t if *t == Type::MONEY => try_extract::<Money>(row, index, JsonValue::from),
         ref t
             if *t == Type::INT4_RANGE
                 || *t == Type::INT8_RANGE
@@ -324,6 +325,32 @@ impl<'a> FromSql<'a> for EnumLabel {
 
     fn accepts(ty: &Type) -> bool {
         matches!(ty.kind(), Kind::Enum(_))
+    }
+}
+
+/// MONEY: total value in cents (or the smallest fractional unit of the
+/// database's locale). Wire format is identical to INT8 — a big-endian
+/// i64 — so decoding just reinterprets those bytes and reuses `i64_to_json`
+/// for the same JS-safe-integer stringification `INT8` gets. Matches
+/// `src-tauri/src/drivers/postgres/extract/advanced_types.rs::Money`.
+pub(crate) struct Money(i64);
+
+impl<'a> FromSql<'a> for Money {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(<i64 as FromSql>::from_sql(&Type::INT8, raw)?))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::MONEY
+    }
+}
+
+impl From<Money> for JsonValue {
+    fn from(value: Money) -> Self {
+        i64_to_json(value.0)
     }
 }
 
