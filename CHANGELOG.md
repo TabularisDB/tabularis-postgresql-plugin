@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.0-beta.9] - 2026-08-25
+
+### Fixed
+
+- Driver icon rendered invisible — `.tabularium`'s badge `color` and the
+  icon SVG's `fill`/`stroke` were both `#336791`, so the mark had zero
+  contrast against its own badge on every connection using this driver.
+  Switched the icon to white so it reads against the fixed badge
+  background regardless of app theme.
+
+### Changed
+
+- Bumped `uuid` from 1.24.0 to 1.24.1 (patch release fixing non-ASCII
+  character handling in parse diagnostics; no behavioral overlap with
+  this plugin's `v4` generation/serde usage in `binding.rs`/`extract.rs`).
+
 ## [1.0.0-beta.8] - 2026-08-19
 
 ### Fixed
