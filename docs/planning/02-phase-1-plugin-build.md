@@ -425,6 +425,11 @@ Before declaring Phase 1 complete, verify:
 - Users can install it alongside the built-in driver and test
 - Feedback collection begins (does it work with their specific PG setups?)
 
+**After CP-4, before Phase 2:** the plugin bakes on the beta channel
+against Tabularis `0.20.0`+ until no new correctness bugs surface, then
+ships `1.0.0` stable — independent of Phase 2 scope. See "Versioning" in
+`docs/planning/03-phase-2-issue-16.md`.
+
 **Verify at CP-4:**
 
 - [ ] 80/80 parity tests GREEN (byte-perfect dual-driver comparison)

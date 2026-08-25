@@ -50,19 +50,18 @@ dev-install: build
 
 [macos]
 dev-install: build
-    mkdir -p "$HOME/Library/Application Support/com.debba.tabularis/plugins/postgresql"
-    cp target/debug/postgresql-plugin "$HOME/Library/Application Support/com.debba.tabularis/plugins/postgresql/"
-    cp .tabularium "$HOME/Library/Application Support/com.debba.tabularis/plugins/postgresql/"
-    @echo "Installed to ~/Library/Application Support/com.debba.tabularis/plugins/postgresql"
+    mkdir -p "$HOME/Library/Application Support/tabularis/plugins/postgresql"
+    cp target/debug/postgresql-plugin "$HOME/Library/Application Support/tabularis/plugins/postgresql/"
+    cp .tabularium "$HOME/Library/Application Support/tabularis/plugins/postgresql/"
+    @echo "Installed to ~/Library/Application Support/tabularis/plugins/postgresql"
     @echo "Restart Tabularis (or toggle the plugin in Settings) to pick up changes."
 
 # Each recipe line runs in a fresh shell, so this must be one logical command.
 # Tabularis resolves its plugin dir via the `directories` crate
-# (ProjectDirs "com"/"debba"/"tabularis"), which on Windows is
-# %APPDATA%\debba\tabularis\data.
+# (ProjectDirs "", "", "tabularis"), which on Windows is %APPDATA%\tabularis.
 [windows]
 dev-install: build
-    $dest = Join-Path $env:APPDATA "debba\tabularis\data\plugins\postgresql"; \
+    $dest = Join-Path $env:APPDATA "tabularis\plugins\postgresql"; \
     New-Item -ItemType Directory -Force -Path $dest | Out-Null; \
     Copy-Item "target\debug\postgresql-plugin.exe" $dest; \
     Copy-Item ".tabularium" $dest; \
@@ -75,9 +74,9 @@ uninstall:
 
 [macos]
 uninstall:
-    rm -rf "$HOME/Library/Application Support/com.debba.tabularis/plugins/postgresql"
+    rm -rf "$HOME/Library/Application Support/tabularis/plugins/postgresql"
 
 [windows]
 uninstall:
-    $dest = Join-Path $env:APPDATA "debba\tabularis\data\plugins\postgresql"; \
+    $dest = Join-Path $env:APPDATA "tabularis\plugins\postgresql"; \
     if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }

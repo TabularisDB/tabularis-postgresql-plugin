@@ -41,8 +41,8 @@ both drivers against the same live database and compares every response.
 - [Known Limitations](#known-limitations)
 - [Building from Source](#building-from-source)
 - [Development](#development)
-  - [Contributing: PR Titles & Versioning](#contributing-pr-titles--versioning)
 - [Changelog](#changelog)
+- [Maintainers](#maintainers)
 - [License](#license)
 
 ## Features
@@ -109,6 +109,8 @@ both drivers against the same live database and compares every response.
 | **Other** | BOOLEAN, UUID, INET, CIDR, MACADDR |
 | **JSON** | JSON, JSONB |
 | **Binary** | BYTEA |
+| **Ranges** | INT4RANGE, INT8RANGE, NUMRANGE, TSRANGE, TSTZRANGE, DATERANGE |
+| **Arrays** | SMALLINT[], INTEGER[], BIGINT[], REAL[], DOUBLE PRECISION[], TEXT[], VARCHAR[], BOOLEAN[] |
 
 ## Installation
 
@@ -138,8 +140,8 @@ ingested this plugin's releases first.
    | OS | Plugins Directory |
    | --- | --- |
    | **Linux** | `~/.local/share/tabularis/plugins/postgresql/` |
-   | **macOS** | `~/Library/Application Support/com.debba.tabularis/plugins/postgresql/` |
-   | **Windows** | `%APPDATA%\debba\tabularis\data\plugins\postgresql\` |
+   | **macOS** | `~/Library/Application Support/tabularis/plugins/postgresql/` |
+   | **Windows** | `%APPDATA%\tabularis\plugins\postgresql\` |
 
 4. Restart Tabularis.
 
@@ -164,6 +166,7 @@ instead of reconnecting.
 
 | Method | Description |
 | --- | --- |
+| `initialize` / `shutdown` | Plugin lifecycle hooks called on load and unload |
 | `test_connection` / `ping` | Verify connectivity with a lightweight `SELECT 1` |
 | `get_databases` | List databases on the server |
 | `get_schemas` | List schemas in the connected database |
