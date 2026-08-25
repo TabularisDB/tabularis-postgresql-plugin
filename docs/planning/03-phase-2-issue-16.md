@@ -285,11 +285,18 @@ Sprint 6: Pub/Sub + Advisory locks (lower priority, quick wins)
 
 ---
 
-## Checkpoint: CP-5 (Phase 2 Complete — Stable Release Gate)
+## Checkpoint: CP-5 (Phase 2 Complete — Feature-Complete Milestone)
 
 **When:** Core Phase 2 features complete (at minimum: sequences + JSONB + extensions).
 
-**This IS a major release gate.** The plugin now exceeds the built-in driver.
+**Note on versioning:** `1.0.0` stable ships at the end of Phase 1
+stabilization (beta bake-in with no new correctness bugs surfacing), not
+at Phase 2 completion — see the "Versioning" section below. CP-5 is a
+feature-completeness milestone on top of an already-stable `1.x` release,
+tracked via the normal PR-title semver bump (`feat` → minor).
+
+**This IS a milestone worth communicating.** The plugin now exceeds the
+built-in driver.
 
 **Verify:**
 
@@ -298,7 +305,6 @@ Sprint 6: Pub/Sub + Advisory locks (lower priority, quick wins)
 - [ ] Sequence management works end-to-end
 - [ ] JSONB editing works with nested objects
 - [ ] At least one extension type (PostGIS or pgvector) is handled
-- [ ] Plugin published as **stable** (not beta) to Tabularium registry
 
 **Communicate to team:**
 
@@ -308,14 +314,27 @@ Sprint 6: Pub/Sub + Advisory locks (lower priority, quick wins)
 
 ---
 
+## Versioning
+
+`1.0.0` ships at the end of Phase 1 stabilization — once the beta bake-in
+period (post-`0.20.0` Tabularis release) shows no new correctness bugs
+surfacing, independent of Phase 2 scope. Phase 2 features then version as
+ordinary minor/patch bumps from `1.0.0` via the existing PR-title →
+semver mapping (see the main README's "Contributing: PR Titles &
+Versioning"): each Phase 2 feature (`feat:`) is a minor bump (`1.1.0`,
+`1.2.0`, ...), not a second "promote to stable" event.
+
+---
+
 ## Ship / Release Points
 
 | After | What to ship | Channel |
 | ----- | ------------ | ------- |
-| Sequences done | Plugin update (minor version bump) | Beta → early adopters |
-| JSONB editing done | Plugin update | Beta |
-| All Phase 2 core done | Plugin promoted to **stable** | Public registry |
-| Extensions done | Plugin update | Stable |
+| Phase 1 stabilization | `1.0.0` | Stable → public registry |
+| Sequences done | Plugin update (minor version bump) | Stable |
+| JSONB editing done | Plugin update (minor version bump) | Stable |
+| Extensions done | Plugin update (minor version bump) | Stable |
+| All Phase 2 core done | CP-5 milestone reached | Stable |
 
 The plugin architecture enables shipping each feature independently without
 waiting for a Tabularis core release. This is a key advantage.
@@ -340,5 +359,4 @@ waiting for a Tabularis core release. This is a key advantage.
 - [ ] Extensions: at least PostGIS + pgvector types detected and handled
 - [ ] Partitions: hierarchy displayed, bounds shown
 - [ ] All Phase 1 tests still GREEN (no regressions)
-- [ ] Plugin published as stable release
 - [ ] CP-5 sync completed with core team
