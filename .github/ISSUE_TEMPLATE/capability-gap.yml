@@ -1,0 +1,40 @@
+name: Feature parity gap
+description: >-
+  Filed automatically by Tabularis when a connection uses a builtin-only
+  feature this plugin doesn't yet support.
+title: "Feature parity gap: "
+labels: ["capability-gap"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form was pre-filled by Tabularis's builtin-to-plugin migration
+        flow, from a connection that uses a feature the plugin's declared
+        capabilities don't yet cover. Review before submitting — nothing has
+        been sent yet. No credentials or connection strings are included.
+  - type: input
+    id: feature
+    attributes:
+      label: Missing feature
+      placeholder: e.g. SSH tunneling, IAM auth, Kubernetes port-forwarding
+    validations:
+      required: true
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+    validations:
+      required: true
+  - type: input
+    id: app_version
+    attributes:
+      label: Tabularis app version
+    validations:
+      required: true
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Anything else that might help scope or reproduce this.
+    validations:
+      required: false
