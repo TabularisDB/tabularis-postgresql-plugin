@@ -1,0 +1,67 @@
+name: Migration from builtin failed
+description: >-
+  Filed automatically by Tabularis when switching a connection from the
+  builtin postgres driver to this plugin fails.
+title: "Migration failed: "
+labels: ["migration"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form was pre-filled by Tabularis's builtin-to-plugin migration
+        flow. Review the details below before submitting — nothing has been
+        sent yet. No credentials or connection strings are included.
+  - type: dropdown
+    id: failure_mode
+    attributes:
+      label: Failure mode
+      description: >-
+        "Process" means the plugin itself never started (interpreter
+        missing, crash). "Connection" means the plugin started fine but
+        the specific database connection failed.
+      options:
+        - connection
+        - process
+    validations:
+      required: true
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+    validations:
+      required: true
+  - type: input
+    id: app_version
+    attributes:
+      label: Tabularis app version
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. macOS 15.1, Windows 11, Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: migrated_from_driver
+    attributes:
+      label: Migrated from
+      placeholder: e.g. builtin postgres
+    validations:
+      required: false
+  - type: textarea
+    id: error
+    attributes:
+      label: Error message
+      description: The exact error returned when the migration or connection failed.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Anything else that might help reproduce or diagnose this.
+    validations:
+      required: false
