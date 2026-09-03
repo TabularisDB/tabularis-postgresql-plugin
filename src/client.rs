@@ -275,6 +275,13 @@ pub fn cleanup_idle_pools() {
 /// When `connection_string` is set, it takes precedence over the discrete
 /// host/port/database/username/password fields — matching the README's
 /// documented behavior ("as an alternative to the discrete fields above").
+///
+/// Pool max size comes from the `poolMaxSize` setting received in the
+/// `initialize` RPC (default 10 — the built-in `postgres` driver's pin,
+/// *not* deadpool's `get_default_pool_max_size()`/cpu×2). Matches the
+/// built-in's configurable pool size in `pool_manager.rs` (tabularis#681):
+/// applied via the builder's `.max_size()`, which overwrites the
+/// `PoolConfig` default unconditionally. See `src/settings.rs`.
 async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
     let mut cfg = Config::new();
 
@@ -328,7 +335,8 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
         let mut builder = cfg
             .builder(tls)
             .map_err(|e| format!("Pool creation failed (TLS): {e}"))?
-            .runtime(Runtime::Tokio1);
+            .runtime(Runtime::Tokio1)
+            .max_size(crate::settings::pool_max_size());
         if let Some(script) = script {
             builder = builder.post_create(startup_script_hook(script));
         }
@@ -342,7 +350,8 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
         let mut builder = cfg
             .builder(NoTls)
             .map_err(|e| format!("Pool creation failed: {e}"))?
-            .runtime(Runtime::Tokio1);
+            .runtime(Runtime::Tokio1)
+            .max_size(crate::settings::pool_max_size());
         if let Some(script) = script {
             builder = builder.post_create(startup_script_hook(script));
         }

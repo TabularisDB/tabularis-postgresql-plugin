@@ -5,9 +5,18 @@ use serde_json::Value;
 use crate::client;
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{error_response, ok_response};
+use crate::settings;
 
-/// Receive plugin settings from the host. Currently a no-op.
-pub async fn initialize(id: Value, _params: &Value) -> Value {
+/// Receive plugin settings from the host. The host sends
+/// `json!({ "settings": settings })` (a `HashMap<String, Value>` built from
+/// this plugin's `.tabularium` setting definitions — see `RpcDriver::new` in
+/// `tabularis/src-tauri/src/plugins/driver.rs`) and silently ignores any
+/// error or non-response, so this must never panic. Currently the only
+/// setting is `poolMaxSize`; an absent/invalid value falls back to the
+/// built-in's default (10) inside the parser.
+pub async fn initialize(id: Value, params: &Value) -> Value {
+    let settings_value = params.get("settings").cloned().unwrap_or(Value::Null);
+    settings::set_pool_max_size(&settings_value);
     ok_response(id, Value::Null)
 }
 

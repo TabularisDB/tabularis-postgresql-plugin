@@ -87,6 +87,15 @@
     "DATETIME": "TIMESTAMP",
     "JSON": "JSONB"
   },
+  "settings": [
+    {
+      "key": "poolMaxSize",
+      "label": "Pool Max Size",
+      "type": "number",
+      "default": 10,
+      "description": "Maximum number of PostgreSQL connections kept in the pool."
+    }
+  ],
   "data_types": [
     {"name": "SMALLINT", "category": "numeric", "requires_length": false, "requires_precision": false},
     {"name": "INTEGER", "category": "numeric", "requires_length": false, "requires_precision": false},

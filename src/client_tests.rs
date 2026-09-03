@@ -4,11 +4,12 @@
 use tokio::sync::Mutex;
 
 use super::{
-    build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
+    build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
     load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode, NoCertVerifier,
     VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
+use crate::settings;
 use deadpool_postgres::SslMode;
 
 // `POOLS` is a single process-wide static, and Rust's test harness runs
@@ -686,4 +687,82 @@ fn build_tls_connector_verify_ca_without_ssl_ca_returns_a_clear_error() {
         err.contains("verify-ca") && err.contains("ssl_ca"),
         "unexpected error message: {err}"
     );
+}
+
+// Coverage for #61: `build_pool` previously never set `max_size`, so deadpool
+// fell back to `PoolConfig::default()` = `get_default_pool_max_size()` =
+// logical_cores × 2 (up to ~32 on a 16-thread machine) — up to ~3× more
+// backend connections per target than the built-in's pinned 10. The parity
+// suite doesn't catch this (82 tests compare query results, not connection
+// counts). These tests close that gap by inspecting the built pool's
+// `status().max_size` directly.
+//
+// deadpool's `Pool::new` is lazy (no connection at creation time when no
+// startup script is set), so a fake host is enough — no live DB needed, and
+// these run in CI's ordinary Test job. `build_pool_pub` calls
+// `get_or_create_pool`, which caches into the shared `POOLS` static, so each
+// test holds `POOLS_TEST_LOCK` (to serialize with the cache-count tests
+// above) AND `POOL_MAX_SIZE_TEST_LOCK` (to serialize with the `settings`
+// tests), then resets the pool-size global to the default first. Two locks
+// are acquired settings-first; order is consistent with `settings_tests`.
+
+#[tokio::test]
+async fn build_pool_default_max_size_is_ten_not_cpu_times_two() {
+    let _settings_guard = settings::test_support::lock_and_reset().await;
+    let _pools_guard = POOLS_TEST_LOCK.lock().await;
+    settings::set_pool_max_size(&serde_json::json!({ "poolMaxSize": 10 }));
+    let p = params("pool-size-default-test-host", 5432, "db", "user");
+    let pool = build_pool_pub(&p)
+        .await
+        .expect("lazy pool builds without a live DB when no startup script is set");
+    let status = pool.status();
+    assert_eq!(
+        status.max_size,
+        10,
+        "default pool max size must be the built-in's pinned 10 (parity), not \
+         deadpool's cpu×2 default ({} on this machine)",
+        num_cpus_from_deadpool_default(),
+    );
+}
+
+#[tokio::test]
+async fn build_pool_honors_custom_pool_max_size_setting() {
+    let _settings_guard = settings::test_support::lock_and_reset().await;
+    let _pools_guard = POOLS_TEST_LOCK.lock().await;
+    settings::set_pool_max_size(&serde_json::json!({ "poolMaxSize": 3 }));
+    let p = params("pool-size-custom-test-host", 5432, "db", "user");
+    let pool = build_pool_pub(&p)
+        .await
+        .expect("lazy pool builds without a live DB when no startup script is set");
+    assert_eq!(
+        pool.status().max_size,
+        3,
+        "a poolMaxSize of 3 must be applied to the built pool's max_size"
+    );
+}
+
+#[tokio::test]
+async fn build_pool_clamps_oversized_pool_max_size_to_cap() {
+    let _settings_guard = settings::test_support::lock_and_reset().await;
+    let _pools_guard = POOLS_TEST_LOCK.lock().await;
+    settings::set_pool_max_size(&serde_json::json!({ "poolMaxSize": 10_000 }));
+    let p = params("pool-size-cap-test-host", 5432, "db", "user");
+    let pool = build_pool_pub(&p)
+        .await
+        .expect("lazy pool builds without a live DB when no startup script is set");
+    assert_eq!(
+        pool.status().max_size,
+        64,
+        "an oversized poolMaxSize must be clamped to the 64 cap before the pool is built"
+    );
+}
+
+/// What deadpool's cpu×2 default *would* be on this machine — only used in
+/// the failure message above, never as an assertion (the test must pass on
+/// any core count). Computed from the live `num_cpus` rather than a constant
+/// so the diagnostic stays accurate across CI runners.
+fn num_cpus_from_deadpool_default() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(20)
 }
