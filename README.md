@@ -273,6 +273,52 @@ tagged or released automatically (yet). The suggestion updates (and marks
 the previous suggestion as outdated) only when the underlying
 classification actually changes, not on every edit to the title text.
 
+### Cutting a release
+
+Releases are prepared with the `Prepare release` GitHub Actions workflow
+(`.github/workflows/prepare-release.yml`) — manual-only (`workflow_dispatch`,
+run from the Actions tab), no push/schedule trigger. It replaces the old
+by-hand ritual of editing `.tabularium`/`Cargo.toml`/`Cargo.lock`/
+`CHANGELOG.md` and pushing a bump commit + tag directly.
+
+Given the current tag, it walks every merged PR since then, classifies each
+by the same Conventional Commits rules as the per-PR version-suggestion
+comment (shared logic lives in `.github/scripts/version.js`), takes the
+highest-severity bump and the highest-ranked `prerelease:*` label across
+them, and drafts the next `CHANGELOG.md` section.
+
+- **`dry_run: true`** (the default) — computes and prints the version,
+  channel, included PRs, and a draft CHANGELOG section to the run's job
+  summary. Nothing is committed, tagged, or pushed. The drafted CHANGELOG
+  bullets are mechanical (`- <PR title> (#N)`) — worth a skim before running
+  for real, since they don't replace the hand-written prose past entries
+  have.
+- **`dry_run: false`** — bumps the version files, merges the draft into
+  `CHANGELOG.md` (any PR that already added its own entry under
+  `## [Unreleased]` is left alone; only PRs missing an entry get the
+  drafted bullet appended), re-runs the full verification suite (build,
+  test, clippy, fmt, markdownlint, manifest schema validation), then
+  commits, tags (`vX.Y.Z`), and pushes directly to `main` as
+  `github-actions[bot]`. The tag push triggers `release.yml`'s
+  cross-platform build and GitHub release.
+
+If a release with no PRs classifying above `none` since the last tag, or a
+PR that should count toward the release but has no `prerelease:*` label, it
+fails clearly rather than guessing.
+
+`main` has no branch protection today, so this direct push matches how bump
+commits have always landed. If protection is added later, prefer a GitHub
+**ruleset** (not classic branch protection) with this workflow's push
+identity in the ruleset's bypass list — rulesets can bypass "require pull
+request" for a specific actor, so human contributors still need PRs while
+this job keeps pushing its own bump commit directly.
+
+The per-PR `prerelease:*` label model above is a known simplification: it
+scales fine while every release ships on the beta channel, but doesn't yet
+say what should happen once the project graduates toward rc/stable, where
+the channel becomes a property of the release rather than of each PR. That
+rework is intentionally out of scope for this workflow.
+
 ### Tech Stack
 
 - **Language:** Rust (edition 2021)
