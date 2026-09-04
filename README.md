@@ -130,9 +130,9 @@ ingested this plugin's releases first.
 
 1. Download the latest release for your platform from the
    [Releases page](https://github.com/TabularisDB/tabularis-postgresql-plugin/releases) —
-   look for the most recent `1.0.0-beta.N` tag; every release published so
-   far, including the first public one, ships on the `beta` prerelease
-   channel (see [Contributing: PR Titles & Versioning](#contributing-pr-titles--versioning)).
+   look for the most recent `1.0.0-rc.N` tag (releases through `1.0.0-beta.10`
+   shipped on the `beta` channel; new releases from `1.0.0-rc.1` onward ship
+   on the `rc` channel — see [Contributing: PR Titles & Versioning](#contributing-pr-titles--versioning)).
 2. Extract the archive.
 3. Copy `postgresql-plugin` (or `postgresql-plugin.exe` on Windows) and
    `.tabularium` into the Tabularis plugins directory:
@@ -259,6 +259,14 @@ Every PR also needs exactly one `prerelease:alpha` / `prerelease:beta` /
 `prerelease:rc` / `prerelease:stable` label, so CI knows which release
 channel to target when suggesting the next version. There's no default —
 CI fails with a clear error if the label is missing, rather than guessing.
+
+**As of `1.0.0-rc.1`, new PRs should use `prerelease:rc`, not
+`prerelease:beta`.** This repo tracks a builtin driver that keeps shipping
+its own changes (see `CLAUDE.md`'s "Parity gaps beyond SQL text"); waiting
+for full parity before calling this release-ready meant an indefinite
+`beta` line chasing a moving target. `rc` is the checkpoint instead: gaps
+discovered after `1.0.0-rc.1` are tracked as issues/patches on the `rc`
+line (`rc.2`, `rc.3`, ...) rather than reasons to hold the channel back.
 
 | PR title type | Version impact |
 | --- | --- |

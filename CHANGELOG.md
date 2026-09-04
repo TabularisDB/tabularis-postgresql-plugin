@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.0-rc.1] - 2026-09-04
+
+No code changes since `1.0.0-beta.10` — this tag promotes that build to the
+`rc` channel. This repo tracks a builtin driver that keeps shipping its own
+changes independently (TLS/pool-config semantics, wire-format coverage —
+see `CLAUDE.md`'s "Parity gaps beyond SQL text"), so waiting for full
+parity before calling a release candidate meant an indefinite `beta` line
+chasing a moving target. `1.0.0-rc.1` is the checkpoint instead: parity
+gaps discovered from here on are tracked as issues/patches on the `rc`
+line (`rc.2`, `rc.3`, ...), not reasons to hold the channel back. New PRs
+should use the `prerelease:rc` label going forward (see README's
+"Contributing: PR Titles & Versioning").
+
 ## [1.0.0-beta.10] - 2026-09-04
 
 ### Added
