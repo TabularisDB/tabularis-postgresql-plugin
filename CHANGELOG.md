@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.0.0-beta.10] - 2026-09-04
+
+### Added
+
+- Configurable connection-pool size via a `poolMaxSize` driver setting
+  (default 10, clamped to 1–64, parsed from u64/i64/string with zero/invalid
+  → default). Ports the built-in `postgres` driver's configurable pool size
+  (TabularisDB/tabularis#681) to the plugin. Motivated by pgBouncer
+  (TabularisDB/tabularis#71): against a pooler you want a *small* client
+  pool so you don't burn server slots, and previously the only option was a
+  recompile. The setting is declared in `.tabularium` and received via the
+  `initialize` RPC; an absent/invalid value degrades gracefully to the
+  default (10), the built-in driver's pin.
+
+### Fixed
+
+- Restored pool-size parity with the built-in driver. `build_pool` never
+  set `max_size`, so deadpool fell back to `PoolConfig::default()` =
+  `logical_cores × 2` (up to ~32 on a 16-thread machine) — up to ~3× more
+  backend connections per target than the built-in's pinned 10. Pools now
+  default to 10 regardless of CPU count, the same gap the new setting
+  addresses. The 82-test parity suite compares query results, not
+  connection counts, so this latent gap went undetected.
+
+### Changed
+
+- Bumped `deadpool-postgres` from 0.14.1 to 0.14.2 (pulls `deadpool`
+  0.12 → 0.13.1, `deadpool-runtime` 0.1 → 0.3.1, `getrandom` 0.2 → 0.4
+  transitively). No public-API changes to the pool surface this plugin
+  uses; 8/8 live-db tests confirm identical pool/connect/TLS/startup-script
+  behavior.
+- Bumped `uuid` from 1.24.1 to 1.26.0. Used only for `Uuid` parse/to-string
+  in `binding.rs`/`extract.rs` (no generation, no new APIs); 8/8 live-db
+  tests pass.
+- Bumped `log` from 0.4.33 to 0.4.34.
+
+### Documentation
+
+- Added GitHub Issue Form templates (`.github/ISSUE_TEMPLATE/`) for the
+  Tabularis builtin-to-plugin migration flow: `migration-failure.yml`,
+  `capability-gap.yml`, and `bug_report.yml`, plus the `migration` and
+  `capability-gap` labels. Pre-filled by the app via query params keyed on
+  each form element's id; no separate release impact.
+
 ## [1.0.0-beta.9] - 2026-08-25
 
 ### Fixed
