@@ -56,7 +56,11 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     if let Some(s) = schema {
         let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
         if let Err(e) = pg_client.batch_execute(&set_path).await {
-            return error_response(id, -32603, &format!("Failed to set search_path: {e}"));
+            return error_response(
+                id,
+                -32603,
+                &format!("Failed to set search_path: {}", client::format_pg_error(&e)),
+            );
         }
     }
 
@@ -136,7 +140,7 @@ async fn exec_query(
         pg_client
             .batch_execute(&set_path)
             .await
-            .map_err(|e| format!("Failed to set search_path: {e}"))?;
+            .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))?;
     }
 
     exec_query_on_client(&pg_client, query, limit, page).await
