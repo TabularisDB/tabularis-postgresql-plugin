@@ -147,6 +147,36 @@ fn execute_query_returns_rows_from_live_database() {
     assert_eq!(rows[0][0], json!(1));
 }
 
+// Coverage for #66: `tokio_postgres::Error`'s own `Display` impl prints the
+// generic "db error" string for any server-side error (its `Kind::Db` arm),
+// throwing away the real message in the wrapped `DbError`. `exec_query_on_client`
+// previously stringified the error with `format!("{e}")` directly instead of
+// checking `as_db_error()` first, so every query error (a syntax error, a
+// missing column, a constraint violation) surfaced as the unhelpful literal
+// "db error" — see issue #66.
+#[test]
+fn query_syntax_error_surfaces_the_real_postgres_message_not_generic_db_error() {
+    let mut plugin = Plugin::spawn();
+    let response = plugin.call(
+        "execute_query",
+        json!({ "params": conn_params(), "query": "select foo" }),
+    );
+    let error = response
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .expect("an invalid query must produce a JSON-RPC error");
+    assert_ne!(
+        error, "db error",
+        "error message must surface the real PostgreSQL error, not the generic \
+         tokio_postgres::Error::Display fallback"
+    );
+    assert!(
+        error.contains("foo"),
+        "error message should mention the offending identifier, got: {error}"
+    );
+}
+
 #[test]
 fn insert_record_persists_a_row() {
     let mut plugin = Plugin::spawn();

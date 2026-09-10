@@ -154,7 +154,7 @@ async fn exec_query_on_client(
         let affected = pg_client
             .execute(query, &[])
             .await
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| client::format_pg_error(&e))?;
         return Ok(json!({
             "columns": [],
             "rows": [],
@@ -177,7 +177,7 @@ async fn exec_query_on_client(
     let rows = pg_client
         .query(&final_query, &[])
         .await
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| client::format_pg_error(&e))?;
 
     if rows.is_empty() {
         // Get columns from the statement if possible
