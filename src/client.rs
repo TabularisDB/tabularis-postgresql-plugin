@@ -377,9 +377,11 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
 
 /// Format a startup-script execution failure so the surfaced error clearly
 /// names the startup script as the cause, instead of reading like a bad host
-/// or wrong credentials.
-fn startup_script_error(err: impl std::fmt::Display) -> String {
-    format!("Startup script failed: {err}")
+/// or wrong credentials. Uses `format_pg_error` so a `DbError` (the common
+/// case — a typo in the script) surfaces its real message instead of the
+/// generic "db error" fallback.
+fn startup_script_error(err: tokio_postgres::Error) -> String {
+    format!("Startup script failed: {}", format_pg_error(&err))
 }
 
 /// Build the `post_create` hook that runs the startup script on every new

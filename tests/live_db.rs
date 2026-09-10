@@ -340,6 +340,15 @@ fn broken_startup_script_fails_fast_with_clear_attribution() {
         error.starts_with("Startup script failed:"),
         "error should be clearly attributed to the startup script, got: {error}"
     );
+    // Coverage for #66: startup_script_error previously stringified the
+    // tokio_postgres::Error directly, so a DbError (a syntax error in the
+    // script, the common case) collapsed to the generic "db error" instead
+    // of the real PostgreSQL message.
+    assert!(
+        !error.contains("db error") && error.contains("syntax error"),
+        "error should surface the real PostgreSQL syntax error, not the generic \
+         tokio_postgres::Error::Display fallback, got: {error}"
+    );
 }
 
 // Coverage for #43: build_pool never called cfg.ssl_mode(...), so
