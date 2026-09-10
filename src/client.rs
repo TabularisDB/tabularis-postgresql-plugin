@@ -31,6 +31,36 @@ use crate::models::ConnectionParams;
 
 static POOLS: LazyLock<Mutex<HashMap<String, Pool>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Format a `tokio_postgres::Error` the way the built-in driver does: for a
+/// server-side `DbError` (syntax errors, constraint violations, etc.) surface
+/// the real severity/message instead of the generic `Kind::Db` "db error"
+/// string that `tokio_postgres::Error`'s own `Display` impl produces.
+pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let brief = format!("{}: {}", db.severity(), db.message());
+        let detail = format!("{e:#?}");
+        format!("{brief}\n\n{detail}")
+    } else {
+        e.to_string()
+    }
+}
+
+/// Format a `pool.get()` failure. The pool's own connection-establishment
+/// handshake (bad database name, bad password, ...) surfaces as a
+/// `tokio_postgres::Error` wrapped in `PoolError::Backend` — the exact same
+/// `Kind::Db`/"db error" pitfall `format_pg_error` exists to avoid, just one
+/// layer deeper. `PostCreateHook` wraps the same shape via `HookError`.
+pub(crate) fn format_pool_error(e: &deadpool_postgres::PoolError) -> String {
+    use deadpool_postgres::HookError;
+    match e {
+        deadpool_postgres::PoolError::Backend(pg_err) => format_pg_error(pg_err),
+        deadpool_postgres::PoolError::PostCreateHook(HookError::Backend(pg_err)) => {
+            format_pg_error(pg_err)
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Build a connection pool from the given params and verify connectivity
 /// by acquiring one client and running `SELECT 1`.
 pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
@@ -38,11 +68,11 @@ pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     client
         .query_one("SELECT 1", &[])
         .await
-        .map_err(|e| format!("Query failed: {e}"))?;
+        .map_err(|e| format_pg_error(&e))?;
     Ok(())
 }
 
@@ -58,11 +88,11 @@ pub async fn query_strings(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     let rows = client
         .query(query, query_params)
         .await
-        .map_err(|e| format!("Query failed: {e}"))?;
+        .map_err(|e| format_pg_error(&e))?;
 
     let results = rows
         .iter()
@@ -81,11 +111,11 @@ pub async fn query_rows(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     client
         .query(query, query_params)
         .await
-        .map_err(|e| format!("Query failed: {e}"))
+        .map_err(|e| format_pg_error(&e))
 }
 
 /// Execute a statement with explicit per-placeholder wire types, pinned via
@@ -101,17 +131,17 @@ pub async fn execute_typed(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
         .await
-        .map_err(|e| format!("Prepare failed: {e}"))?;
+        .map_err(|e| format_pg_error(&e))?;
     let values: Vec<&(dyn ToSql + Sync)> = typed_params.iter().map(|(v, _)| *v).collect();
     client
         .execute(&stmt, &values)
         .await
-        .map_err(|e| format!("Execute failed: {e}"))
+        .map_err(|e| format_pg_error(&e))
 }
 
 /// Run a SELECT with explicit per-placeholder wire types (same rationale as
@@ -125,17 +155,17 @@ pub async fn query_typed(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
         .await
-        .map_err(|e| format!("Prepare failed: {e}"))?;
+        .map_err(|e| format_pg_error(&e))?;
     let values: Vec<&(dyn ToSql + Sync)> = typed_params.iter().map(|(v, _)| *v).collect();
     client
         .query(&stmt, &values)
         .await
-        .map_err(|e| format!("Query failed: {e}"))
+        .map_err(|e| format_pg_error(&e))
 }
 
 /// Fetch data types for every column in a table as a name -> type map.
@@ -363,9 +393,11 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
 
 /// Format a startup-script execution failure so the surfaced error clearly
 /// names the startup script as the cause, instead of reading like a bad host
-/// or wrong credentials.
-fn startup_script_error(err: impl std::fmt::Display) -> String {
-    format!("Startup script failed: {err}")
+/// or wrong credentials. Uses `format_pg_error` so a `DbError` (the common
+/// case — a typo in the script) surfaces its real message instead of the
+/// generic "db error" fallback.
+fn startup_script_error(err: tokio_postgres::Error) -> String {
+    format!("Startup script failed: {}", format_pg_error(&err))
 }
 
 /// Build the `post_create` hook that runs the startup script on every new
@@ -404,7 +436,7 @@ where
     let (mut client, connection) = pg_config
         .connect(tls)
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pg_error(&e)))?;
     let driver = tokio::spawn(async move {
         let _ = connection.await;
     });
