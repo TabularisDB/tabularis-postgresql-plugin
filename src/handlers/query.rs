@@ -50,13 +50,23 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     };
     let pg_client = match pool.get().await {
         Ok(c) => c,
-        Err(e) => return error_response(id, -32603, &format!("Connection failed: {e}")),
+        Err(e) => {
+            return error_response(
+                id,
+                -32603,
+                &format!("Connection failed: {}", client::format_pool_error(&e)),
+            )
+        }
     };
 
     if let Some(s) = schema {
         let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
         if let Err(e) = pg_client.batch_execute(&set_path).await {
-            return error_response(id, -32603, &format!("Failed to set search_path: {e}"));
+            return error_response(
+                id,
+                -32603,
+                &format!("Failed to set search_path: {}", client::format_pg_error(&e)),
+            );
         }
     }
 
@@ -128,7 +138,7 @@ async fn exec_query(
     let pg_client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", client::format_pool_error(&e)))?;
 
     // Set search_path if schema is specified
     if let Some(s) = schema {
@@ -136,7 +146,7 @@ async fn exec_query(
         pg_client
             .batch_execute(&set_path)
             .await
-            .map_err(|e| format!("Failed to set search_path: {e}"))?;
+            .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))?;
     }
 
     exec_query_on_client(&pg_client, query, limit, page).await
@@ -154,7 +164,7 @@ async fn exec_query_on_client(
         let affected = pg_client
             .execute(query, &[])
             .await
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| client::format_pg_error(&e))?;
         return Ok(json!({
             "columns": [],
             "rows": [],
@@ -177,7 +187,7 @@ async fn exec_query_on_client(
     let rows = pg_client
         .query(&final_query, &[])
         .await
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| client::format_pg_error(&e))?;
 
     if rows.is_empty() {
         // Get columns from the statement if possible

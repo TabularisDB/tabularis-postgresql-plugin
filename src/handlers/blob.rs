@@ -96,7 +96,8 @@ async fn fetch_blob_bytes(
 
     let rows = client::query_typed(conn_params, &query, &typed_params).await?;
     let row = rows.first().ok_or_else(|| "Row not found".to_string())?;
-    row.try_get::<_, Vec<u8>>(0).map_err(|e| e.to_string())
+    row.try_get::<_, Vec<u8>>(0)
+        .map_err(|e| client::format_pg_error(&e))
 }
 
 /// Sanity-check `file_path` before spending a DB round-trip on a write that's
