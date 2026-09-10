@@ -50,7 +50,13 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     };
     let pg_client = match pool.get().await {
         Ok(c) => c,
-        Err(e) => return error_response(id, -32603, &format!("Connection failed: {e}")),
+        Err(e) => {
+            return error_response(
+                id,
+                -32603,
+                &format!("Connection failed: {}", client::format_pool_error(&e)),
+            )
+        }
     };
 
     if let Some(s) = schema {
@@ -132,7 +138,7 @@ async fn exec_query(
     let pg_client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", client::format_pool_error(&e)))?;
 
     // Set search_path if schema is specified
     if let Some(s) = schema {

@@ -45,6 +45,22 @@ pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
     }
 }
 
+/// Format a `pool.get()` failure. The pool's own connection-establishment
+/// handshake (bad database name, bad password, ...) surfaces as a
+/// `tokio_postgres::Error` wrapped in `PoolError::Backend` — the exact same
+/// `Kind::Db`/"db error" pitfall `format_pg_error` exists to avoid, just one
+/// layer deeper. `PostCreateHook` wraps the same shape via `HookError`.
+pub(crate) fn format_pool_error(e: &deadpool_postgres::PoolError) -> String {
+    use deadpool_postgres::HookError;
+    match e {
+        deadpool_postgres::PoolError::Backend(pg_err) => format_pg_error(pg_err),
+        deadpool_postgres::PoolError::PostCreateHook(HookError::Backend(pg_err)) => {
+            format_pg_error(pg_err)
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Build a connection pool from the given params and verify connectivity
 /// by acquiring one client and running `SELECT 1`.
 pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
@@ -52,7 +68,7 @@ pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     client
         .query_one("SELECT 1", &[])
         .await
@@ -72,7 +88,7 @@ pub async fn query_strings(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     let rows = client
         .query(query, query_params)
         .await
@@ -95,7 +111,7 @@ pub async fn query_rows(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     client
         .query(query, query_params)
         .await
@@ -115,7 +131,7 @@ pub async fn execute_typed(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
@@ -139,7 +155,7 @@ pub async fn query_typed(
     let client = pool
         .get()
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
@@ -420,7 +436,7 @@ where
     let (mut client, connection) = pg_config
         .connect(tls)
         .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {}", format_pg_error(&e)))?;
     let driver = tokio::spawn(async move {
         let _ = connection.await;
     });

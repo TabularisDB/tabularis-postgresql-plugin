@@ -370,3 +370,47 @@ fn ssl_mode_require_fails_against_a_server_without_tls() {
         "ssl_mode=require must fail against a server with no TLS, not silently connect over plaintext"
     );
 }
+
+// Coverage for #66: the connection-establishment handshake itself (bad
+// database name, bad password) surfaces as a tokio_postgres::Error wrapped
+// in deadpool_postgres::PoolError::Backend, from pool.get() — the same
+// Kind::Db/"db error" pitfall as query execution, just one layer deeper.
+// Every "Connection failed: {e}" call site previously stringified the
+// PoolError directly instead of unwrapping to the inner DbError.
+#[test]
+fn connecting_to_a_nonexistent_database_surfaces_the_real_postgres_message() {
+    let mut plugin = Plugin::spawn();
+    let mut params = conn_params();
+    params["database"] = json!("this_database_does_not_exist_xyz");
+
+    let response = plugin.call("test_connection", json!({ "params": params }));
+    let error = response
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .expect("connecting to a nonexistent database must produce a JSON-RPC error");
+    assert!(
+        !error.contains("db error") && error.contains("does not exist"),
+        "error should surface the real PostgreSQL message, not the generic \
+         tokio_postgres::Error::Display fallback, got: {error}"
+    );
+}
+
+#[test]
+fn connecting_with_a_wrong_password_surfaces_the_real_postgres_message() {
+    let mut plugin = Plugin::spawn();
+    let mut params = conn_params();
+    params["password"] = json!("definitely_wrong_password");
+
+    let response = plugin.call("test_connection", json!({ "params": params }));
+    let error = response
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .expect("a wrong password must produce a JSON-RPC error");
+    assert!(
+        !error.contains("db error") && error.contains("password authentication failed"),
+        "error should surface the real PostgreSQL message, not the generic \
+         tokio_postgres::Error::Display fallback, got: {error}"
+    );
+}
