@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.0.0-rc.2] - 2026-09-10
+
+### Fixed
+
+- Query, startup-script, and connection-establishment failures now surface
+  PostgreSQL's real error message instead of the generic literal string
+  `"db error"`. `tokio_postgres::Error`'s own `Display` impl prints that
+  fallback for any server-side error (its `Kind::Db` arm); the actual
+  message lives in the wrapped `DbError`, reachable via `.as_db_error()`.
+  Every call site that stringified the error directly — query execution,
+  startup scripts, blob fetch, `SET search_path`, and the connection
+  handshake itself (bad database name, bad password) — lost that detail.
+  Ports the built-in driver's `format_pg_error` helper and applies it at
+  every affected site (#66, #67).
+
+### Changed
+
+- Bumped `rust_decimal` from 1.42.1 to 1.43.0 (backported fixes, perf
+  improvements, clippy cleanup; lockfile-only change, no `Cargo.toml`
+  range change). Verified `NUMERIC`/`Decimal` round-tripping — including
+  negative values, the one behavioral fix in this release — against a
+  live PostgreSQL container with no regressions (#65).
+
 ## [1.0.0-rc.1] - 2026-09-04
 
 No code changes since `1.0.0-beta.10` — this tag promotes that build to the
