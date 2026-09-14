@@ -9,7 +9,7 @@
 //! nulls out), the same way the builtin driver unit-tests
 //! `extract/enum.rs::extract_or_null`.
 
-use crate::extract::{EnumLabel, Money};
+use crate::extract::{ArrayValue, EnumLabel, Money};
 use std::collections::HashMap;
 use tokio_postgres::types::{FromSql, Kind, Type};
 
@@ -132,4 +132,112 @@ fn empty_hstore_decodes_to_an_empty_json_object() {
     let map = HashMap::<String, Option<String>>::from_sql(&hstore_type(), &bytes).unwrap();
     let json = serde_json::to_value(map).unwrap();
     assert_eq!(json, serde_json::json!({}));
+}
+
+fn array_type(elem: Type) -> Type {
+    Type::new(
+        format!("_{}", elem.name()),
+        16_433,
+        Kind::Array(elem),
+        "public".to_string(),
+    )
+}
+
+/// Builds the 1-D Postgres array wire format: 4-byte dimension count,
+/// 4-byte has-nulls flag, 4-byte element type OID, one 8-byte
+/// (length, lower_bound) dimension header, then each element as a
+/// 4-byte length-prefixed value (-1 length = NULL, no bytes follow).
+/// Matches `postgres_protocol::types::array_from_sql`, which
+/// `ArrayValue::from_sql` parses directly (#72).
+fn array_wire_bytes(element_oid: u32, elements: &[Option<&[u8]>]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&1_i32.to_be_bytes()); // dimensions
+    buf.extend_from_slice(&0_i32.to_be_bytes()); // has_nulls (unused by our decoder)
+    buf.extend_from_slice(&element_oid.to_be_bytes());
+    buf.extend_from_slice(&(elements.len() as i32).to_be_bytes()); // dim length
+    buf.extend_from_slice(&1_i32.to_be_bytes()); // lower_bound
+    for elem in elements {
+        match elem {
+            Some(bytes) => {
+                buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            None => buf.extend_from_slice(&(-1_i32).to_be_bytes()),
+        }
+    }
+    buf
+}
+
+fn empty_array_wire_bytes() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&0_i32.to_be_bytes()); // dimensions = 0 -> empty
+    buf.extend_from_slice(&0_i32.to_be_bytes());
+    buf.extend_from_slice(&Type::INT4.oid().to_be_bytes());
+    buf
+}
+
+#[test]
+fn array_value_accepts_only_array_kinds() {
+    assert!(ArrayValue::accepts(&array_type(Type::INT4)));
+    assert!(!ArrayValue::accepts(&Type::INT4));
+    assert!(!ArrayValue::accepts(&enum_type()));
+}
+
+#[test]
+fn enum_array_decodes_each_element_as_its_label_string() {
+    // enum[] has no hardcoded fast-path in extract.rs (no well-known OID),
+    // so it must go through the generic per-element decoder (#72) rather
+    // than tokio_postgres's Vec<T>: FromSql (which requires one concrete T).
+    let ty = array_type(enum_type());
+    let bytes = array_wire_bytes(enum_type().oid(), &[Some(b"happy"), Some(b"sad")]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["happy", "sad"]));
+}
+
+#[test]
+fn enum_array_null_element_becomes_json_null_not_a_dropped_slot() {
+    let ty = array_type(enum_type());
+    let bytes = array_wire_bytes(enum_type().oid(), &[Some(b"happy"), None]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["happy", null]));
+}
+
+#[test]
+fn hstore_array_decodes_each_element_as_a_json_object() {
+    let ty = array_type(hstore_type());
+    let a = hstore_wire_bytes(&[("a", Some("1"))]);
+    let b = hstore_wire_bytes(&[("b", Some("2"))]);
+    let bytes = array_wire_bytes(hstore_type().oid(), &[Some(&a), Some(&b)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!([{"a": "1"}, {"b": "2"}]));
+}
+
+#[test]
+fn numeric_array_decodes_via_the_extract_simple_from_bytes_fallback() {
+    // INT8 isn't one of extract_element_from_bytes's explicit arms, so this
+    // exercises its fallback to extract_simple_from_bytes — proving that
+    // shared helper (already covered by range tests) also drives
+    // array-element decoding correctly for types beyond enum/hstore.
+    let ty = array_type(Type::INT8);
+    let elem_bytes = 42_i64.to_be_bytes();
+    let bytes = array_wire_bytes(Type::INT8.oid(), &[Some(&elem_bytes)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!([42]));
+}
+
+#[test]
+fn empty_array_decodes_to_an_empty_json_array() {
+    let ty = array_type(Type::INT4);
+    let array = ArrayValue::from_sql(&ty, &empty_array_wire_bytes()).unwrap();
+    assert_eq!(array.0, serde_json::json!([]));
+}
+
+#[test]
+fn multi_dimensional_array_is_rejected_rather_than_misparsed() {
+    let ty = array_type(Type::INT4);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&2_i32.to_be_bytes()); // dimensions = 2
+    buf.extend_from_slice(&0_i32.to_be_bytes());
+    buf.extend_from_slice(&Type::INT4.oid().to_be_bytes());
+    assert!(ArrayValue::from_sql(&ty, &buf).is_err());
 }
