@@ -2,7 +2,7 @@
 //! (`.rules/rust.md` #4/#5) — loaded via `#[cfg(test)] mod binding_tests;`.
 
 use crate::binding::{bind_pg_value, bind_pk_value, BindOptions};
-use serde_json::json;
+use serde_json::{json, Value};
 
 mod bind_pg_value_tests {
     use super::*;
@@ -65,6 +65,7 @@ mod bind_pg_value_tests {
             column_type: Some("jsonb"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!({"a": 1}), 1, &options).unwrap();
         assert_eq!(bound.sql, "$1");
@@ -80,6 +81,7 @@ mod bind_pg_value_tests {
             column_type: Some("jsonb"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("{\"a\":1}"), 1, &options).unwrap();
         assert_eq!(bound.sql, "$1");
@@ -91,6 +93,7 @@ mod bind_pg_value_tests {
             column_type: None,
             enum_type: None,
             allow_default: true,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("__USE_DEFAULT__"), 1, &options).unwrap();
         assert_eq!(bound.sql, "DEFAULT");
@@ -103,6 +106,7 @@ mod bind_pg_value_tests {
             column_type: None,
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("__USE_DEFAULT__"), 1, &options).unwrap();
         // Falls through to the plain TEXT fallback, not treated as DEFAULT.
@@ -128,6 +132,7 @@ mod bind_pg_value_tests {
             column_type: None,
             enum_type: Some("\"test_schema\".\"mood\""),
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("sad"), 1, &options).unwrap();
         assert_eq!(bound.sql, "CAST($1 AS \"test_schema\".\"mood\")");
@@ -143,6 +148,7 @@ mod bind_pg_value_tests {
             column_type: None,
             enum_type: Some("\"public\".\"status\""),
             allow_default: false,
+            hstore_oid: None,
         };
         let bound =
             bind_pg_value(json!("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"), 1, &options).unwrap();
@@ -155,6 +161,7 @@ mod bind_pg_value_tests {
             column_type: Some("boolean"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         for truthy in ["true", "t", "yes", "y", "on", "1", "TRUE"] {
             let bound = bind_pg_value(json!(truthy), 1, &options).unwrap();
@@ -168,6 +175,7 @@ mod bind_pg_value_tests {
             column_type: Some("boolean"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let err = bind_pg_value(json!("maybe"), 1, &options).unwrap_err();
         assert!(err.contains("boolean"));
@@ -179,6 +187,7 @@ mod bind_pg_value_tests {
             column_type: Some("integer"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("42"), 1, &options).unwrap();
         assert_eq!(bound.sql, "CAST($1 AS bigint)");
@@ -190,6 +199,7 @@ mod bind_pg_value_tests {
             column_type: Some("integer"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let err = bind_pg_value(json!("not-a-number"), 1, &options).unwrap_err();
         assert!(err.contains("integer"));
@@ -201,6 +211,7 @@ mod bind_pg_value_tests {
             column_type: Some("numeric"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("12345.67"), 1, &options).unwrap();
         assert_eq!(bound.sql, "CAST($1 AS numeric)");
@@ -212,6 +223,7 @@ mod bind_pg_value_tests {
             column_type: Some("timestamp"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("2026-01-15 14:30:00"), 1, &options).unwrap();
         assert_eq!(bound.sql, "CAST($1 AS timestamp)");
@@ -223,6 +235,7 @@ mod bind_pg_value_tests {
             column_type: Some("timestamptz"),
             enum_type: None,
             allow_default: false,
+            hstore_oid: None,
         };
         let bound = bind_pg_value(json!("2026-01-15 14:30:00+00"), 1, &options).unwrap();
         assert_eq!(bound.sql, "CAST($1 AS timestamptz)");
@@ -251,6 +264,106 @@ mod bind_pg_value_tests {
         let bound = bind_pg_value(json!("hello world"), 1, &BindOptions::default()).unwrap();
         assert_eq!(bound.sql, "$1");
         assert!(bound.param.is_some());
+    }
+
+    #[test]
+    fn hstore_object_bound_as_value_with_correct_type_name() {
+        let options = BindOptions {
+            column_type: Some("hstore"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: Some(16_500),
+        };
+        let bound = bind_pg_value(json!({"key": "value", "other": "thing"}), 1, &options).unwrap();
+
+        assert_eq!(bound.sql, "$1");
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type.name(), "hstore");
+        assert_eq!(pg_type.oid(), 16_500);
+    }
+
+    #[test]
+    fn hstore_object_with_null_value_bound_correctly() {
+        let options = BindOptions {
+            column_type: Some("hstore"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: Some(16_500),
+        };
+        let bound = bind_pg_value(json!({"key": null}), 1, &options).unwrap();
+
+        assert_eq!(bound.sql, "$1");
+        assert!(bound.param.is_some());
+    }
+
+    #[test]
+    fn hstore_null_value_stays_sql_null() {
+        let options = BindOptions {
+            column_type: Some("hstore"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: Some(16_500),
+        };
+        let bound = bind_pg_value(Value::Null, 1, &options).unwrap();
+
+        assert_eq!(bound.sql, "NULL");
+        assert!(bound.param.is_none());
+    }
+
+    #[test]
+    fn hstore_json_encoded_string_is_accepted_as_a_fallback() {
+        // The plain-text cell editor doesn't distinguish hstore from other
+        // types, so it may round-trip a value as a JSON-encoded string.
+        let options = BindOptions {
+            column_type: Some("hstore"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: Some(16_500),
+        };
+        let bound = bind_pg_value(json!("{\"key\": \"value\"}"), 1, &options).unwrap();
+
+        assert_eq!(bound.sql, "$1");
+        assert!(bound.param.is_some());
+    }
+
+    #[test]
+    fn hstore_non_string_value_in_object_returns_clear_error() {
+        let options = BindOptions {
+            column_type: Some("hstore"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: Some(16_500),
+        };
+        let err = bind_pg_value(json!({"key": 42}), 1, &options).unwrap_err();
+
+        assert!(err.contains("key"));
+        assert!(err.contains("string or null"));
+    }
+
+    #[test]
+    fn hstore_non_object_value_returns_clear_error() {
+        let options = BindOptions {
+            column_type: Some("hstore"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: Some(16_500),
+        };
+        let err = bind_pg_value(json!(42), 1, &options).unwrap_err();
+
+        assert!(err.contains("JSON object"));
+    }
+
+    #[test]
+    fn hstore_object_without_resolved_oid_returns_clear_error() {
+        let options = BindOptions {
+            column_type: Some("hstore"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: None,
+        };
+        let err = bind_pg_value(json!({"key": "value"}), 1, &options).unwrap_err();
+
+        assert!(err.contains("hstore"));
     }
 }
 

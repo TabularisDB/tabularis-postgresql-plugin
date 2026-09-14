@@ -68,10 +68,20 @@ async fn exec_insert(
     for (col_name, val) in entries {
         cols.push(format!("\"{}\"", col_name.replace('"', "\"\"")));
         let column_type = column_types.get(&col_name).map(String::as_str);
+        // get_column_types_map already unfolds 'USER-DEFINED' to the real
+        // udt_name, so hstore columns report as plain "hstore" here.
+        let hstore_oid = if column_type == Some("hstore") {
+            client::get_hstore_oid_for_column(conn_params, schema, table, &col_name)
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
         let options = BindOptions {
             column_type,
             enum_type: enum_types.get(&col_name).map(String::as_str),
             allow_default: false,
+            hstore_oid,
         };
         let bound = bind_pg_value(val, placeholder_idx, &options)?;
         sql_fragments.push(bound.sql);
@@ -142,6 +152,15 @@ async fn exec_update(
         column_type: column_types.get(col_name).map(String::as_str),
         enum_type: enum_types.get(col_name).map(String::as_str),
         allow_default: true,
+        // get_column_types_map already unfolds 'USER-DEFINED' to the real
+        // udt_name, so hstore columns report as plain "hstore" here.
+        hstore_oid: if column_types.get(col_name).map(String::as_str) == Some("hstore") {
+            client::get_hstore_oid_for_column(conn_params, schema, table, col_name)
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        },
     };
     let bound = bind_pg_value(new_val, 1, &options)?;
 

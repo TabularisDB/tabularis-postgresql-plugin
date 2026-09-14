@@ -4,6 +4,8 @@
 //! `src-tauri/src/drivers/postgres/extract/` system. Every PG type must
 //! produce byte-identical JSON to the builtin — the parity tests enforce this.
 
+use std::collections::HashMap;
+
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::Decimal;
 use serde_json::Value as JsonValue;
@@ -133,6 +135,14 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         // `extract/enum.rs::extract_or_null`.
         ref t if matches!(t.kind(), Kind::Enum(_)) => {
             try_extract::<EnumLabel>(row, index, |v| JsonValue::String(v.0))
+        }
+        // hstore is an extension type (no well-known OID), matched by name like
+        // the builtin driver's `extract/simple.rs::extract_or_null`. tokio-postgres
+        // decodes it natively as HashMap<String, Option<String>>.
+        ref t if t.name() == "hstore" => {
+            try_extract::<HashMap<String, Option<String>>>(row, index, |v| {
+                serde_json::to_value(v).unwrap_or(JsonValue::Null)
+            })
         }
         // For types not explicitly handled (ranges, composites, geometric, etc.),
         // fall back to text representation via the Display trait on the raw bytes.

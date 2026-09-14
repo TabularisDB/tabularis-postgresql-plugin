@@ -282,6 +282,60 @@ fn execute_query_returns_a_real_enum_value_not_null() {
 }
 
 #[test]
+fn execute_query_returns_a_real_hstore_value_not_null() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained, same shape as the enum regression test above (#7):
+    // hstore is an extension type, so this must not assume it's already
+    // installed on whatever database CI points at (#68/#69).
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "CREATE EXTENSION IF NOT EXISTS hstore" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_db_hstore_scratch \
+                       (id SERIAL PRIMARY KEY, attrs hstore)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "TRUNCATE live_db_hstore_scratch RESTART IDENTITY" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_hstore_scratch (attrs) VALUES \
+                       ('\"comment\"=>\"This is a test\", \"count\"=>\"1\"'), (NULL)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT id, attrs FROM live_db_hstore_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0][1],
+        json!({"comment": "This is a test", "count": "1"}),
+        "a non-null hstore column must round-trip as a JSON object, not null"
+    );
+    assert_eq!(
+        rows[1][1],
+        Value::Null,
+        "a genuinely-NULL hstore column must still come back as null"
+    );
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();
