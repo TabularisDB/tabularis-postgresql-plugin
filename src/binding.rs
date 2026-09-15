@@ -512,6 +512,17 @@ pub fn bind_pk_value(
                 param: Some((Box::new(s.clone()), Type::TEXT)),
             })
         }
+        // Keyless tables identify rows by every comparable column, so the map
+        // may legitimately carry NULLs — `= NULL` never matches, so emit
+        // `IS NULL` and bind no parameter (the placeholder index is not
+        // consumed). `build_pk_map_predicate` formats this directly as
+        // `"col" IS NULL` rather than the `"col" = <rhs>` shape, since there is
+        // no valid rhs for a NULL comparison. Mirrors the builtin driver's
+        // `build_pk_predicate` `Null` arm (`TabularisDB/tabularis` `binding.rs`).
+        Value::Null => Ok(BoundValue {
+            sql: "IS NULL".to_string(),
+            param: None,
+        }),
         _ => Err("Unsupported PK type".to_string()),
     }
 }
@@ -536,6 +547,17 @@ pub fn build_pk_map_predicate(
 
     for key in keys {
         let val = &pk_map[key];
+
+        // A NULL key value is `IS NULL`, not `"col" = IS NULL` — the `=`
+        // prefix only applies to non-null rhs values. `bind_pk_value` returns
+        // `IS NULL` with no parameter for `Value::Null`; format it directly so
+        // the predicate reads `"col" IS NULL` and consumes no placeholder.
+        // Matches the builtin driver's `build_pk_predicate` `Null` arm.
+        if val.is_null() {
+            predicates.push(format!("\"{}\" IS NULL", key.replace('"', "\"\"")));
+            continue;
+        }
+
         let pk_type = column_types.get(key).map(String::as_str);
         let bound = bind_pk_value(val, idx, pk_type)?;
         predicates.push(format!("\"{}\" = {}", key.replace('"', "\"\""), bound.sql));

@@ -1,8 +1,9 @@
 //! Unit tests for `binding.rs`. Sibling test file per repo convention
 //! (`.rules/rust.md` #4/#5) — loaded via `#[cfg(test)] mod binding_tests;`.
 
-use crate::binding::{bind_pg_value, bind_pk_value, BindOptions};
+use crate::binding::{bind_pg_value, bind_pk_value, build_pk_map_predicate, BindOptions};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 mod bind_pg_value_tests {
     use super::*;
@@ -461,5 +462,60 @@ mod bind_pk_value_tests {
         assert_eq!(bound.sql, "CAST($3 AS timestamp)");
         let (_, pg_type) = bound.param.unwrap();
         assert_eq!(pg_type, tokio_postgres::types::Type::TEXT);
+    }
+
+    // Keyless tables identify rows by every column, so a `pk_map` entry can
+    // legitimately be `null` (a column whose value is NULL). `= NULL` never
+    // matches in SQL — the predicate must be `IS NULL`, and no parameter is
+    // bound so the placeholder index is not consumed. Mirrors the builtin
+    // driver's `build_pk_predicate` `Null` arm
+    // (`TabularisDB/tabularis` `binding.rs`).
+
+    #[test]
+    fn null_pk_binds_as_is_null() {
+        let bound = bind_pk_value(&Value::Null, 1, None).unwrap();
+        assert_eq!(bound.sql, "IS NULL");
+        assert!(
+            bound.param.is_none(),
+            "IS NULL must bind no parameter so the placeholder index is not consumed"
+        );
+    }
+}
+
+mod build_pk_map_predicate_tests {
+    use super::*;
+
+    fn empty_types() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn null_pk_entry_emits_is_null_predicate_without_consuming_placeholder() {
+        // A keyless-table row with a NULL column: `{"a": 1, "b": null}` must
+        // produce `"a" = CAST($1 AS bigint) AND "b" IS NULL` with exactly one
+        // parameter. The builtin builds this; the plugin previously errored
+        // with "Unsupported PK type" (#78).
+        let mut pk_map = serde_json::Map::new();
+        pk_map.insert("a".to_string(), json!(1));
+        pk_map.insert("b".to_string(), Value::Null);
+        let types = empty_types();
+
+        let (predicate, params) = build_pk_map_predicate(&pk_map, &types, 1).unwrap();
+
+        // Keys are sorted alphabetically: "a" before "b". The number binds as
+        // a bigint cast (one param); the null binds as `IS NULL` (no param).
+        assert_eq!(predicate, r#""a" = CAST($1 AS bigint) AND "b" IS NULL"#);
+        assert_eq!(params.len(), 1, "IS NULL must not consume a placeholder");
+    }
+
+    #[test]
+    fn null_pk_entry_alone_emits_is_null_with_no_parameters() {
+        let mut pk_map = serde_json::Map::new();
+        pk_map.insert("nullable_col".to_string(), Value::Null);
+
+        let (predicate, params) = build_pk_map_predicate(&pk_map, &empty_types(), 1).unwrap();
+
+        assert_eq!(predicate, r#""nullable_col" IS NULL"#);
+        assert!(params.is_empty(), "IS NULL binds no parameters");
     }
 }
