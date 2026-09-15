@@ -241,3 +241,21 @@ fn multi_dimensional_array_is_rejected_rather_than_misparsed() {
     buf.extend_from_slice(&Type::INT4.oid().to_be_bytes());
     assert!(ArrayValue::from_sql(&ty, &buf).is_err());
 }
+
+#[test]
+fn huge_claimed_length_with_truncated_buffer_does_not_attempt_unbounded_allocation() {
+    // A malformed/truncated array buffer could claim a huge element count
+    // (e.g. i32::MAX) while actually containing far fewer bytes. This must
+    // error out cheaply rather than pre-allocating a Vec sized to the
+    // claimed (attacker/corruption-controlled) length.
+    let ty = array_type(Type::INT4);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&1_i32.to_be_bytes()); // dimensions = 1
+    buf.extend_from_slice(&0_i32.to_be_bytes());
+    buf.extend_from_slice(&Type::INT4.oid().to_be_bytes());
+    buf.extend_from_slice(&i32::MAX.to_be_bytes()); // claimed length: ~2.1 billion
+    buf.extend_from_slice(&1_i32.to_be_bytes()); // lower_bound
+                                                 // No element bytes follow — buffer is truncated relative to the claim.
+    let result = ArrayValue::from_sql(&ty, &buf);
+    assert!(result.is_err());
+}

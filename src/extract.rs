@@ -379,7 +379,14 @@ impl<'a> FromSql<'a> for ArrayValue {
         }
         buf = &buf[8..]; // skip length + lower_bound
 
-        let mut elements = Vec::with_capacity(len as usize);
+        // Don't pre-allocate based on the claimed length: it's untrusted
+        // (comes straight off the wire) and a truncated/malformed buffer
+        // could claim up to i32::MAX elements while containing far fewer
+        // bytes, turning a single bad row into a multi-gigabyte allocation
+        // before the truncation check below ever runs. `Vec::new()` grows
+        // by amortized doubling as elements are actually read, so the
+        // allocation stays proportional to what's really in the buffer.
+        let mut elements = Vec::new();
         for _ in 0..len {
             if buf.len() < 4 {
                 return Err("array buffer truncated before element length".into());
