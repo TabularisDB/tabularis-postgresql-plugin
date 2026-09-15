@@ -569,6 +569,10 @@ pub fn build_pk_map_predicate(
     column_types: &std::collections::HashMap<String, String>,
     placeholder_idx: usize,
 ) -> Result<(String, Vec<TypedPgParam>), String> {
+    if pk_map.is_empty() {
+        return Err("pk_map must not be empty".to_string());
+    }
+
     let mut keys: Vec<&String> = pk_map.keys().collect();
     keys.sort();
 
