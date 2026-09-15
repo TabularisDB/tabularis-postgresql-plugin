@@ -1,5 +1,53 @@
 # Changelog
 
+## [1.0.0-rc.3] - 2026-09-15
+
+### Added
+
+- Table and column comments (`COMMENT ON TABLE`/`COMMENT ON COLUMN`,
+  stored in `pg_description`) are now exposed as an optional `comment`
+  field in `get_tables`/`get_columns`, joined via `pg_class`/
+  `pg_attribute`. Matches the builtin driver's parity fix. Additive —
+  no manifest/capability change, no minimum runtime bump (#74, #76).
+
+### Fixed
+
+- `hstore` columns decoded to `null` instead of a JSON object, since
+  `extract.rs`'s type dispatch had no arm for hstore's extension OID
+  (which varies per installation and isn't a well-known Postgres
+  type). Also fixes the write side: editing an hstore cell previously
+  failed with "Cannot bind a JSON object to a non-JSON column" (#68,
+  #69, #71).
+- Arrays of any custom-OID element type — `enum[]`, `hstore[]`, and in
+  practice every array type without a hardcoded fast-path (`numeric[]`,
+  `date[]`, `json[]`, `money[]`, `inet[]`, etc.) — also decoded to
+  `null`. Adds a generic array decoder that recurses per-element,
+  matching the builtin driver's dispatch. Existing hardcoded array
+  fast-paths (int2/int4/int8/float4/float8/bool/text/varchar) are
+  unaffected (#71, #72).
+- The hardcoded array fast-paths decoded the *entire* array to `null`
+  if any single element was `NULL` (e.g. `ARRAY[1, NULL]` returned
+  `null`, not `[1, null]`), since they decoded via `Vec<T>: FromSql`
+  rather than `Vec<Option<T>>: FromSql`. Now preserves the `null` slot
+  in its correct position (#73, #75).
+- Running `SHOW search_path` (or any `CALL`) from the Console produced
+  `syntax error at or near "LIMIT"`, because the Console always sends
+  a `limit`/`page` param and pagination was unconditionally appending
+  a SQL `LIMIT`/`OFFSET` clause — but PostgreSQL's `SHOW`/`CALL` syntax
+  doesn't accept one. `SELECT`/`WITH`/`VALUES`/`TABLE`/`EXPLAIN` do
+  accept it and keep real SQL-level pagination (multi-page browsing
+  still works for CTEs); only `SHOW`/`CALL` fall back to capping rows
+  client-side instead (#70, #77).
+- A comment-headed query (e.g. `-- note\nSELECT 1`) was misclassified
+  as not returning a result set, silently losing its row data through
+  the execute()-and-discard path instead of the fetch-rows path (#77).
+
+### Changed
+
+- Bumped `rustls` from 0.23.43 to 0.23.45, fixing RUSTSEC-2026-0285
+  (CVE-2025-61730) — a TLS 1.3 handshake message boundary check.
+  Lockfile-only change, no `Cargo.toml` range change.
+
 ## [1.0.0-rc.2] - 2026-09-10
 
 ### Fixed
