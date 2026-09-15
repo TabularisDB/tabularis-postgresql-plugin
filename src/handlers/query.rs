@@ -174,14 +174,24 @@ async fn exec_query_on_client(
         }));
     }
 
-    // Build paginated query — strips any existing LIMIT/OFFSET first so we
-    // never emit a query with two LIMIT clauses (which is a syntax error).
-    let (final_query, page_size) = if let Some(lim) = limit {
-        let paginated = crate::utils::pagination::build_paginated_query(query, lim, page);
-        (paginated, lim)
+    // Only genuine SELECTs get a SQL LIMIT/OFFSET appended — PostgreSQL syntax
+    // doesn't support that clause on SHOW/EXPLAIN/TABLE/CALL/etc., which also
+    // return a result set (#70: `SHOW search_path` with a `limit` param
+    // produced "syntax error at or near LIMIT" before this check existed).
+    // Non-SELECT statements still respect `limit` by capping rows client-side
+    // below (`manual_limit`), matching the builtin driver's behavior — they
+    // just can't push the limit down into the SQL text itself.
+    let is_paginated = is_select_query(query) && limit.is_some();
+    let (final_query, page_size) = if is_paginated {
+        let lim = limit.unwrap();
+        (
+            crate::utils::pagination::build_paginated_query(query, lim, page),
+            lim,
+        )
     } else {
         (query.to_string(), 0u32)
     };
+    let manual_limit = if is_paginated { None } else { limit };
 
     // Execute query
     let rows = pg_client
@@ -200,7 +210,7 @@ async fn exec_query_on_client(
             vec![]
         };
 
-        let pagination = if limit.is_some() {
+        let pagination = if is_paginated {
             Some(json!({
                 "page": page,
                 "page_size": page_size,
@@ -227,12 +237,17 @@ async fn exec_query_on_client(
         .map(|c| c.name().to_string())
         .collect();
 
-    // Determine has_more and truncate
-    let has_more = limit.is_some() && rows.len() > page_size as usize;
-    let result_rows = if has_more {
-        &rows[..page_size as usize]
+    // Determine has_more/truncate — via the paginated page size for a real
+    // SELECT, or by capping to the raw limit client-side otherwise.
+    let cap = if is_paginated {
+        Some(page_size as usize)
     } else {
-        &rows[..]
+        manual_limit.map(|l| l as usize)
+    };
+    let truncated = cap.is_some_and(|c| rows.len() > c);
+    let result_rows = match cap {
+        Some(c) if truncated => &rows[..c],
+        _ => &rows[..],
     };
 
     // Extract row values
@@ -246,12 +261,12 @@ async fn exec_query_on_client(
         })
         .collect();
 
-    let pagination = if limit.is_some() {
+    let pagination = if is_paginated {
         Some(json!({
             "page": page,
             "page_size": page_size,
             "total_rows": null,
-            "has_more": has_more,
+            "has_more": truncated,
         }))
     } else {
         None
@@ -261,15 +276,40 @@ async fn exec_query_on_client(
         "columns": columns,
         "rows": json_rows,
         "affected_rows": 0,
-        "truncated": has_more,
+        "truncated": truncated,
         "pagination": pagination,
     }))
 }
 
+/// Strip leading SQL comments (`-- …` line comments and `/* … */` block
+/// comments) and whitespace so the first statement keyword is at position 0.
+/// Matches the builtin driver's `drivers/common/query.rs::strip_leading_sql_comments`
+/// — `returns_result_set`/`is_select_query` must agree on where a statement
+/// "really" starts, or a comment-headed query gets misclassified.
+fn strip_leading_sql_comments(query: &str) -> &str {
+    let mut s = query;
+    loop {
+        s = s.trim_start();
+        if s.starts_with("--") {
+            match s.find('\n') {
+                Some(pos) => s = &s[pos + 1..],
+                None => return "",
+            }
+        } else if s.starts_with("/*") {
+            match s.find("*/") {
+                Some(pos) => s = &s[pos + 2..],
+                None => return "",
+            }
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 /// Check if a SQL statement returns a result set (SELECT, WITH, SHOW, etc.)
 fn returns_result_set(query: &str) -> bool {
-    let trimmed = query.trim_start();
-    let upper = trimmed.to_uppercase();
+    let upper = strip_leading_sql_comments(query).to_uppercase();
     upper.starts_with("SELECT")
         || upper.starts_with("WITH")
         || upper.starts_with("SHOW")
@@ -280,3 +320,23 @@ fn returns_result_set(query: &str) -> bool {
         || upper.starts_with("PRAGMA")
         || upper.starts_with("CALL")
 }
+
+/// Check if a query is a SELECT statement — narrower than
+/// `returns_result_set`, which also matches non-`SELECT` statements
+/// (`SHOW`, `EXPLAIN`, `TABLE`, `CALL`, ...) that return rows but don't
+/// support a trailing `LIMIT`/`OFFSET` clause in PostgreSQL syntax. Only
+/// `is_select_query` queries should be routed through
+/// `pagination::build_paginated_query` (#70 — `SHOW search_path` with a
+/// `limit` param produced "syntax error at or near LIMIT" because
+/// pagination was being applied to every result-set-bearing query, not
+/// just genuine SELECTs). Matches the builtin driver's
+/// `drivers/common/query.rs::is_select_query`.
+fn is_select_query(query: &str) -> bool {
+    strip_leading_sql_comments(query)
+        .to_uppercase()
+        .starts_with("SELECT")
+}
+
+#[cfg(test)]
+#[path = "query_tests.rs"]
+mod query_tests;

@@ -562,6 +562,35 @@ fn get_tables_and_get_columns_return_real_comments() {
 }
 
 #[test]
+fn show_command_with_a_limit_param_does_not_error() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // #70: the Console sends a limit/page param on every execute_query
+    // call regardless of statement type. SHOW isn't a SELECT and doesn't
+    // support a trailing LIMIT/OFFSET clause in PostgreSQL syntax, so
+    // pagination must not push a SQL LIMIT into it — before this fix, this
+    // produced "syntax error at or near LIMIT".
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "SHOW search_path", "limit": 100, "page": 1 }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "SHOW search_path must return exactly one row"
+    );
+    assert!(
+        result
+            .get("pagination")
+            .map(Value::is_null)
+            .unwrap_or(false),
+        "a non-SELECT statement must not carry fabricated pagination metadata, got: {result:?}"
+    );
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();
