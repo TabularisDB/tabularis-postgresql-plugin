@@ -259,3 +259,78 @@ fn huge_claimed_length_with_truncated_buffer_does_not_attempt_unbounded_allocati
     let result = ArrayValue::from_sql(&ty, &buf);
     assert!(result.is_err());
 }
+
+// --- #73: hardcoded array fast-paths must preserve a NULL element instead
+// of nulling out the whole array. extract_value dispatches these types via
+// `Vec<Option<T>>: FromSql`, not `Vec<T>: FromSql` (which errors — and
+// therefore whole-column-nulls via try_extract's catch-all — the moment any
+// element is absent, since plain T has no "missing" representation). These
+// tests exercise that FromSql impl directly with hand-built wire bytes,
+// reusing `array_wire_bytes` (the same 1-D array wire format `ArrayValue`
+// parses) since tokio_postgres's own array decoders parse the identical
+// layout.
+
+#[test]
+fn int4_array_with_null_element_preserves_the_null_slot() {
+    let bytes = array_wire_bytes(Type::INT4.oid(), &[Some(&1_i32.to_be_bytes()), None]);
+    let v = Vec::<Option<i32>>::from_sql(&array_type(Type::INT4), &bytes).unwrap();
+    assert_eq!(v, vec![Some(1), None]);
+}
+
+#[test]
+fn int2_array_with_null_element_preserves_the_null_slot() {
+    let bytes = array_wire_bytes(Type::INT2.oid(), &[Some(&1_i16.to_be_bytes()), None]);
+    let v = Vec::<Option<i16>>::from_sql(&array_type(Type::INT2), &bytes).unwrap();
+    assert_eq!(v, vec![Some(1), None]);
+}
+
+#[test]
+fn int8_array_with_null_element_preserves_the_null_slot() {
+    let bytes = array_wire_bytes(Type::INT8.oid(), &[Some(&1_i64.to_be_bytes()), None]);
+    let v = Vec::<Option<i64>>::from_sql(&array_type(Type::INT8), &bytes).unwrap();
+    assert_eq!(v, vec![Some(1), None]);
+}
+
+#[test]
+fn text_array_with_null_element_preserves_the_null_slot() {
+    let bytes = array_wire_bytes(Type::TEXT.oid(), &[Some(b"a" as &[u8]), None]);
+    let v = Vec::<Option<String>>::from_sql(&array_type(Type::TEXT), &bytes).unwrap();
+    assert_eq!(v, vec![Some("a".to_string()), None]);
+}
+
+#[test]
+fn float4_array_with_null_element_preserves_the_null_slot() {
+    let bytes = array_wire_bytes(Type::FLOAT4.oid(), &[Some(&1.5_f32.to_be_bytes()), None]);
+    let v = Vec::<Option<f32>>::from_sql(&array_type(Type::FLOAT4), &bytes).unwrap();
+    assert_eq!(v, vec![Some(1.5), None]);
+}
+
+#[test]
+fn float8_array_with_null_element_preserves_the_null_slot() {
+    let bytes = array_wire_bytes(Type::FLOAT8.oid(), &[Some(&1.5_f64.to_be_bytes()), None]);
+    let v = Vec::<Option<f64>>::from_sql(&array_type(Type::FLOAT8), &bytes).unwrap();
+    assert_eq!(v, vec![Some(1.5), None]);
+}
+
+#[test]
+fn bool_array_with_null_element_preserves_the_null_slot() {
+    let bytes = array_wire_bytes(Type::BOOL.oid(), &[Some(&[1u8]), None]);
+    let v = Vec::<Option<bool>>::from_sql(&array_type(Type::BOOL), &bytes).unwrap();
+    assert_eq!(v, vec![Some(true), None]);
+}
+
+#[test]
+fn array_with_no_null_elements_still_decodes_every_value() {
+    // Regression guard: switching from Vec<T> to Vec<Option<T>> must not
+    // change behavior for the (much more common) all-present case.
+    let bytes = array_wire_bytes(
+        Type::INT4.oid(),
+        &[
+            Some(&1_i32.to_be_bytes()),
+            Some(&2_i32.to_be_bytes()),
+            Some(&3_i32.to_be_bytes()),
+        ],
+    );
+    let v = Vec::<Option<i32>>::from_sql(&array_type(Type::INT4), &bytes).unwrap();
+    assert_eq!(v, vec![Some(1), Some(2), Some(3)]);
+}

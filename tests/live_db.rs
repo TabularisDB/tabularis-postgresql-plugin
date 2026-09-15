@@ -414,6 +414,66 @@ fn execute_query_returns_real_array_values_for_custom_oid_element_types() {
 }
 
 #[test]
+fn execute_query_preserves_null_slots_in_hardcoded_array_types() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained, same shape as the tests above. Before #73's fix, the
+    // hardcoded array fast-paths (int2/int4/int8/float4/float8/bool/text/
+    // varchar) decoded via Vec<T>: FromSql, which errors the moment any
+    // element is NULL — try_extract's catch-all then turned that error into
+    // whole-column null instead of preserving the null element's position.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_db_array_null_scratch \
+                       (id SERIAL PRIMARY KEY, \
+                        nums int4[], \
+                        words text[], \
+                        flags bool[])",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "TRUNCATE live_db_array_null_scratch RESTART IDENTITY" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_array_null_scratch (nums, words, flags) VALUES \
+                       (ARRAY[1, NULL], ARRAY['a', NULL], ARRAY[true, NULL])",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT nums, words, flags FROM live_db_array_null_scratch",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0],
+        json!([1, null]),
+        "int4[] with a NULL element must preserve the null slot, not null the whole array"
+    );
+    assert_eq!(
+        rows[0][1],
+        json!(["a", null]),
+        "text[] with a NULL element must preserve the null slot, not null the whole array"
+    );
+    assert_eq!(
+        rows[0][2],
+        json!([true, null]),
+        "bool[] with a NULL element must preserve the null slot, not null the whole array"
+    );
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();

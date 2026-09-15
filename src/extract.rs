@@ -90,44 +90,64 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         {
             try_extract_range(row, index)
         }
-        ref t if *t == Type::INT2_ARRAY => try_extract::<Vec<i16>>(row, index, |v| {
-            JsonValue::Array(v.into_iter().map(JsonValue::from).collect())
+        ref t if *t == Type::INT2_ARRAY => try_extract::<Vec<Option<i16>>>(row, index, |v| {
+            JsonValue::Array(
+                v.into_iter()
+                    .map(|e| e.map(JsonValue::from).unwrap_or(JsonValue::Null))
+                    .collect(),
+            )
         }),
-        ref t if *t == Type::INT4_ARRAY => try_extract::<Vec<i32>>(row, index, |v| {
-            JsonValue::Array(v.into_iter().map(JsonValue::from).collect())
+        ref t if *t == Type::INT4_ARRAY => try_extract::<Vec<Option<i32>>>(row, index, |v| {
+            JsonValue::Array(
+                v.into_iter()
+                    .map(|e| e.map(JsonValue::from).unwrap_or(JsonValue::Null))
+                    .collect(),
+            )
         }),
-        ref t if *t == Type::INT8_ARRAY => try_extract::<Vec<i64>>(row, index, |v| {
-            JsonValue::Array(v.into_iter().map(i64_to_json).collect())
+        ref t if *t == Type::INT8_ARRAY => try_extract::<Vec<Option<i64>>>(row, index, |v| {
+            JsonValue::Array(
+                v.into_iter()
+                    .map(|e| e.map(i64_to_json).unwrap_or(JsonValue::Null))
+                    .collect(),
+            )
         }),
         ref t if *t == Type::TEXT_ARRAY || *t == Type::VARCHAR_ARRAY => {
-            try_extract::<Vec<String>>(row, index, |v| {
-                JsonValue::Array(v.into_iter().map(JsonValue::String).collect())
+            try_extract::<Vec<Option<String>>>(row, index, |v| {
+                JsonValue::Array(
+                    v.into_iter()
+                        .map(|e| e.map(JsonValue::String).unwrap_or(JsonValue::Null))
+                        .collect(),
+                )
             })
         }
-        ref t if *t == Type::FLOAT4_ARRAY => try_extract::<Vec<f32>>(row, index, |v| {
+        ref t if *t == Type::FLOAT4_ARRAY => try_extract::<Vec<Option<f32>>>(row, index, |v| {
             JsonValue::Array(
                 v.into_iter()
-                    .map(|f| {
-                        serde_json::Number::from_f64(f as f64)
+                    .map(|e| {
+                        e.and_then(|f| serde_json::Number::from_f64(f as f64))
                             .map(JsonValue::Number)
                             .unwrap_or(JsonValue::Null)
                     })
                     .collect(),
             )
         }),
-        ref t if *t == Type::FLOAT8_ARRAY => try_extract::<Vec<f64>>(row, index, |v| {
+        ref t if *t == Type::FLOAT8_ARRAY => try_extract::<Vec<Option<f64>>>(row, index, |v| {
             JsonValue::Array(
                 v.into_iter()
-                    .map(|f| {
-                        serde_json::Number::from_f64(f)
+                    .map(|e| {
+                        e.and_then(serde_json::Number::from_f64)
                             .map(JsonValue::Number)
                             .unwrap_or(JsonValue::Null)
                     })
                     .collect(),
             )
         }),
-        ref t if *t == Type::BOOL_ARRAY => try_extract::<Vec<bool>>(row, index, |v| {
-            JsonValue::Array(v.into_iter().map(JsonValue::Bool).collect())
+        ref t if *t == Type::BOOL_ARRAY => try_extract::<Vec<Option<bool>>>(row, index, |v| {
+            JsonValue::Array(
+                v.into_iter()
+                    .map(|e| e.map(JsonValue::Bool).unwrap_or(JsonValue::Null))
+                    .collect(),
+            )
         }),
         // Enums are custom-OID types, so tokio_postgres's built-in `FromSql for
         // String` (which enforces known-OID checks) can't decode them — read the
