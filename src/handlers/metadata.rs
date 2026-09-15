@@ -51,18 +51,36 @@ pub async fn get_tables(id: Value, params: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("public");
 
-    match client::query_strings(
-        &conn_params,
-        "SELECT table_name::text as name FROM information_schema.tables \
-         WHERE table_schema = $1 AND table_type = 'BASE TABLE' \
-         ORDER BY table_name ASC",
-        &[&schema],
-        "name",
-    )
-    .await
-    {
-        Ok(names) => {
-            let tables: Vec<Value> = names.into_iter().map(|n| json!({"name": n})).collect();
+    let query = r#"
+        SELECT t.table_name::text AS name, d.description::text AS comment
+        FROM information_schema.tables t
+        JOIN pg_namespace n ON n.nspname = t.table_schema
+        JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name
+        LEFT JOIN pg_description d
+            ON d.objoid = c.oid
+            AND d.classoid = 'pg_class'::regclass
+            AND d.objsubid = 0
+        WHERE t.table_schema = $1 AND t.table_type = 'BASE TABLE'
+        ORDER BY t.table_name ASC
+    "#;
+
+    match client::query_rows(&conn_params, query, &[&schema]).await {
+        Ok(rows) => {
+            let tables: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    let name: String = r.try_get("name").unwrap_or_default();
+                    let comment: Option<String> = r.try_get("comment").ok().flatten();
+                    let mut table = json!({"name": name});
+                    if let Some(c) = comment {
+                        table
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("comment".to_string(), json!(c));
+                    }
+                    table
+                })
+                .collect();
             ok_response(id, json!(tables))
         }
         Err(e) => error_response(id, -32603, &e),
@@ -88,6 +106,7 @@ pub async fn get_columns(id: Value, params: &Value) -> Value {
             c.column_default::text,
             c.is_identity::text,
             c.character_maximum_length,
+            d.description::text AS comment,
             (SELECT string_agg('''' || replace(e.enumlabel, '''', '''''') || '''', ',' ORDER BY e.enumsortorder)
              FROM pg_enum e
              JOIN pg_type t ON t.oid = e.enumtypid
@@ -109,6 +128,13 @@ pub async fn get_columns(id: Value, params: &Value) -> Value {
                     AND pk_att.attname = c.column_name
             ) AS is_pk
         FROM information_schema.columns c
+        JOIN pg_namespace n ON n.nspname = c.table_schema
+        JOIN pg_class pc ON pc.relnamespace = n.oid AND pc.relname = c.table_name
+        JOIN pg_attribute a ON a.attrelid = pc.oid AND a.attname = c.column_name
+        LEFT JOIN pg_description d
+            ON d.objoid = pc.oid
+            AND d.classoid = 'pg_class'::regclass
+            AND d.objsubid = a.attnum
         WHERE c.table_schema = $1 AND c.table_name = $2
         ORDER BY c.ordinal_position
     "#;
@@ -136,6 +162,7 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
         .ok()
         .flatten();
     let is_pk: bool = r.try_get("is_pk").unwrap_or(false);
+    let comment: Option<String> = r.try_get("comment").ok().flatten();
 
     let data_type = match enum_values {
         Some(ref vals) if !vals.is_empty() => format!("enum({})", vals),
@@ -174,6 +201,11 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
         col.as_object_mut()
             .unwrap()
             .insert("character_maximum_length".to_string(), json!(len));
+    }
+    if let Some(c) = comment {
+        col.as_object_mut()
+            .unwrap()
+            .insert("comment".to_string(), json!(c));
     }
 
     col
