@@ -591,6 +591,149 @@ fn show_command_with_a_limit_param_does_not_error() {
 }
 
 #[test]
+fn call_with_a_limit_param_does_not_error() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Same class of bug as SHOW (#70): CALL returns a result set but
+    // PostgreSQL also rejects a trailing LIMIT after it.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE OR REPLACE PROCEDURE live_db_noop_proc() \
+                       LANGUAGE plpgsql AS $$ BEGIN END $$",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CALL live_db_noop_proc()",
+            "limit": 10,
+            "page": 1,
+        }),
+    );
+}
+
+#[test]
+fn cte_values_and_table_statements_still_paginate_correctly_across_pages() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Regression guard: an earlier version of the #70 fix matched the
+    // builtin driver's narrower is_select_query (literal SELECT prefix
+    // only), which routed WITH/VALUES/TABLE through client-side capping
+    // instead of real SQL pagination — silently returning the same first
+    // page for every `page` value even though `WITH ... SELECT ...
+    // LIMIT n OFFSET m` is valid PostgreSQL syntax. Verified directly
+    // against this live database that these statement types accept a
+    // trailing LIMIT, so page 2 must return different rows than page 1.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_db_pagination_scratch \
+                       (id SERIAL PRIMARY KEY, v INTEGER)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "TRUNCATE live_db_pagination_scratch RESTART IDENTITY",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_pagination_scratch (v) \
+                       SELECT generate_series(1, 10)",
+        }),
+    );
+
+    let cte_page1 = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "WITH t AS (SELECT * FROM live_db_pagination_scratch) \
+                       SELECT * FROM t ORDER BY id",
+            "limit": 5,
+            "page": 1,
+        }),
+    );
+    let cte_page2 = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "WITH t AS (SELECT * FROM live_db_pagination_scratch) \
+                       SELECT * FROM t ORDER BY id",
+            "limit": 5,
+            "page": 2,
+        }),
+    );
+    assert_ne!(
+        cte_page1.get("rows"),
+        cte_page2.get("rows"),
+        "a paginated CTE must return different rows on page 2, not repeat page 1"
+    );
+    assert_eq!(
+        cte_page1.get("rows"),
+        Some(&json!([[1, 1], [2, 2], [3, 3], [4, 4], [5, 5]]))
+    );
+    assert_eq!(
+        cte_page2.get("rows"),
+        Some(&json!([[6, 6], [7, 7], [8, 8], [9, 9], [10, 10]]))
+    );
+
+    let table_page1 = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "TABLE live_db_pagination_scratch",
+            "limit": 5,
+            "page": 1,
+        }),
+    );
+    let table_page2 = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "TABLE live_db_pagination_scratch",
+            "limit": 5,
+            "page": 2,
+        }),
+    );
+    assert_ne!(
+        table_page1.get("rows"),
+        table_page2.get("rows"),
+        "a paginated TABLE statement must return different rows on page 2"
+    );
+
+    let values_page1 = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "VALUES (1),(2),(3),(4),(5),(6)",
+            "limit": 3,
+            "page": 1,
+        }),
+    );
+    let values_page2 = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "VALUES (1),(2),(3),(4),(5),(6)",
+            "limit": 3,
+            "page": 2,
+        }),
+    );
+    assert_eq!(values_page1.get("rows"), Some(&json!([[1], [2], [3]])));
+    assert_eq!(values_page2.get("rows"), Some(&json!([[4], [5], [6]])));
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();

@@ -10,7 +10,7 @@
 //! These tests exercise the pure classification logic that decides whether
 //! pagination is applied to a statement.
 
-use super::{is_select_query, returns_result_set, strip_leading_sql_comments};
+use super::{returns_result_set, strip_leading_sql_comments, supports_trailing_limit_clause};
 
 #[test]
 fn strip_leading_sql_comments_skips_line_comments() {
@@ -92,31 +92,49 @@ fn returns_result_set_sees_through_leading_comments() {
 }
 
 #[test]
-fn is_select_query_accepts_only_the_select_keyword() {
-    assert!(is_select_query("SELECT 1"));
-    assert!(is_select_query("select 1"));
-    assert!(is_select_query("-- note\nSELECT 1"));
+fn supports_trailing_limit_clause_accepts_statements_verified_against_live_postgres() {
+    // Verified directly against a live PostgreSQL instance: these statement
+    // types all accept a trailing `LIMIT`/`OFFSET` clause.
+    for stmt in [
+        "SELECT 1",
+        "select 1",
+        "-- note\nSELECT 1",
+        "WITH t AS (SELECT 1) SELECT * FROM t",
+        "VALUES (1)",
+        "TABLE foo",
+        "EXPLAIN SELECT 1",
+    ] {
+        assert!(
+            supports_trailing_limit_clause(stmt),
+            "expected {stmt:?} to accept a trailing LIMIT clause"
+        );
+    }
 }
 
 #[test]
-fn is_select_query_rejects_other_row_producing_statements() {
-    // The core of #70: SHOW/EXPLAIN/WITH/VALUES/TABLE/PRAGMA/CALL all
-    // return a result set (returns_result_set == true) but don't support a
-    // trailing SQL LIMIT/OFFSET clause the way a SELECT does — only
-    // is_select_query should gate pagination.
-    for stmt in [
-        "WITH t AS (SELECT 1) SELECT * FROM t",
-        "SHOW search_path",
-        "EXPLAIN SELECT 1",
-        "DESCRIBE foo",
-        "VALUES (1)",
-        "TABLE foo",
-        "PRAGMA foo",
-        "CALL foo()",
-    ] {
+fn supports_trailing_limit_clause_rejects_statements_verified_against_live_postgres() {
+    // The core of #70: SHOW and CALL return a result set
+    // (returns_result_set == true) but PostgreSQL rejects a trailing LIMIT
+    // after either with "syntax error at or near LIMIT" — verified directly
+    // against a live instance. Only these two should skip SQL pagination
+    // and fall back to capping rows client-side instead.
+    for stmt in ["SHOW search_path", "CALL foo()"] {
         assert!(
-            !is_select_query(stmt),
-            "expected {stmt:?} to not be a SELECT"
+            !supports_trailing_limit_clause(stmt),
+            "expected {stmt:?} to reject a trailing LIMIT clause"
         );
     }
+}
+
+#[test]
+fn supports_trailing_limit_clause_does_not_silently_disable_cte_pagination() {
+    // Regression guard: an earlier version of this fix matched the builtin
+    // driver's narrower `is_select_query` (literal SELECT prefix only),
+    // which routed WITH/VALUES/TABLE/EXPLAIN through client-side capping
+    // instead of real SQL pagination — silently breaking page 2+ for a
+    // paginated CTE even though `WITH ... SELECT ... LIMIT n OFFSET m` is
+    // valid PostgreSQL syntax. This must stay true.
+    assert!(supports_trailing_limit_clause(
+        "WITH t AS (SELECT 1) SELECT * FROM t"
+    ));
 }

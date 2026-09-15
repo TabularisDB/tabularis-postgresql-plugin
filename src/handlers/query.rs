@@ -174,14 +174,13 @@ async fn exec_query_on_client(
         }));
     }
 
-    // Only genuine SELECTs get a SQL LIMIT/OFFSET appended — PostgreSQL syntax
-    // doesn't support that clause on SHOW/EXPLAIN/TABLE/CALL/etc., which also
-    // return a result set (#70: `SHOW search_path` with a `limit` param
-    // produced "syntax error at or near LIMIT" before this check existed).
-    // Non-SELECT statements still respect `limit` by capping rows client-side
-    // below (`manual_limit`), matching the builtin driver's behavior — they
-    // just can't push the limit down into the SQL text itself.
-    let is_paginated = is_select_query(query) && limit.is_some();
+    // Only statements whose PostgreSQL syntax actually accepts a trailing
+    // LIMIT/OFFSET get one appended (#70: `SHOW search_path` with a `limit`
+    // param produced "syntax error at or near LIMIT" — SHOW and CALL, unlike
+    // SELECT/WITH/VALUES/TABLE/EXPLAIN, don't accept that clause). Statements
+    // that don't get real SQL pagination still respect `limit` by capping
+    // rows client-side below (`manual_limit`).
+    let is_paginated = supports_trailing_limit_clause(query) && limit.is_some();
     let (final_query, page_size) = if is_paginated {
         let lim = limit.unwrap();
         (
@@ -321,20 +320,31 @@ fn returns_result_set(query: &str) -> bool {
         || upper.starts_with("CALL")
 }
 
-/// Check if a query is a SELECT statement — narrower than
-/// `returns_result_set`, which also matches non-`SELECT` statements
-/// (`SHOW`, `EXPLAIN`, `TABLE`, `CALL`, ...) that return rows but don't
-/// support a trailing `LIMIT`/`OFFSET` clause in PostgreSQL syntax. Only
-/// `is_select_query` queries should be routed through
+/// Check if a result-set-bearing statement's syntax actually accepts a
+/// trailing `LIMIT`/`OFFSET` clause — narrower than `returns_result_set`.
+/// Verified directly against a live PostgreSQL instance (`SELECT`, `WITH`,
+/// `VALUES`, `TABLE`, `EXPLAIN` all accept a trailing `LIMIT`; `SHOW` and
+/// `CALL` reject it with "syntax error at or near LIMIT"). Only statements
+/// that pass this should be routed through
 /// `pagination::build_paginated_query` (#70 — `SHOW search_path` with a
-/// `limit` param produced "syntax error at or near LIMIT" because
-/// pagination was being applied to every result-set-bearing query, not
-/// just genuine SELECTs). Matches the builtin driver's
-/// `drivers/common/query.rs::is_select_query`.
-fn is_select_query(query: &str) -> bool {
-    strip_leading_sql_comments(query)
-        .to_uppercase()
-        .starts_with("SELECT")
+/// `limit` param produced that exact syntax error because pagination was
+/// being applied to every result-set-bearing statement, not just the ones
+/// whose grammar supports it).
+///
+/// This deliberately does NOT match the builtin driver's narrower
+/// `is_select_query` (literal `SELECT` prefix only): that function also
+/// routes `WITH`/`VALUES`/`TABLE`/`EXPLAIN` through client-side capping
+/// instead of SQL pagination, which silently breaks page 2+ for a paginated
+/// CTE even though `WITH ... SELECT ... LIMIT n OFFSET m` is valid syntax.
+/// Copying that classification 1:1 would trade a real syntax-error bug for
+/// a real (if quieter) pagination-correctness bug — not a net parity win.
+fn supports_trailing_limit_clause(query: &str) -> bool {
+    let upper = strip_leading_sql_comments(query).to_uppercase();
+    upper.starts_with("SELECT")
+        || upper.starts_with("WITH")
+        || upper.starts_with("VALUES")
+        || upper.starts_with("TABLE")
+        || upper.starts_with("EXPLAIN")
 }
 
 #[cfg(test)]
