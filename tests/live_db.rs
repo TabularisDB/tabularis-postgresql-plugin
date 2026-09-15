@@ -282,6 +282,138 @@ fn execute_query_returns_a_real_enum_value_not_null() {
 }
 
 #[test]
+fn execute_query_returns_a_real_hstore_value_not_null() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained, same shape as the enum regression test above (#7):
+    // hstore is an extension type, so this must not assume it's already
+    // installed on whatever database CI points at (#68/#69).
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "CREATE EXTENSION IF NOT EXISTS hstore" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_db_hstore_scratch \
+                       (id SERIAL PRIMARY KEY, attrs hstore)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "TRUNCATE live_db_hstore_scratch RESTART IDENTITY" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_hstore_scratch (attrs) VALUES \
+                       ('\"comment\"=>\"This is a test\", \"count\"=>\"1\"'), (NULL)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT id, attrs FROM live_db_hstore_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0][1],
+        json!({"comment": "This is a test", "count": "1"}),
+        "a non-null hstore column must round-trip as a JSON object, not null"
+    );
+    assert_eq!(
+        rows[1][1],
+        Value::Null,
+        "a genuinely-NULL hstore column must still come back as null"
+    );
+}
+
+#[test]
+fn execute_query_returns_real_array_values_for_custom_oid_element_types() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained, same shape as the enum/hstore regression tests above
+    // (#7, #68/#69). Arrays of a custom-OID element type (enum[], hstore[])
+    // have no hardcoded fast-path in extract.rs — before #72's fix they fell
+    // through to the generic string fallback and came back as null.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DO $$ BEGIN \
+                       CREATE TYPE live_db_test_array_mood AS ENUM ('happy', 'sad'); \
+                       EXCEPTION WHEN duplicate_object THEN null; END $$",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "CREATE EXTENSION IF NOT EXISTS hstore" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_db_array_scratch \
+                       (id SERIAL PRIMARY KEY, \
+                        moods live_db_test_array_mood[], \
+                        attrs hstore[])",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "TRUNCATE live_db_array_scratch RESTART IDENTITY" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_array_scratch (moods, attrs) VALUES \
+                       (ARRAY['happy'::live_db_test_array_mood, 'sad'::live_db_test_array_mood], \
+                        ARRAY['a=>1'::hstore, 'b=>2'::hstore]), \
+                       (NULL, NULL)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT id, moods, attrs FROM live_db_array_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0][1],
+        json!(["happy", "sad"]),
+        "an enum[] column must round-trip as a JSON array of label strings, not null"
+    );
+    assert_eq!(
+        rows[0][2],
+        json!([{"a": "1"}, {"b": "2"}]),
+        "an hstore[] column must round-trip as a JSON array of objects, not null"
+    );
+    assert_eq!(
+        rows[1][1],
+        Value::Null,
+        "a genuinely-NULL array column must still come back as null"
+    );
+    assert_eq!(
+        rows[1][2],
+        Value::Null,
+        "a genuinely-NULL array column must still come back as null"
+    );
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();

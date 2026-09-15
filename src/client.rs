@@ -226,6 +226,32 @@ pub async fn get_enum_column_types(
         .collect())
 }
 
+/// Resolves the real OID of the `hstore` type for a specific column,
+/// confirming in the same query that the column actually is hstore. hstore
+/// is an extension type (not a well-known Postgres OID), so its OID varies
+/// per installation and — unlike `information_schema.columns.data_type`,
+/// which reports it only as the generic "USER-DEFINED" — the concrete type
+/// name has to come from the catalog directly. `None` means either the
+/// extension isn't installed or the column isn't hstore. Ported from
+/// `tabularis#427`'s `get_hstore_oid_for_column`.
+pub async fn get_hstore_oid_for_column(
+    params: &ConnectionParams,
+    schema: &str,
+    table: &str,
+    col_name: &str,
+) -> Result<Option<u32>, String> {
+    let query = "SELECT a.atttypid::oid \
+        FROM pg_attribute a \
+        JOIN pg_class c ON c.oid = a.attrelid \
+        JOIN pg_namespace n ON n.oid = c.relnamespace \
+        JOIN pg_type t ON t.oid = a.atttypid \
+        WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 AND t.typname = 'hstore' \
+        LIMIT 1";
+
+    let rows = query_rows(params, query, &[&schema, &table, &col_name]).await?;
+    Ok(rows.first().and_then(|row| row.try_get::<_, u32>(0).ok()))
+}
+
 /// Quote a schema-qualified type name (e.g. `"public"."mood"`) so it can be
 /// spliced into a `CAST($N AS ...)` without becoming an injection vector.
 fn quote_qualified_type(type_schema: &str, type_name: &str) -> String {

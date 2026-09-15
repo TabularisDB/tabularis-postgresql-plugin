@@ -13,7 +13,8 @@
 
 use rust_decimal::Decimal;
 use serde_json::Value;
-use tokio_postgres::types::{ToSql, Type};
+use std::collections::HashMap;
+use tokio_postgres::types::{Kind, ToSql, Type};
 use uuid::Uuid;
 
 pub type PgParam = Box<dyn ToSql + Sync + Send>;
@@ -44,6 +45,11 @@ pub struct BindOptions<'a> {
     /// the `CAST($N AS <enum>)` coercion in [`bind_pg_enum_string`].
     pub enum_type: Option<&'a str>,
     pub allow_default: bool,
+    /// Real OID of the `hstore` type for this database, when `column_type`
+    /// is `"hstore"` — required because hstore has no well-known Postgres
+    /// OID and varies per installation. `None` when the column isn't
+    /// hstore, or resolution failed (surfaced as an error at bind time).
+    pub hstore_oid: Option<u32>,
 }
 
 const USE_DEFAULT_SENTINEL: &str = "__USE_DEFAULT__";
@@ -62,6 +68,12 @@ pub fn bind_pg_value(
     options: &BindOptions,
 ) -> Result<BoundValue, String> {
     let base_type = options.column_type.map(extract_base_type);
+
+    // hstore column — bind before the JSON/JSONB check below, since a JSON
+    // object destined for hstore must NOT go through the JSON ToSql path.
+    if options.column_type == Some("hstore") {
+        return bind_pg_hstore(value, placeholder_idx, options.hstore_oid);
+    }
 
     // JSON/JSONB columns receiving a native JSON value (object/array/number/bool)
     // must bind the value's own ToSql JSON encoding — a text CAST trips an OID
@@ -100,6 +112,85 @@ pub fn bind_pg_value(
         }
         Value::Object(_) => Err("Cannot bind a JSON object to a non-JSON column".to_string()),
     }
+}
+
+/// Binds a JSON object to an hstore column as `HashMap<String, Option<String>>`,
+/// which `tokio-postgres` encodes natively via its built-in hstore `ToSql` impl.
+/// Requires the real OID of the `hstore` type in this database (extension-defined,
+/// not a well-known Postgres OID) so the placeholder's `Type` pins it correctly.
+/// Ported from `tabularis#427`'s `bind_pg_hstore`.
+fn bind_pg_hstore(
+    value: Value,
+    placeholder_idx: usize,
+    hstore_oid: Option<u32>,
+) -> Result<BoundValue, String> {
+    let map = match value {
+        Value::Null => {
+            return Ok(BoundValue {
+                sql: "NULL".to_string(),
+                param: None,
+            });
+        }
+        Value::Object(map) => map,
+
+        // The grid's plain-text cell editor doesn't yet know about hstore, so it
+        // may round-trip the value as a JSON-encoded string rather than an
+        // object. Accept that shape here so editing still works.
+        Value::String(s) => match serde_json::from_str::<Value>(&s) {
+            Ok(Value::Object(map)) => map,
+            _ => {
+                return Err(format!(
+                    "hstore column requires a JSON object value, got a string that is not valid JSON: {:?}",
+                    s
+                ));
+            }
+        },
+        other => {
+            return Err(format!(
+                "hstore column requires a JSON object value, got {:?}",
+                other
+            ));
+        }
+    };
+
+    let oid = hstore_oid.ok_or_else(|| {
+        "Could not resolve the hstore type OID; is the hstore extension installed?".to_string()
+    })?;
+    let hmap = hstore_map_from_json_object(map)?;
+    let pg_type = Type::new(
+        "hstore".to_string(),
+        oid,
+        Kind::Simple,
+        "public".to_string(),
+    );
+    Ok(BoundValue {
+        sql: format!("${}", placeholder_idx),
+        param: Some((Box::new(hmap), pg_type)),
+    })
+}
+
+/// Converts a JSON object into the `HashMap<String, Option<String>>` shape that
+/// `tokio-postgres` encodes natively as hstore. Every value must be a string or
+/// null — hstore itself only stores text, so numbers/bools/nested objects have no
+/// unambiguous representation and are rejected with a message naming the offending key.
+fn hstore_map_from_json_object(
+    map: serde_json::Map<String, Value>,
+) -> Result<HashMap<String, Option<String>>, String> {
+    let mut hmap = HashMap::with_capacity(map.len());
+    for (k, v) in map {
+        let val = match v {
+            Value::String(s) => Some(s),
+            Value::Null => None,
+            other => {
+                return Err(format!(
+                    "hstore value for key '{}' must be a string or null, got {:?}",
+                    k, other
+                ));
+            }
+        };
+        hmap.insert(k, val);
+    }
+    Ok(hmap)
 }
 
 fn bind_pg_number(n: serde_json::Number, placeholder_idx: usize) -> Result<BoundValue, String> {

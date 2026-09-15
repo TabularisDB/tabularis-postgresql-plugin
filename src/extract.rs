@@ -4,6 +4,8 @@
 //! `src-tauri/src/drivers/postgres/extract/` system. Every PG type must
 //! produce byte-identical JSON to the builtin — the parity tests enforce this.
 
+use std::collections::HashMap;
+
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::Decimal;
 use serde_json::Value as JsonValue;
@@ -133,6 +135,27 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         // `extract/enum.rs::extract_or_null`.
         ref t if matches!(t.kind(), Kind::Enum(_)) => {
             try_extract::<EnumLabel>(row, index, |v| JsonValue::String(v.0))
+        }
+        // hstore is an extension type (no well-known OID), matched by name like
+        // the builtin driver's `extract/simple.rs::extract_or_null`. tokio-postgres
+        // decodes it natively as HashMap<String, Option<String>>.
+        ref t if t.name() == "hstore" => {
+            try_extract::<HashMap<String, Option<String>>>(row, index, |v| {
+                serde_json::to_value(v).unwrap_or(JsonValue::Null)
+            })
+        }
+        // Generic fallback for arrays whose element type isn't one of the
+        // hardcoded fast-paths above (int2/int4/int8/float4/float8/bool/
+        // text/varchar) — e.g. enum[] or hstore[]. tokio_postgres's built-in
+        // `Vec<T>: FromSql` requires a single concrete `T`, which can't
+        // express "decode each element the way `extract_value` would for a
+        // scalar column of that type" — so this parses the array wire
+        // format directly and recurses per-element, matching the builtin
+        // driver's generic `Kind::Array` dispatch (`extract/mod.rs` +
+        // `extract/array.rs::try_extract_elem`). Placed after the hardcoded
+        // array arms so their exact existing behavior is unaffected.
+        ref t if matches!(t.kind(), Kind::Array(_)) => {
+            try_extract::<ArrayValue>(row, index, |v| v.0)
         }
         // For types not explicitly handled (ranges, composites, geometric, etc.),
         // fall back to text representation via the Display trait on the raw bytes.
@@ -307,6 +330,162 @@ fn extract_simple_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
             .map(|v| JsonValue::String(v.format("%Y-%m-%d %H:%M:%S").to_string()))
             .unwrap_or(JsonValue::Null),
         _ => JsonValue::Null,
+    }
+}
+
+/// Wraps the raw wire format of a 1-D Postgres array whose element type
+/// isn't one of the hardcoded fast-paths in `extract_value` (e.g. `enum[]`
+/// or `hstore[]`). Format: 4-byte dimension count, 4-byte has-nulls flag,
+/// 4-byte element type OID, then per dimension an 8-byte (length,
+/// lower_bound) pair, then the elements themselves as length-prefixed
+/// values (-1 length = NULL element). Decodes each element the same way
+/// `extract_value` would for a scalar column of that type, matching the
+/// builtin driver's generic `Kind::Array` dispatch
+/// (`extract/mod.rs` + `extract/array.rs::try_extract_elem`). Multi-
+/// dimensional arrays fall back to `Null`, consistent with this file's
+/// existing hardcoded array arms (which only ever handle 1-D arrays).
+pub(crate) struct ArrayValue(pub(crate) JsonValue);
+
+impl<'a> FromSql<'a> for ArrayValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let elem_type = match ty.kind() {
+            Kind::Array(t) => t.clone(),
+            _ => return Err("expected an array type".into()),
+        };
+
+        if raw.len() < 12 {
+            return Err("array buffer too short for header".into());
+        }
+        let dimensions = i32::from_be_bytes(raw[0..4].try_into().unwrap());
+        if dimensions == 0 {
+            return Ok(Self(JsonValue::Array(vec![])));
+        }
+        if dimensions != 1 {
+            // Multi-dimensional arrays aren't modeled by this decoder —
+            // fall back to Null rather than misinterpreting the layout.
+            return Err("multi-dimensional array not supported".into());
+        }
+
+        let mut buf = &raw[12..];
+        if buf.len() < 8 {
+            return Err("array buffer too short for dimension header".into());
+        }
+        let len = i32::from_be_bytes(buf[0..4].try_into().unwrap());
+        if len < 0 {
+            return Err("invalid array dimension length".into());
+        }
+        buf = &buf[8..]; // skip length + lower_bound
+
+        // Don't pre-allocate based on the claimed length: it's untrusted
+        // (comes straight off the wire) and a truncated/malformed buffer
+        // could claim up to i32::MAX elements while containing far fewer
+        // bytes, turning a single bad row into a multi-gigabyte allocation
+        // before the truncation check below ever runs. `Vec::new()` grows
+        // by amortized doubling as elements are actually read, so the
+        // allocation stays proportional to what's really in the buffer.
+        let mut elements = Vec::new();
+        for _ in 0..len {
+            if buf.len() < 4 {
+                return Err("array buffer truncated before element length".into());
+            }
+            let elem_len = i32::from_be_bytes(buf[0..4].try_into().unwrap());
+            buf = &buf[4..];
+            if elem_len < 0 {
+                elements.push(JsonValue::Null);
+                continue;
+            }
+            let elem_len = elem_len as usize;
+            if buf.len() < elem_len {
+                return Err("array buffer truncated before element value".into());
+            }
+            let (elem_buf, rest) = buf.split_at(elem_len);
+            buf = rest;
+            elements.push(extract_element_from_bytes(&elem_type, elem_buf));
+        }
+
+        Ok(Self(JsonValue::Array(elements)))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Array(_))
+    }
+}
+
+/// Decode one array element's raw bytes as JSON, covering the scalar types
+/// `extract_value` handles (minus ranges/arrays, which can't appear as a
+/// single array's element type here) plus enum and hstore, mirroring the
+/// builtin's `try_extract_elem`.
+fn extract_element_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
+    match ty {
+        _ if *ty == Type::BOOL => bool::from_sql(ty, buf)
+            .map(JsonValue::Bool)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::INT2 => i16::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::OID => u32::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::FLOAT4 => f32::from_sql(ty, buf)
+            .map(|v| {
+                serde_json::Number::from_f64(v as f64)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            })
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::FLOAT8 => f64::from_sql(ty, buf)
+            .map(|v| {
+                serde_json::Number::from_f64(v)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            })
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::TEXT
+            || *ty == Type::VARCHAR
+            || *ty == Type::BPCHAR
+            || *ty == Type::NAME =>
+        {
+            String::from_sql(ty, buf)
+                .map(JsonValue::String)
+                .unwrap_or(JsonValue::Null)
+        }
+        _ if *ty == Type::UUID => Uuid::from_sql(ty, buf)
+            .map(|v| JsonValue::String(v.to_string()))
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::TIMETZ => TimeTz::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::INTERVAL => Interval::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::JSON || *ty == Type::JSONB => {
+            serde_json::Value::from_sql(ty, buf).unwrap_or(JsonValue::Null)
+        }
+        _ if *ty == Type::BYTEA => Vec::<u8>::from_sql(ty, buf)
+            .map(|v| {
+                let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &v);
+                JsonValue::String(format!("BLOB:{}:application/octet-stream:{}", v.len(), b64))
+            })
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::INET || *ty == Type::CIDR => CidrOrInet::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::MACADDR => MacAddr::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::MONEY => Money::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if matches!(ty.kind(), Kind::Enum(_)) => EnumLabel::from_sql(ty, buf)
+            .map(|v| JsonValue::String(v.0))
+            .unwrap_or(JsonValue::Null),
+        _ if ty.name() == "hstore" => HashMap::<String, Option<String>>::from_sql(ty, buf)
+            .map(|v| serde_json::to_value(v).unwrap_or(JsonValue::Null))
+            .unwrap_or(JsonValue::Null),
+        _ => extract_simple_from_bytes(ty, buf),
     }
 }
 
