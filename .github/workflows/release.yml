@@ -157,6 +157,41 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          # Pull this version's section out of CHANGELOG.md so the GitHub
+          # release body is the same hand-written prose we already maintain,
+          # instead of shipping empty (rc.2, rc.3 both did — see #78's
+          # follow-up) or relying on GitHub's auto-generated commit list.
+          # A version's section runs from its "## [x.y.z]" heading to the
+          # next one (or EOF for the oldest entry).
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          awk -v ver="$VERSION" '
+            /^## \[/ {
+              line = $0
+              sub(/^## \[/, "", line)
+              sub(/\].*/, "", line)
+              if (capturing) { exit }
+              if (line == ver) { capturing = 1; found = 1; next }
+              next
+            }
+            capturing { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > /tmp/release-notes.raw.md || {
+            echo "::error::No CHANGELOG.md section found for version $VERSION (expected a '## [$VERSION]' heading). Add one before tagging."
+            exit 1
+          }
+
+          # Trim leading/trailing blank lines the section boundary leaves
+          # behind, without collapsing intentional blank lines between bullets.
+          awk 'NF{p=1} p' /tmp/release-notes.raw.md | tac | awk 'NF{p=1} p' | tac > /tmp/release-notes.md
+
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "::error::CHANGELOG.md section for version $VERSION is empty."
+            exit 1
+          fi
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
@@ -165,5 +200,6 @@ jobs:
           files: |
             artifacts/*.zip
             .tabularium
+          body_path: /tmp/release-notes.md
           prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
           make_latest: ${{ steps.meta.outputs.prerelease == 'false' }}
