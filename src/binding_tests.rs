@@ -480,6 +480,27 @@ mod bind_pk_value_tests {
             "IS NULL must bind no parameter so the placeholder index is not consumed"
         );
     }
+
+    // A boolean PK value (a table keyed by a boolean column) must bind
+    // natively as BOOL, not fall through to the "Unsupported PK type" error.
+    // Mirrors the builtin driver's `build_pk_predicate` `Bool` arm
+    // (`TabularisDB/tabularis` `binding.rs`).
+
+    #[test]
+    fn bool_pk_binds_natively_as_bool() {
+        let bound = bind_pk_value(&json!(true), 1, None).unwrap();
+        assert_eq!(bound.sql, "$1");
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type, tokio_postgres::types::Type::BOOL);
+    }
+
+    #[test]
+    fn false_pk_binds_natively_as_bool() {
+        let bound = bind_pk_value(&json!(false), 3, None).unwrap();
+        assert_eq!(bound.sql, "$3");
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type, tokio_postgres::types::Type::BOOL);
+    }
 }
 
 mod build_pk_map_predicate_tests {
@@ -517,5 +538,20 @@ mod build_pk_map_predicate_tests {
 
         assert_eq!(predicate, r#""nullable_col" IS NULL"#);
         assert!(params.is_empty(), "IS NULL binds no parameters");
+    }
+
+    #[test]
+    fn bool_pk_entry_emits_native_bool_equality() {
+        // A table keyed by a boolean column: `{"flag": true}` must produce
+        // `"flag" = $1` bound as BOOL, not error with "Unsupported PK type"
+        // (#79).
+        let mut pk_map = serde_json::Map::new();
+        pk_map.insert("flag".to_string(), json!(true));
+
+        let (predicate, params) = build_pk_map_predicate(&pk_map, &empty_types(), 1).unwrap();
+
+        assert_eq!(predicate, r#""flag" = $1"#);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].1, tokio_postgres::types::Type::BOOL);
     }
 }

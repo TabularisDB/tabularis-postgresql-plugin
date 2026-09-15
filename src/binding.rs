@@ -523,6 +523,14 @@ pub fn bind_pk_value(
             sql: "IS NULL".to_string(),
             param: None,
         }),
+        // A table keyed by (or including) a boolean column binds natively as
+        // BOOL — unlike Null, this produces a valid `"col" = <rhs>` shape, so
+        // it needs no special handling in `build_pk_map_predicate`. Mirrors
+        // the builtin driver's `build_pk_predicate` `Bool` arm.
+        Value::Bool(b) => Ok(BoundValue {
+            sql: format!("${}", placeholder_idx),
+            param: Some((Box::new(*b), Type::BOOL)),
+        }),
         _ => Err("Unsupported PK type".to_string()),
     }
 }
