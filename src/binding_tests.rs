@@ -592,4 +592,18 @@ mod build_pk_map_predicate_tests {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].1, tokio_postgres::types::Type::BOOL);
     }
+
+    #[test]
+    fn empty_pk_map_is_rejected_instead_of_building_malformed_sql() {
+        // Without this guard, an empty pk_map produces an empty predicate
+        // string ("", []), which callers splice into "... WHERE " — a
+        // trailing WHERE with nothing after it. The builtin rejects this
+        // explicitly rather than letting a malformed query reach the server
+        // (#81).
+        let pk_map = serde_json::Map::new();
+
+        let err = build_pk_map_predicate(&pk_map, &empty_types(), 1).unwrap_err();
+
+        assert_eq!(err, "pk_map must not be empty");
+    }
 }
