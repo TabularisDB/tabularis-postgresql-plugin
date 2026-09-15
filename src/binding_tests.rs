@@ -409,6 +409,44 @@ mod bind_pk_value_tests {
         assert_eq!(bound.sql, "CAST($1 AS bigint)");
     }
 
+    // A PK value's column type is `None` for two reasons: a genuinely
+    // unknown/unresolvable column, or (on a keyless table) a text column
+    // whose value merely looks numeric. Small integer strings round-trip
+    // fine as plain JSON numbers, so treating a small integer-*shaped*
+    // string as evidence of an integer column — regardless of type — risks
+    // casting a `"42"` in a text/varchar PK to bigint, which trips
+    // SQLSTATE 42883 ("operator does not exist: character varying =
+    // bigint") against the real column. Only bind through the bigint cast
+    // when the string is outside JavaScript's safe-integer range (where a
+    // large bigint necessarily arrived as a JSON string in the first
+    // place, since a plain JSON number would have lost precision).
+    // Mirrors the builtin driver's `build_pk_predicate`, which gates this
+    // branch on `parse_unsafe_bigint_string` (#80).
+
+    #[test]
+    fn small_integer_shaped_string_pk_binds_as_text_when_column_type_unknown() {
+        let bound = bind_pk_value(&json!("42"), 1, None).unwrap();
+        assert_eq!(
+            bound.sql, "$1",
+            "a small int-shaped string with an unresolved column type must \
+             bind as TEXT, not be coerced to bigint — it may target a text \
+             column holding a numeric-looking value"
+        );
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type, tokio_postgres::types::Type::TEXT);
+    }
+
+    #[test]
+    fn unsafe_range_integer_string_pk_still_casts_to_bigint_when_column_type_unknown() {
+        // 2^53, one past JS_MAX_SAFE_INTEGER (2^53 - 1) — genuinely a
+        // large bigint that arrived as a string to preserve precision.
+        let unsafe_range_value = "9007199254740992";
+        let bound = bind_pk_value(&json!(unsafe_range_value), 1, None).unwrap();
+        assert_eq!(bound.sql, "CAST($1 AS bigint)");
+        let (_, pg_type) = bound.param.unwrap();
+        assert_eq!(pg_type, tokio_postgres::types::Type::INT8);
+    }
+
     #[test]
     fn plain_string_pk_falls_back_to_text() {
         let bound = bind_pk_value(&json!("abc"), 1, None).unwrap();

@@ -437,6 +437,29 @@ fn bind_pg_temporal_string(
     }))
 }
 
+/// Parse a string back into an `i64` *only* when it represents an integer
+/// outside JavaScript's safe range (`±(2^53 - 1)`, [`crate::extract::JS_MAX_SAFE_INTEGER`]).
+///
+/// The frontend's `JSON.parse` loses precision for integers beyond that
+/// range, so a genuinely large bigint arrives from the UI as a JSON string
+/// rather than a JSON number. This heuristic deliberately ignores small
+/// numeric strings (under 2^53) because those round-trip fine as ordinary
+/// JSON numbers on a genuinely-integer column (handled above by
+/// [`bind_pg_numeric_string`]); treating a small numeric-*shaped* string as
+/// evidence of an integer column on its own — the only signal left once the
+/// column type is unknown — would silently coerce text like `"42"` typed
+/// into a keyless table's `varchar` primary key. Ported from the builtin
+/// driver's `common/safe_int.rs::parse_unsafe_bigint_string`.
+fn parse_unsafe_bigint_string(s: &str) -> Option<i64> {
+    let parsed: i64 = s.parse().ok()?;
+    let safe_range = -crate::extract::JS_MAX_SAFE_INTEGER..=crate::extract::JS_MAX_SAFE_INTEGER;
+    if safe_range.contains(&parsed) {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
 /// Bind a WHERE-clause value from a PK map entry. Returns the SQL fragment
 /// (may include a CAST) plus the typed parameter — stricter than
 /// `bind_pg_value` for strings: UUID/integer string coercion is only applied
@@ -499,7 +522,7 @@ pub fn bind_pk_value(
                 )
             });
             if is_int_type {
-                if let Ok(i) = s.parse::<i64>() {
+                if let Some(i) = parse_unsafe_bigint_string(s) {
                     return Ok(BoundValue {
                         sql: format!("CAST(${} AS bigint)", placeholder_idx),
                         param: Some((Box::new(i), Type::INT8)),
