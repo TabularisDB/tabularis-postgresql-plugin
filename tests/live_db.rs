@@ -474,6 +474,94 @@ fn execute_query_preserves_null_slots_in_hardcoded_array_types() {
 }
 
 #[test]
+fn get_tables_and_get_columns_return_real_comments() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained, same shape as the tests above. #74: get_tables/
+    // get_columns must surface pg_description comments as an optional
+    // "comment" field, matching the builtin driver's parity fix
+    // (tabularis#764). Comments must be omitted (not present as null or
+    // empty string) when no COMMENT ON was ever run for that object.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TABLE IF EXISTS live_db_comment_scratch",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_comment_scratch \
+                       (id SERIAL PRIMARY KEY, commented_col TEXT, plain_col TEXT)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "COMMENT ON TABLE live_db_comment_scratch \
+                       IS 'Table comment with an apostrophe''s test'",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "COMMENT ON COLUMN live_db_comment_scratch.commented_col \
+                       IS 'Unicode: 日本語 café — with a\nnewline'",
+        }),
+    );
+    // plain_col deliberately left without a COMMENT ON.
+
+    let tables = plugin.call_ok(
+        "get_tables",
+        json!({ "params": params, "schema": "public" }),
+    );
+    let table = tables
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "live_db_comment_scratch")
+        .expect("live_db_comment_scratch must be in get_tables' result");
+    assert_eq!(
+        table["comment"],
+        json!("Table comment with an apostrophe's test"),
+        "a table with a COMMENT ON must surface it via get_tables"
+    );
+
+    let columns = plugin.call_ok(
+        "get_columns",
+        json!({
+            "params": params,
+            "table": "live_db_comment_scratch",
+            "schema": "public",
+        }),
+    );
+    let columns = columns.as_array().unwrap();
+    let commented = columns
+        .iter()
+        .find(|c| c["name"] == "commented_col")
+        .expect("commented_col must be in get_columns' result");
+    assert_eq!(
+        commented["comment"],
+        json!("Unicode: 日本語 café — with a\nnewline"),
+        "a column with a COMMENT ON must surface Unicode/newlines correctly via get_columns"
+    );
+
+    let plain = columns
+        .iter()
+        .find(|c| c["name"] == "plain_col")
+        .expect("plain_col must be in get_columns' result");
+    assert!(
+        plain.get("comment").is_none(),
+        "a column with no COMMENT ON must omit the comment field entirely, got: {plain:?}"
+    );
+}
+
+#[test]
 fn connection_string_connects_with_no_discrete_fields() {
     let mut plugin = Plugin::spawn();
     let p = conn_params();
