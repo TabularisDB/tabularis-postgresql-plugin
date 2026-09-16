@@ -10,13 +10,14 @@
 //! `extract/enum.rs::extract_or_null`.
 
 use crate::extract::{
-    ArrayValue, BitOrVarBit, Cid, Circle, EnumLabel, GtsVector, JsonPath, Line, Lseg, MacAddr8,
-    Money, Path, PgBox, PgBrinBloomSummary, PgDependencies, PgLsn, PgMcvList, PgNdistinct,
-    PgNodeTree, Point, Polygon, RefCursor, RegClass, RegProc, RegType, Tid, TsQuery, TsVector,
+    ArrayValue, BitOrVarBit, Cid, Circle, CompositeValue, EnumLabel, GtsVector, JsonPath, Line,
+    Lseg, MacAddr8, Money, MultirangeValue, Path, PgBox, PgBrinBloomSummary, PgDependencies,
+    PgHalfVector, PgLsn, PgMcvList, PgNdistinct, PgNodeTree, PgSparseVector, PgVector, Point,
+    Polygon, RefCursor, RegClass, RegProc, RegType, Tid, TsQuery, TsVector,
     TxidSnapshotOrPgSnapshot, Xid, Xid8, Xml,
 };
 use std::collections::HashMap;
-use tokio_postgres::types::{FromSql, Kind, Type};
+use tokio_postgres::types::{Field, FromSql, Kind, Type};
 
 fn enum_type() -> Type {
     Type::new(
@@ -1256,4 +1257,432 @@ fn pg_lsn_array_decodes_each_element() {
     let bytes = array_wire_bytes(Type::PG_LSN.oid(), &[Some(&lsn)]);
     let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
     assert_eq!(array.0, serde_json::json!(["16/B374D848"]));
+}
+
+// Final #82 batch: pgvector + Kind::Composite/Domain/Multirange + arrays
+// of ranges/composites. Wire bytes below were captured live from a real
+// PostgreSQL 16 instance (a pgvector/pgvector:pg16 image for the pgvector
+// cases specifically, since the stock postgres:16 image doesn't bundle
+// the extension) — not hand-derived from the format spec, same discipline
+// as every prior #82 batch.
+
+fn multirange_type(subtype: Type) -> Type {
+    Type::new(
+        format!("{}multirange", subtype.name()),
+        16_500,
+        Kind::Multirange(subtype),
+        "public".to_string(),
+    )
+}
+
+#[test]
+fn multirange_decodes_two_ranges_joined_by_bare_comma() {
+    // `'{[1,5),[10,20)}'::int4multirange` — captured live.
+    let bytes: [u8; 46] = [
+        0, 0, 0, 2, 0, 0, 0, 17, 2, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 17, 2,
+        0, 0, 0, 4, 0, 0, 0, 10, 0, 0, 0, 4, 0, 0, 0, 20,
+    ];
+    let v = MultirangeValue::from_sql(&multirange_type(Type::INT4), &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("{[1, 5),[10, 20)}")
+    );
+}
+
+#[test]
+fn multirange_with_zero_ranges_decodes_to_empty_braces() {
+    let bytes = [0, 0, 0, 0];
+    let v = MultirangeValue::from_sql(&multirange_type(Type::INT4), &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("{}"));
+}
+
+#[test]
+fn multirange_with_a_single_range() {
+    // Adapted from the builtin's own `test_single_range_multirange`
+    // (`extract/multi_range.rs`) as a cross-check, not just this port's
+    // own hand-derived bytes: flag=RANGE_LB_INC (bit 1), bounds [1, 5).
+    let mut bytes = vec![0, 0, 0, 1]; // count = 1
+    let range = [2u8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5]; // [1, 5)
+    bytes.extend_from_slice(&(range.len() as i32).to_be_bytes());
+    bytes.extend_from_slice(&range);
+    let v = MultirangeValue::from_sql(&multirange_type(Type::INT4), &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("{[1, 5)}"));
+}
+
+#[test]
+fn multirange_with_mixed_bound_inclusivity_across_ranges() {
+    // Adapted from the builtin's `test_mixed_bounds`: three ranges with
+    // different inclusivity flags on each — proves the per-range flag
+    // byte isn't accidentally reused/cached across iterations of the loop.
+    const RANGE_LB_INC: u8 = 1 << 1;
+    const RANGE_UB_INC: u8 = 1 << 2;
+    fn build_range(flag: u8, lower: i32, upper: i32) -> Vec<u8> {
+        let mut r = vec![flag];
+        r.extend_from_slice(&4i32.to_be_bytes());
+        r.extend_from_slice(&lower.to_be_bytes());
+        r.extend_from_slice(&4i32.to_be_bytes());
+        r.extend_from_slice(&upper.to_be_bytes());
+        r
+    }
+    let r1 = build_range(RANGE_LB_INC, 1, 5); // [1, 5)
+    let r2 = build_range(0x00, 10, 20); // (10, 20)
+    let r3 = build_range(RANGE_UB_INC, 100, 200); // (100, 200]
+    let mut bytes = vec![0, 0, 0, 3]; // count = 3
+    for r in [&r1, &r2, &r3] {
+        bytes.extend_from_slice(&(r.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(r);
+    }
+    let v = MultirangeValue::from_sql(&multirange_type(Type::INT4), &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("{[1, 5),(10, 20),(100, 200]}")
+    );
+}
+
+#[test]
+fn multirange_accepts_rejects_a_plain_range() {
+    assert!(MultirangeValue::accepts(&multirange_type(Type::INT4)));
+    assert!(!MultirangeValue::accepts(&Type::INT4_RANGE));
+}
+
+#[test]
+fn multirange_with_truncated_range_length_prefix_stops_early() {
+    // count says 2 ranges, but only 1 fits — the second range's length
+    // prefix is missing. The builtin's algorithm produces `"{[1, 5),}"` here
+    // (a trailing comma before the closing brace, which is invalid multirange
+    // syntax). We deliberately deviate: strip the trailing comma on early
+    // close so the output is valid (`"{[1, 5)}"`) even for truncated input.
+    // Rationale: `"{[1, 5),}"` cannot be cast back to a multirange; it
+    // would silently surface as a valid-looking but actually invalid string
+    // in the data grid. The builtin quirk is unreachable in practice
+    // (tokio_postgres always receives complete, atomic wire frames from PG),
+    // so deviating here costs nothing in the normal case while producing
+    // better output if the unreachable path is ever hit. See the PR
+    // discussion on #101 for the full analysis.
+    let mut bytes = vec![0, 0, 0, 2]; // count = 2
+    let range = [2u8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5];
+    bytes.extend_from_slice(&(range.len() as i32).to_be_bytes());
+    bytes.extend_from_slice(&range);
+    // no second range's bytes follow
+    let v = MultirangeValue::from_sql(&multirange_type(Type::INT4), &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("{[1, 5)}"));
+}
+
+fn composite_type(name: &str, fields: Vec<Field>) -> Type {
+    Type::new(
+        name.to_string(),
+        16_600,
+        Kind::Composite(fields),
+        "public".to_string(),
+    )
+}
+
+/// Builds the composite wire format: 4-byte field count (its value is
+/// unused by the decoder — the real field list comes from `Type::fields()`
+/// — but PostgreSQL always sends one, so the fixture includes it for
+/// realism), then per field a 4-byte type OID + a 4-byte length-prefixed
+/// value (-1 length = NULL).
+fn composite_wire_bytes(field_values: &[(u32, Option<&[u8]>)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(field_values.len() as i32).to_be_bytes());
+    for (oid, val) in field_values {
+        buf.extend_from_slice(&oid.to_be_bytes());
+        match val {
+            Some(bytes) => {
+                buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            None => buf.extend_from_slice(&(-1_i32).to_be_bytes()),
+        }
+    }
+    buf
+}
+
+#[test]
+fn composite_decodes_every_field_by_name() {
+    // `ROW(1, 2, 'hello')::point3d` where point3d is `(x int, y int, z text)`
+    // — captured live.
+    let fields = vec![
+        Field::new("x".to_string(), Type::INT4),
+        Field::new("y".to_string(), Type::INT4),
+        Field::new("z".to_string(), Type::TEXT),
+    ];
+    let bytes = composite_wire_bytes(&[
+        (Type::INT4.oid(), Some(&1_i32.to_be_bytes())),
+        (Type::INT4.oid(), Some(&2_i32.to_be_bytes())),
+        (Type::TEXT.oid(), Some(b"hello")),
+    ]);
+    let ty = composite_type("point3d", fields);
+    let v = CompositeValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!({"x": 1, "y": 2, "z": "hello"})
+    );
+}
+
+#[test]
+fn composite_preserves_a_null_field_at_its_own_position() {
+    // `ROW(1, NULL, 'x')::point3d` — captured live. The NULL field must
+    // decode to JSON null WITHOUT causing every subsequent field to also
+    // become null (that's the truncated-buffer recovery path, a different
+    // case, tested separately below).
+    let fields = vec![
+        Field::new("x".to_string(), Type::INT4),
+        Field::new("y".to_string(), Type::INT4),
+        Field::new("z".to_string(), Type::TEXT),
+    ];
+    let bytes = composite_wire_bytes(&[
+        (Type::INT4.oid(), Some(&1_i32.to_be_bytes())),
+        (Type::INT4.oid(), None),
+        (Type::TEXT.oid(), Some(b"x")),
+    ]);
+    let ty = composite_type("point3d", fields);
+    let v = CompositeValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!({"x": 1, "y": null, "z": "x"})
+    );
+}
+
+#[test]
+fn composite_truncated_after_first_field_fills_the_rest_with_null() {
+    // Adapted from the builtin's own
+    // `test_truncated_composite_fills_remaining_with_nulls`
+    // (`extract/composite.rs`): a buffer cut off mid-second-field must
+    // decode the first field normally and fill every remaining field
+    // (including the one that was mid-read) with null, not error out or
+    // panic on the out-of-bounds read.
+    let fields = vec![
+        Field::new("first".to_string(), Type::INT4),
+        Field::new("second".to_string(), Type::INT4),
+    ];
+    let full = composite_wire_bytes(&[
+        (Type::INT4.oid(), Some(&1_i32.to_be_bytes())),
+        (Type::INT4.oid(), Some(&2_i32.to_be_bytes())),
+    ]);
+    let truncated = &full[..16];
+    let ty = composite_type("pair", fields);
+    let v = CompositeValue::from_sql(&ty, truncated).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!({"first": 1, "second": null})
+    );
+}
+
+#[test]
+fn composite_with_an_empty_buffer_decodes_to_null_not_an_empty_object() {
+    // Matches the builtin's `test_empty_buffer_returns_null`: an empty
+    // buffer means the composite value itself is NULL (the length-
+    // prefixed value framing at the call site already handles this in
+    // practice, since a NULL composite column never reaches from_sql at
+    // all — but the decoder is defensive about it anyway, matching the
+    // builtin's own defensiveness).
+    let fields = vec![Field::new("id".to_string(), Type::INT4)];
+    let ty = composite_type("single", fields);
+    let v = CompositeValue::from_sql(&ty, &[]).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::Value::Null);
+}
+
+#[test]
+fn composite_with_a_nested_composite_field() {
+    // A field whose own type is itself Kind::Composite — proves the
+    // recursive dispatch (extract_kind_from_bytes -> Kind::Composite ->
+    // extract_composite_fields -> recurse) terminates correctly rather
+    // than looping or panicking on nested structures.
+    let inner_fields = vec![
+        Field::new("a".to_string(), Type::INT4),
+        Field::new("b".to_string(), Type::INT4),
+    ];
+    let inner_ty = composite_type("inner", inner_fields);
+    let inner_bytes = composite_wire_bytes(&[
+        (Type::INT4.oid(), Some(&10_i32.to_be_bytes())),
+        (Type::INT4.oid(), Some(&20_i32.to_be_bytes())),
+    ]);
+
+    let outer_fields = vec![
+        Field::new("name".to_string(), Type::TEXT),
+        Field::new("nested".to_string(), inner_ty),
+    ];
+    let outer_bytes = composite_wire_bytes(&[
+        (Type::TEXT.oid(), Some(b"outer")),
+        (16_600, Some(&inner_bytes)),
+    ]);
+    let outer_ty = composite_type("outer", outer_fields);
+    let v = CompositeValue::from_sql(&outer_ty, &outer_bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!({"name": "outer", "nested": {"a": 10, "b": 20}})
+    );
+}
+
+#[test]
+fn composite_with_an_array_typed_field() {
+    // A field whose type is Kind::Array — proves extract_kind_from_bytes's
+    // Kind::Array arm (added in this batch specifically to cover this
+    // case, which previously fell to `extract_simple_from_bytes` and
+    // decoded to null) is reachable from inside a composite.
+    let int4_array_ty = Type::new(
+        "_int4".to_string(),
+        1007,
+        Kind::Array(Type::INT4),
+        "pg_catalog".to_string(),
+    );
+    let array_bytes = array_wire_bytes(
+        Type::INT4.oid(),
+        &[Some(&1_i32.to_be_bytes()), Some(&2_i32.to_be_bytes())],
+    );
+
+    let fields = vec![Field::new("nums".to_string(), int4_array_ty)];
+    let bytes = composite_wire_bytes(&[(1007, Some(&array_bytes))]);
+    let ty = composite_type("with_array", fields);
+    let v = CompositeValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!({"nums": [1, 2]})
+    );
+}
+
+#[test]
+fn composite_accepts_rejects_a_plain_simple_type() {
+    let fields = vec![Field::new("id".to_string(), Type::INT4)];
+    let ty = composite_type("single", fields);
+    assert!(CompositeValue::accepts(&ty));
+    assert!(!CompositeValue::accepts(&Type::INT4));
+}
+
+// Arrays of ranges/multirange/composite: a gap found live (int4range[]
+// decoded every element to null) during this batch's investigation —
+// extract_element_from_bytes (renamed extract_kind_from_bytes internally)
+// had no arms for these Kinds, so every array element of these types fell
+// to the same "unsupported, return null" path the scalar columns used to
+// hit before Kind::Multirange/Composite existed at all.
+
+#[test]
+fn int4range_array_decodes_each_element() {
+    let ty = array_type(Type::INT4_RANGE);
+    let r1 = [2u8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5]; // [1, 5)
+    let r2 = [2u8, 0, 0, 0, 4, 0, 0, 0, 10, 0, 0, 0, 4, 0, 0, 0, 20]; // [10, 20)
+    let bytes = array_wire_bytes(Type::INT4_RANGE.oid(), &[Some(&r1), Some(&r2)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["[1, 5)", "[10, 20)"]));
+}
+
+#[test]
+fn composite_array_decodes_each_element() {
+    let fields = vec![
+        Field::new("x".to_string(), Type::INT4),
+        Field::new("y".to_string(), Type::INT4),
+    ];
+    let point_ty = composite_type("point2d", fields);
+    let ty = array_type(point_ty.clone());
+    let p1 = composite_wire_bytes(&[
+        (Type::INT4.oid(), Some(&1_i32.to_be_bytes())),
+        (Type::INT4.oid(), Some(&2_i32.to_be_bytes())),
+    ]);
+    let p2 = composite_wire_bytes(&[
+        (Type::INT4.oid(), Some(&3_i32.to_be_bytes())),
+        (Type::INT4.oid(), Some(&4_i32.to_be_bytes())),
+    ]);
+    let bytes = array_wire_bytes(16_600, &[Some(&p1), Some(&p2)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(
+        array.0,
+        serde_json::json!([{"x": 1, "y": 2}, {"x": 3, "y": 4}])
+    );
+}
+
+// pgvector: dynamic OIDs, matched by name (like hstore) rather than a
+// `Type::` constant. Wire bytes captured live from pgvector/pgvector:pg16.
+
+fn pgvector_type(name: &str) -> Type {
+    Type::new(name.to_string(), 16_700, Kind::Simple, "public".to_string())
+}
+
+#[test]
+fn pgvector_decodes_three_dimensions() {
+    // `'[1,2,3.5]'::vector(3)` — captured live.
+    let bytes: [u8; 16] = [0, 3, 0, 0, 63, 128, 0, 0, 64, 0, 0, 0, 64, 96, 0, 0];
+    let v = PgVector::from_sql(&pgvector_type("vector"), &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("[1,2,3.5]"));
+}
+
+#[test]
+fn pgvector_accepts_matches_only_by_name() {
+    assert!(PgVector::accepts(&pgvector_type("vector")));
+    assert!(!PgVector::accepts(&pgvector_type("halfvec")));
+    assert!(!PgVector::accepts(&Type::INT4));
+}
+
+#[test]
+fn pgvector_rejects_a_buffer_shorter_than_the_header() {
+    assert!(PgVector::from_sql(&pgvector_type("vector"), &[0; 2]).is_err());
+}
+
+#[test]
+fn pgvector_rejects_a_buffer_too_short_for_its_declared_dimension() {
+    // dim=3 declared but only 1 float4 worth of payload follows.
+    let bytes = [0, 3, 0, 0, 63, 128, 0, 0];
+    assert!(PgVector::from_sql(&pgvector_type("vector"), &bytes).is_err());
+}
+
+#[test]
+fn pg_halfvec_decodes_three_dimensions_via_f16_conversion() {
+    // `'[1,2,3.5]'::halfvec(3)` — captured live. 0x3C00/0x4000/0x4300 are
+    // the IEEE 754 binary16 encodings of 1.0/2.0/3.5 — verified against
+    // the f16_bits_to_f32 algorithm independently before writing this
+    // test, not just trusted because the live query happened to match.
+    let bytes: [u8; 10] = [0, 3, 0, 0, 60, 0, 64, 0, 67, 0];
+    let v = PgHalfVector::from_sql(&pgvector_type("halfvec"), &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("[1,2,3.5]"));
+}
+
+#[test]
+fn pg_halfvec_decodes_special_values_zero_and_negative() {
+    // 0x0000 = +0.0, 0x8000 = -0.0 (renders as "0" either way via Rust's
+    // f32 Display), 0xBC00 = -1.0 — exercises the sign-bit and the
+    // subnormal/zero branch of f16_bits_to_f32 that the "happy path"
+    // 1/2/3.5 values above never touch.
+    let bytes: [u8; 8] = [0, 2, 0, 0, 0, 0, 188, 0];
+    let v = PgHalfVector::from_sql(&pgvector_type("halfvec"), &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("[0,-1]"));
+}
+
+#[test]
+fn pg_sparsevec_decodes_and_renders_one_based_indices() {
+    // `'{1:1.5,3:2.25}/5'::sparsevec(5)` — captured live. The wire format
+    // stores indices 0-based (0 and 2 here); the text form is 1-based (1
+    // and 3) — this is the one place pgvector's wire and text
+    // representations disagree on indexing, so it gets a dedicated test
+    // rather than trusting the +1 arithmetic by inspection.
+    let bytes: [u8; 28] = [
+        0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 63, 192, 0, 0, 64, 16, 0, 0,
+    ];
+    let v = PgSparseVector::from_sql(&pgvector_type("sparsevec"), &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("{1:1.5,3:2.25}/5")
+    );
+}
+
+#[test]
+fn pg_sparsevec_with_zero_entries_decodes_to_an_empty_body() {
+    let bytes: [u8; 12] = [0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0];
+    let v = PgSparseVector::from_sql(&pgvector_type("sparsevec"), &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("{}/5"));
+}
+
+#[test]
+fn pg_sparsevec_rejects_a_buffer_too_short_for_the_header() {
+    assert!(PgSparseVector::from_sql(&pgvector_type("sparsevec"), &[0; 8]).is_err());
+}
+
+#[test]
+fn pgvector_array_decodes_each_element() {
+    let ty = array_type(pgvector_type("vector"));
+    // dim=1, header(4 bytes) + 1 float4(4 bytes) = 8 bytes per element.
+    let v1: [u8; 8] = [0, 1, 0, 0, 63, 128, 0, 0]; // dim=1, value=1.0
+    let v2: [u8; 8] = [0, 1, 0, 0, 64, 0, 0, 0]; // dim=1, value=2.0
+    let bytes = array_wire_bytes(16_700, &[Some(&v1), Some(&v2)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["[1]", "[2]"]));
 }

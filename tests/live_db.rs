@@ -1433,3 +1433,223 @@ fn execute_query_decodes_fts_and_introspection_types_correctly() {
         );
     }
 }
+
+// Coverage for the final #82 batch: Kind::Composite, Kind::Domain,
+// Kind::Multirange, arrays of the 6 built-in range types (int4range[] etc.
+// previously decoded to [null, null, ...] — a gap found live during this
+// batch), and the architectural refactor that unified the per-element
+// decoder to cover all `Kind` variants (not just `Kind::Simple`).
+#[test]
+fn execute_query_decodes_composite_domain_multirange_and_range_arrays_correctly() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TABLE IF EXISTS live_db_type_coverage_6_scratch CASCADE"
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TYPE IF EXISTS tc6_point3d CASCADE"
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP DOMAIN IF EXISTS tc6_positive_int CASCADE"
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TYPE tc6_point3d AS (x int, y int, z text)"
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE DOMAIN tc6_positive_int AS int CHECK (VALUE > 0)"
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_type_coverage_6_scratch ( \
+                id serial PRIMARY KEY, \
+                c_composite tc6_point3d, \
+                c_composite_null_field tc6_point3d, \
+                c_domain tc6_positive_int, \
+                c_multirange int4multirange, \
+                c_int4range_arr int4range[], \
+                c_composite_arr tc6_point3d[] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_6_scratch VALUES ( \
+                DEFAULT, \
+                ROW(1, 2, 'hello'), \
+                ROW(1, NULL, 'x'), \
+                42, \
+                '{[1,5),[10,20)}', \
+                ARRAY['[1,5)'::int4range, '[10,20)'::int4range], \
+                ARRAY[ROW(1,2,'a')::tc6_point3d, ROW(3,4,'b')::tc6_point3d] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_6_scratch (id) VALUES (DEFAULT)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT * FROM live_db_type_coverage_6_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let populated = &rows[0];
+    assert_eq!(
+        populated[1],
+        json!({"x": 1, "y": 2, "z": "hello"}),
+        "c_composite"
+    );
+    assert_eq!(
+        populated[2],
+        json!({"x": 1, "y": null, "z": "x"}),
+        "c_composite_null_field (null field must be JSON null, not drop the field)"
+    );
+    assert_eq!(
+        populated[3],
+        json!(42),
+        "c_domain (must unwrap to its base int type)"
+    );
+    assert_eq!(populated[4], json!("{[1, 5),[10, 20)}"), "c_multirange");
+    assert_eq!(
+        populated[5],
+        json!(["[1, 5)", "[10, 20)"]),
+        "c_int4range_arr (previously decoded to [null, null])"
+    );
+    assert_eq!(
+        populated[6],
+        json!([{"x": 1, "y": 2, "z": "a"}, {"x": 3, "y": 4, "z": "b"}]),
+        "c_composite_arr"
+    );
+
+    let all_null = &rows[1];
+    for (col_idx, col_name) in [
+        (1, "c_composite"),
+        (2, "c_composite_null_field"),
+        (3, "c_domain"),
+        (4, "c_multirange"),
+        (5, "c_int4range_arr"),
+        (6, "c_composite_arr"),
+    ] {
+        assert_eq!(
+            all_null[col_idx],
+            Value::Null,
+            "{col_name} must decode to null when the column is genuinely NULL"
+        );
+    }
+}
+
+// pgvector coverage is in a separate `#[ignore]` test because it requires
+// the `vector` extension (not available in the stock `postgres:16` CI
+// image — only `pgvector/pgvector:pg16`). Run locally with:
+//   PGPORT=54321 POSTGRES_PLUGIN_BIN=target/debug/postgresql-plugin \
+//   cargo test --test live_db execute_query_decodes_pgvector_types -- \
+//   --include-ignored --test-threads=1
+//
+// CI coverage is provided instead by the unit tests in extract_tests.rs,
+// which test PgVector/PgHalfVector/PgSparseVector::from_sql directly
+// against real wire bytes captured from a pgvector/pgvector:pg16 instance.
+#[test]
+#[ignore = "requires pgvector extension (pgvector/pgvector:pg16 image, not stock postgres:16)"]
+fn execute_query_decodes_pgvector_types_correctly() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "CREATE EXTENSION IF NOT EXISTS vector" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "DROP TABLE IF EXISTS live_db_pgvector_scratch" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_pgvector_scratch ( \
+                id serial PRIMARY KEY, \
+                c_vector vector(3), \
+                c_halfvec halfvec(3), \
+                c_sparsevec sparsevec(5), \
+                c_vector_arr vector(3)[] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_pgvector_scratch VALUES ( \
+                DEFAULT, '[1,2,3.5]', '[1,2,3.5]', '{1:1.5,3:2.25}/5', \
+                ARRAY['[1,1,1]'::vector(3), '[2,2,2]'::vector(3)] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_pgvector_scratch (id) VALUES (DEFAULT)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT * FROM live_db_pgvector_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let populated = &rows[0];
+    assert_eq!(populated[1], json!("[1,2,3.5]"), "c_vector");
+    assert_eq!(populated[2], json!("[1,2,3.5]"), "c_halfvec");
+    assert_eq!(populated[3], json!("{1:1.5,3:2.25}/5"), "c_sparsevec");
+    assert_eq!(populated[4], json!(["[1,1,1]", "[2,2,2]"]), "c_vector_arr");
+
+    let all_null = &rows[1];
+    for (col_idx, col_name) in [
+        (1, "c_vector"),
+        (2, "c_halfvec"),
+        (3, "c_sparsevec"),
+        (4, "c_vector_arr"),
+    ] {
+        assert_eq!(all_null[col_idx], Value::Null, "{col_name} must be null");
+    }
+}
