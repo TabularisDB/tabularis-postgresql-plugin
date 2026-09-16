@@ -10,8 +10,10 @@
 //! `extract/enum.rs::extract_or_null`.
 
 use crate::extract::{
-    ArrayValue, BitOrVarBit, Cid, Circle, EnumLabel, Line, Lseg, MacAddr8, Money, Path, PgBox,
-    Point, Polygon, RegClass, RegProc, RegType, Tid, Xid, Xid8,
+    ArrayValue, BitOrVarBit, Cid, Circle, EnumLabel, GtsVector, JsonPath, Line, Lseg, MacAddr8,
+    Money, Path, PgBox, PgBrinBloomSummary, PgDependencies, PgLsn, PgMcvList, PgNdistinct,
+    PgNodeTree, Point, Polygon, RefCursor, RegClass, RegProc, RegType, Tid, TsQuery, TsVector,
+    TxidSnapshotOrPgSnapshot, Xid, Xid8, Xml,
 };
 use std::collections::HashMap;
 use tokio_postgres::types::{FromSql, Kind, Type};
@@ -821,4 +823,437 @@ fn circle_array_decodes_each_element() {
     let bytes = array_wire_bytes(Type::CIRCLE.oid(), &[Some(&c)]);
     let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
     assert_eq!(array.0, serde_json::json!(["<(1, 1), 5>"]));
+}
+
+// Full-text-search + introspection types — wire bytes below were captured
+// from a real PostgreSQL 16 instance (not hand-derived from the format
+// spec). Before this fix, none of these had a dispatch arm in extract.rs,
+// so they fell to the string-or-null fallback and either silently decoded
+// to `null` (most of them) or, for JSONPATH specifically, decoded to a
+// *corrupted* string (the fallback's plain-String FromSql happens to
+// accept JSONPATH's wire format, but without stripping the leading
+// version byte).
+//
+// ACLITEM is deliberately not covered here: confirmed live that
+// PostgreSQL has no binary send function for it at all
+// ("no binary output function available for type aclitem", SQLSTATE
+// 42883) — the query fails at the server before any client-side
+// FromSql ever runs, for both this plugin and the builtin. See the
+// doc comment on the (absent) AclItem type in extract.rs.
+
+#[test]
+fn xml_decodes_as_plain_utf8_text() {
+    // `'<foo>bar</foo>'::xml`
+    let bytes = b"<foo>bar</foo>";
+    let v = Xml::from_sql(&Type::XML, bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("<foo>bar</foo>")
+    );
+}
+
+#[test]
+fn xml_accepts_rejects_other_types() {
+    assert!(Xml::accepts(&Type::XML));
+    assert!(!Xml::accepts(&Type::REFCURSOR));
+    assert!(!Xml::accepts(&Type::TEXT));
+}
+
+#[test]
+fn refcursor_decodes_as_plain_utf8_text() {
+    let bytes = b"my_cursor_name";
+    let v = RefCursor::from_sql(&Type::REFCURSOR, bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("my_cursor_name")
+    );
+}
+
+#[test]
+fn refcursor_accepts_rejects_other_types() {
+    assert!(RefCursor::accepts(&Type::REFCURSOR));
+    assert!(!RefCursor::accepts(&Type::XML));
+}
+
+#[test]
+fn pg_node_tree_decodes_as_plain_utf8_text() {
+    // Captured from a live `pg_attrdef.adbin` column (a column DEFAULT
+    // expression's parsed node tree) — confirmed reachable under the
+    // binary protocol, unlike ACLITEM.
+    let text = "{CONST :consttype 23 :consttypmod -1 :constcollid 0 \
+                 :constlen 4 :constbyval true :constisnull false \
+                 :location 45 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}";
+    let v = PgNodeTree::from_sql(&Type::PG_NODE_TREE, text.as_bytes()).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!(text));
+}
+
+#[test]
+fn json_path_strips_the_leading_version_byte() {
+    // `'$.store.book[*].author'::jsonpath` — PostgreSQL normalizes the
+    // stored path to quote every key segment. Byte 0 is the version
+    // prefix (1), which must NOT appear in the decoded output — that's
+    // the exact corruption the string fallback produced before this fix.
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(b"$.\"store\".\"book\"[*].\"author\"");
+    let v = JsonPath::from_sql(&Type::JSONPATH, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("$.\"store\".\"book\"[*].\"author\"")
+    );
+}
+
+#[test]
+fn json_path_rejects_an_empty_buffer() {
+    assert!(JsonPath::from_sql(&Type::JSONPATH, &[]).is_err());
+}
+
+#[test]
+fn tsvector_decodes_lexemes_with_positions_and_default_weight() {
+    // `to_tsvector('english', 'a fat cat sat on a mat and ate a fat rat')`
+    // — 6 distinct lexemes, one ('fat') with two positions. Weight 'D' is
+    // the default and must NOT be rendered (matches PostgreSQL's own
+    // tsvector text output, which omits the default weight letter).
+    let bytes: [u8; 54] = [
+        0, 0, 0, 6, 97, 116, 101, 0, 0, 1, 0, 9, 99, 97, 116, 0, 0, 1, 0, 3, 102, 97, 116, 0, 0, 2,
+        0, 2, 0, 11, 109, 97, 116, 0, 0, 1, 0, 7, 114, 97, 116, 0, 0, 1, 0, 12, 115, 97, 116, 0, 0,
+        1, 0, 4,
+    ];
+    let v = TsVector::from_sql(&Type::TS_VECTOR, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'ate':9 'cat':3 'fat':2,11 'mat':7 'rat':12 'sat':4")
+    );
+}
+
+#[test]
+fn tsvector_decodes_a_non_default_weight_letter() {
+    // `setweight(to_tsvector('english', 'fat cat'), 'A')` — every lexeme's
+    // weight is 'A' here, so both must render the letter (unlike the
+    // default-weight test above, where 'D' is always omitted). Weight bits
+    // live in the top 2 bits of the position/weight u16: 0xC0 = 0b11______
+    // -> weight index 3 -> 'A'.
+    let bytes: [u8; 20] = [
+        0, 0, 0, 2, 99, 97, 116, 0, 0, 1, 192, 2, 102, 97, 116, 0, 0, 1, 192, 1,
+    ];
+    let v = TsVector::from_sql(&Type::TS_VECTOR, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'cat':2A 'fat':1A")
+    );
+}
+
+#[test]
+fn tsvector_decodes_mixed_weights_across_lexemes() {
+    // `setweight(..., 'A') || setweight(..., 'B')` — 'cat' carries weight
+    // 'B' (weight bits 0b10______ -> index 2), 'fat' carries 'A' (index 3).
+    // Exercises every branch of the weight lookup table in one test,
+    // beyond the all-default (D) and all-same-non-default (A) cases above.
+    let bytes: [u8; 20] = [
+        0, 0, 0, 2, 99, 97, 116, 0, 0, 1, 128, 2, 102, 97, 116, 0, 0, 1, 192, 1,
+    ];
+    let v = TsVector::from_sql(&Type::TS_VECTOR, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'cat':2B 'fat':1A")
+    );
+}
+
+#[test]
+fn tsvector_with_zero_lexemes_decodes_to_an_empty_string() {
+    let bytes = [0, 0, 0, 0];
+    let v = TsVector::from_sql(&Type::TS_VECTOR, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!(""));
+}
+
+#[test]
+fn tsvector_rejects_a_buffer_too_short_for_the_count_header() {
+    assert!(TsVector::from_sql(&Type::TS_VECTOR, &[0, 0, 0]).is_err());
+}
+
+#[test]
+fn tsquery_decodes_a_two_operand_and_expression() {
+    // `to_tsquery('english', 'fat & rat')`
+    let bytes: [u8; 20] = [
+        0, 0, 0, 3, 2, 2, 1, 0, 0, 114, 97, 116, 0, 1, 0, 0, 102, 97, 116, 0,
+    ];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'fat' & 'rat'")
+    );
+}
+
+// The AND/OR/prefix/weight case above exercises only one shape of the
+// recursive tsquery tree. Every remaining operator (NOT, OR, both phrase-
+// distance forms), every operand modifier (prefix, weight, prefix+weight
+// combined), and the precedence-based parenthesization logic get their
+// own dedicated test below — all against wire bytes captured live from
+// `to_tsquery('english', ...)`, not hand-derived. This is the highest-risk
+// parser in this batch (a stateful recursive binary-tree decoder with
+// four distinct operator encodings), so it gets the most exhaustive
+// coverage.
+
+#[test]
+fn tsquery_decodes_a_not_operand() {
+    // `to_tsquery('english', '!fat')` -> `!'fat'`
+    let bytes: [u8; 13] = [0, 0, 0, 2, 2, 1, 1, 0, 0, 102, 97, 116, 0];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("!'fat'"));
+}
+
+#[test]
+fn tsquery_decodes_an_or_expression() {
+    // `to_tsquery('english', 'fat | rat')` -> `'fat' | 'rat'`
+    let bytes: [u8; 20] = [
+        0, 0, 0, 3, 2, 3, 1, 0, 0, 114, 97, 116, 0, 1, 0, 0, 102, 97, 116, 0,
+    ];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'fat' | 'rat'")
+    );
+}
+
+#[test]
+fn tsquery_decodes_adjacent_phrase_operator_as_arrow_no_distance_number() {
+    // `to_tsquery('english', 'fat <-> rat')` — distance 1 renders as the
+    // bare "<->" arrow, not "<1>".
+    let bytes: [u8; 22] = [
+        0, 0, 0, 3, 2, 4, 0, 1, 1, 0, 0, 114, 97, 116, 0, 1, 0, 0, 102, 97, 116, 0,
+    ];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'fat' <-> 'rat'")
+    );
+}
+
+#[test]
+fn tsquery_decodes_phrase_operator_with_explicit_distance() {
+    // `to_tsquery('english', 'fat <3> rat')` — distance 3 renders as "<3>".
+    let bytes: [u8; 22] = [
+        0, 0, 0, 3, 2, 4, 0, 3, 1, 0, 0, 114, 97, 116, 0, 1, 0, 0, 102, 97, 116, 0,
+    ];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'fat' <3> 'rat'")
+    );
+}
+
+#[test]
+fn tsquery_decodes_weighted_operand() {
+    // `to_tsquery('english', 'fat:A')` -> `'fat':A`
+    let bytes: [u8; 11] = [0, 0, 0, 1, 1, 8, 0, 102, 97, 116, 0];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("'fat':A"));
+}
+
+#[test]
+fn tsquery_decodes_prefix_operand() {
+    // `to_tsquery('english', 'fat:*')` -> `'fat':*`
+    let bytes: [u8; 11] = [0, 0, 0, 1, 1, 0, 1, 102, 97, 116, 0];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("'fat':*"));
+}
+
+#[test]
+fn tsquery_decodes_prefix_and_weight_combined() {
+    // `to_tsquery('english', 'fat:*A')` -> `'fat':*A` — note the weight
+    // letter is appended directly after `*` with no colon when both a
+    // prefix marker and a weight are present (differs from the
+    // weight-only case, which uses `:A`).
+    let bytes: [u8; 11] = [0, 0, 0, 1, 1, 8, 1, 102, 97, 116, 0];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("'fat':*A"));
+}
+
+#[test]
+fn tsquery_omits_parens_when_and_is_nested_inside_or_at_default_precedence() {
+    // `to_tsquery('english', 'fat & cat | rat')` — AND binds tighter than
+    // OR by default, so no parens are needed. Captured live: PostgreSQL's
+    // own parser produces IDENTICAL bytes for `fat & cat | rat` and
+    // `(fat & cat) | rat` (confirmed separately) — the explicit parens in
+    // the second form are dropped before the query even reaches the wire,
+    // so both inputs exercise this same byte sequence and same expected
+    // output.
+    let bytes: [u8; 29] = [
+        0, 0, 0, 5, 2, 3, 1, 0, 0, 114, 97, 116, 0, 2, 2, 1, 0, 0, 99, 97, 116, 0, 1, 0, 0, 102,
+        97, 116, 0,
+    ];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("'fat' & 'cat' | 'rat'")
+    );
+}
+
+#[test]
+fn tsquery_adds_parens_when_not_wraps_an_and_expression() {
+    // `to_tsquery('english', '!(fat & cat)')` -> the builtin's rendering
+    // is `!('fat' & 'cat')` — parens present (this is what distinguishes
+    // it from the bare NOT-of-a-single-operand case above), but note this
+    // differs from PostgreSQL's own `::text` cast, which additionally
+    // pads the parens with spaces: `!( 'fat' & 'cat' )`. That whitespace
+    // difference is the builtin's own behavior (verified by reading its
+    // source directly — the NOT branch does `format!("!{}", operand)`
+    // with no space), not something this port introduces; parity with
+    // the builtin, not with psql's `::text` output, is this plugin's
+    // contract.
+    let bytes: [u8; 22] = [
+        0, 0, 0, 4, 2, 1, 2, 2, 1, 0, 0, 99, 97, 116, 0, 1, 0, 0, 102, 97, 116, 0,
+    ];
+    let v = TsQuery::from_sql(&Type::TSQUERY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("!('fat' & 'cat')")
+    );
+}
+
+#[test]
+fn tsquery_rejects_a_buffer_too_short_for_the_length_prefix() {
+    assert!(TsQuery::from_sql(&Type::TSQUERY, &[0, 0, 0]).is_err());
+}
+
+#[test]
+fn tsquery_accepts_rejects_tsvector() {
+    assert!(TsQuery::accepts(&Type::TSQUERY));
+    assert!(!TsQuery::accepts(&Type::TS_VECTOR));
+}
+
+#[test]
+fn gts_vector_decodes_as_a_blob_string() {
+    let bytes = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    let v = GtsVector::from_sql(&Type::GTS_VECTOR, &bytes).unwrap();
+    let serde_json::Value::String(s) = serde_json::Value::from(v) else {
+        panic!("expected a string");
+    };
+    assert!(s.starts_with("BLOB:5:application/octet-stream:"));
+}
+
+#[test]
+fn gts_vector_rejects_a_buffer_shorter_than_5_bytes() {
+    assert!(GtsVector::from_sql(&Type::GTS_VECTOR, &[0; 4]).is_err());
+}
+
+#[test]
+fn pg_lsn_decodes_as_uppercase_hex_upper_slash_lower() {
+    // `'16/B374D848'::pg_lsn`
+    let bytes = [0, 0, 0, 22, 179, 116, 216, 72];
+    let v = PgLsn::from_sql(&Type::PG_LSN, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("16/B374D848"));
+}
+
+#[test]
+fn pg_lsn_rejects_wrong_length() {
+    assert!(PgLsn::from_sql(&Type::PG_LSN, &[0; 4]).is_err());
+}
+
+#[test]
+fn pg_snapshot_decodes_xmin_xmax_and_empty_active_xids() {
+    // `pg_current_snapshot()` on a connection with no other concurrent
+    // transactions — captured live: count=0, xmin=xmax=2679.
+    let bytes: [u8; 20] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 119, 0, 0, 0, 0, 0, 0, 10, 119,
+    ];
+    let v = TxidSnapshotOrPgSnapshot::from_sql(&Type::PG_SNAPSHOT, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("2679:2679:"));
+}
+
+#[test]
+fn txid_snapshot_decodes_active_xids_joined_by_comma() {
+    let mut bytes = vec![0, 0, 0, 2]; // count = 2
+    bytes.extend_from_slice(&100_i64.to_be_bytes()); // xmin
+    bytes.extend_from_slice(&200_i64.to_be_bytes()); // xmax
+    bytes.extend_from_slice(&150_i64.to_be_bytes()); // active xid 1
+    bytes.extend_from_slice(&175_i64.to_be_bytes()); // active xid 2
+    let v = TxidSnapshotOrPgSnapshot::from_sql(&Type::TXID_SNAPSHOT, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("100:200:150,175")
+    );
+}
+
+#[test]
+fn txid_snapshot_and_pg_snapshot_share_the_same_accepts() {
+    assert!(TxidSnapshotOrPgSnapshot::accepts(&Type::TXID_SNAPSHOT));
+    assert!(TxidSnapshotOrPgSnapshot::accepts(&Type::PG_SNAPSHOT));
+    assert!(!TxidSnapshotOrPgSnapshot::accepts(&Type::PG_LSN));
+}
+
+#[test]
+fn txid_snapshot_rejects_a_buffer_too_short_for_the_header() {
+    assert!(TxidSnapshotOrPgSnapshot::from_sql(&Type::TXID_SNAPSHOT, &[0; 10]).is_err());
+}
+
+#[test]
+fn internal_statistics_blob_types_decode_and_accept_correctly() {
+    // pg_ndistinct/pg_dependencies bytes captured live from a real
+    // pg_statistic_ext_data row (CREATE STATISTICS ... ON a, b). No
+    // meaningful text representation, so all five internal-stats types
+    // decode via the same opaque-blob pattern as this plugin's existing
+    // BYTEA arm.
+    let ndistinct_bytes: [u8; 28] = [
+        164, 191, 82, 163, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 89, 64, 2, 0, 0, 0, 1, 0, 2, 0,
+    ];
+    let v = PgNdistinct::from_sql(&Type::PG_NDISTINCT, &ndistinct_bytes).unwrap();
+    let serde_json::Value::String(s) = serde_json::Value::from(v) else {
+        panic!("expected a string");
+    };
+    assert!(s.starts_with("BLOB:28:application/octet-stream:"));
+
+    let dependencies_bytes: [u8; 26] = [
+        44, 154, 84, 180, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 2, 0, 1, 0, 2, 0,
+    ];
+    let v = PgDependencies::from_sql(&Type::PG_DEPENDENCIES, &dependencies_bytes).unwrap();
+    let serde_json::Value::String(s) = serde_json::Value::from(v) else {
+        panic!("expected a string");
+    };
+    assert!(s.starts_with("BLOB:26:application/octet-stream:"));
+
+    // PG_MCV_LIST and the two BRIN summary types share the identical blob
+    // pattern; no live example was practical to capture for the BRIN
+    // types (they're only ever materialized inside a BRIN index page, not
+    // exposed as an ordinary queryable catalog column) but the decode
+    // logic is a byte-identical pass-through, so a synthetic buffer
+    // suffices to prove the wiring.
+    let synthetic = [1, 2, 3, 4, 5, 6, 7, 8];
+    let v = PgMcvList::from_sql(&Type::PG_MCV_LIST, &synthetic).unwrap();
+    assert!(matches!(
+        serde_json::Value::from(v),
+        serde_json::Value::String(_)
+    ));
+    let v = PgBrinBloomSummary::from_sql(&Type::PG_BRIN_BLOOM_SUMMARY, &synthetic).unwrap();
+    assert!(matches!(
+        serde_json::Value::from(v),
+        serde_json::Value::String(_)
+    ));
+
+    assert!(PgNdistinct::accepts(&Type::PG_NDISTINCT));
+    assert!(!PgNdistinct::accepts(&Type::PG_DEPENDENCIES));
+    assert!(PgDependencies::accepts(&Type::PG_DEPENDENCIES));
+    assert!(!PgDependencies::accepts(&Type::PG_NDISTINCT));
+    assert!(PgMcvList::accepts(&Type::PG_MCV_LIST));
+    assert!(PgBrinBloomSummary::accepts(&Type::PG_BRIN_BLOOM_SUMMARY));
+    assert!(!PgBrinBloomSummary::accepts(
+        &Type::PG_BRIN_MINMAX_MULTI_SUMMARY
+    ));
+}
+
+#[test]
+fn tsvector_array_decodes_each_element() {
+    let ty = array_type(Type::TS_VECTOR);
+    let single_lexeme: [u8; 12] = [0, 0, 0, 1, 104, 105, 0, 0, 1, 0, 1, 0]; // 'hi':1
+    let bytes = array_wire_bytes(Type::TS_VECTOR.oid(), &[Some(&single_lexeme)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["'hi':1"]));
+}
+
+#[test]
+fn pg_lsn_array_decodes_each_element() {
+    let ty = array_type(Type::PG_LSN);
+    let lsn = [0, 0, 0, 22, 179, 116, 216, 72];
+    let bytes = array_wire_bytes(Type::PG_LSN.oid(), &[Some(&lsn)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["16/B374D848"]));
 }
