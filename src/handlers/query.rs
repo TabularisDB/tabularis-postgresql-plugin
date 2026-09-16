@@ -111,19 +111,36 @@ pub async fn explain_query(id: Value, params: &Value) -> Value {
 
     match exec_query(&conn_params, &explain_sql, None, 1, schema).await {
         Ok(result) => {
-            // The host wraps this in ExplainQueryOutput::Plan { plan: res }
-            // We just return the raw explain JSON from the first row/col
-            if let Some(rows) = result.get("rows").and_then(Value::as_array) {
-                if let Some(first_row) = rows.first().and_then(Value::as_array) {
-                    if let Some(plan_json) = first_row.first() {
-                        return ok_response(id, plan_json.clone());
-                    }
-                }
+            let plan_json = result
+                .get("rows")
+                .and_then(Value::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(Value::as_array)
+                .and_then(|first_row| first_row.first());
+            match plan_json {
+                Some(plan_json) => ok_response(id, raw_explain_output(plan_json, query)),
+                None => ok_response(id, result),
             }
-            ok_response(id, result)
         }
         Err(e) => error_response(id, -32603, &e),
     }
+}
+
+/// Wrap an EXPLAIN plan value in the `Raw { engine, format, payload,
+/// original_query }` shape the host's plugin adapter recognizes
+/// (`tabularis` `plugins/driver.rs::explain_query`, which reads
+/// `engine`/`format`/`payload` as strings via `.as_str()` before
+/// classifying the result as `ExplainQueryOutput::Raw`; any other shape
+/// falls through to the parsed-plan path instead). `payload` must be the
+/// JSON **stringified**, not the live JSON value itself, to match the
+/// builtin driver's `RawExplainOutput` contract exactly.
+fn raw_explain_output(plan_json: &Value, original_query: &str) -> Value {
+    json!({
+        "engine": "postgres",
+        "format": "postgres-json",
+        "payload": plan_json.to_string(),
+        "original_query": original_query,
+    })
 }
 
 /// Execute a SQL query and return a QueryResult-shaped JSON value.

@@ -10,7 +10,10 @@
 //! These tests exercise the pure classification logic that decides whether
 //! pagination is applied to a statement.
 
-use super::{returns_result_set, strip_leading_sql_comments, supports_trailing_limit_clause};
+use super::{
+    raw_explain_output, returns_result_set, strip_leading_sql_comments,
+    supports_trailing_limit_clause,
+};
 
 #[test]
 fn strip_leading_sql_comments_skips_line_comments() {
@@ -137,4 +140,53 @@ fn supports_trailing_limit_clause_does_not_silently_disable_cte_pagination() {
     assert!(supports_trailing_limit_clause(
         "WITH t AS (SELECT 1) SELECT * FROM t"
     ));
+}
+
+#[test]
+fn raw_explain_output_matches_the_host_adapters_raw_shape() {
+    // #89: the host's plugin adapter (tabularis plugins/driver.rs) only
+    // classifies a response as ExplainQueryOutput::Raw when it finds
+    // engine/format/payload as strings via .as_str() — anything else
+    // (including the bare EXPLAIN JSON this plugin used to return) falls
+    // through to the parsed-plan path instead.
+    let plan = serde_json::json!([{"Plan": {"Node Type": "Seq Scan"}}]);
+    let wire = raw_explain_output(&plan, "SELECT 1");
+
+    let obj = wire.as_object().expect("must be a JSON object");
+    assert_eq!(
+        obj.get("engine").and_then(serde_json::Value::as_str),
+        Some("postgres")
+    );
+    assert_eq!(
+        obj.get("format").and_then(serde_json::Value::as_str),
+        Some("postgres-json")
+    );
+    assert_eq!(
+        obj.get("original_query")
+            .and_then(serde_json::Value::as_str),
+        Some("SELECT 1")
+    );
+
+    // payload must be the JSON *stringified*, not the live JSON value — the
+    // host adapter reads it with object.get("payload")?.as_str(), which
+    // returns None (not an error) for a JSON object/array, silently
+    // dropping this plugin's output into the Plan fallback path instead.
+    let payload = obj
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .expect("payload must be a JSON string, not a nested object/array");
+    let reparsed: serde_json::Value =
+        serde_json::from_str(payload).expect("payload must be valid JSON once parsed");
+    assert_eq!(reparsed, plan);
+}
+
+#[test]
+fn raw_explain_output_payload_is_not_the_live_json_value() {
+    let plan = serde_json::json!({"Node Type": "Index Scan"});
+    let wire = raw_explain_output(&plan, "SELECT * FROM t WHERE id = 1");
+    let payload_value = wire.get("payload").unwrap();
+    assert!(
+        payload_value.is_string(),
+        "payload must be Value::String, got {payload_value:?}"
+    );
 }
