@@ -414,6 +414,48 @@ fn cid_decodes_as_a_plain_number() {
 }
 
 #[test]
+fn xid_and_cid_accepts_are_distinct_and_do_not_cross_match() {
+    // The u32_oid_wrapper! macro substitutes `Type::$pg_type` per invocation
+    // — this guards against a copy-paste mixup in the macro expansion
+    // routing an XID buffer through Cid's (or vice versa) accepts check.
+    assert!(Xid::accepts(&Type::XID));
+    assert!(!Xid::accepts(&Type::CID));
+    assert!(!Xid::accepts(&Type::OID));
+    assert!(Cid::accepts(&Type::CID));
+    assert!(!Cid::accepts(&Type::XID));
+}
+
+#[test]
+fn macaddr8_accepts_rejects_macaddr_and_other_types() {
+    assert!(MacAddr8::accepts(&Type::MACADDR8));
+    assert!(!MacAddr8::accepts(&Type::MACADDR));
+    assert!(!MacAddr8::accepts(&Type::TEXT));
+}
+
+#[test]
+fn bit_or_varbit_accepts_both_bit_and_varbit_but_nothing_else() {
+    assert!(BitOrVarBit::accepts(&Type::BIT));
+    assert!(BitOrVarBit::accepts(&Type::VARBIT));
+    assert!(!BitOrVarBit::accepts(&Type::TEXT));
+    assert!(!BitOrVarBit::accepts(&Type::BOOL));
+}
+
+#[test]
+fn tid_accepts_rejects_other_types() {
+    assert!(Tid::accepts(&Type::TID));
+    assert!(!Tid::accepts(&Type::OID));
+    assert!(!Tid::accepts(&Type::XID));
+}
+
+#[test]
+fn xid8_accepts_rejects_int8_despite_sharing_its_wire_format() {
+    // XID8 reinterprets INT8's exact wire bytes as unsigned — accepts must
+    // still gate on the XID8 OID, not fall open for any 8-byte integer type.
+    assert!(Xid8::accepts(&Type::XID8));
+    assert!(!Xid8::accepts(&Type::INT8));
+}
+
+#[test]
 fn tid_decodes_as_a_block_offset_pair_string() {
     // `'(3,7)'::tid` — 4-byte block number, 2-byte offset.
     let bytes = [0, 0, 0, 3, 0, 7];
