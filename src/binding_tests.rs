@@ -49,6 +49,24 @@ mod bind_pg_value_tests {
     }
 
     #[test]
+    fn empty_array_binds_as_quoted_empty_literal_not_array_constructor() {
+        // ARRAY[] (an ARRAY constructor with no elements) is only accepted
+        // when the target column type is unambiguous -- in many contexts
+        // (e.g. plain INSERT ... VALUES) it's a syntax/type error. '{}' is
+        // the canonical PostgreSQL empty-array literal the server always
+        // accepts. See #86.
+        let bound = bind_pg_value(json!([]), 1, &BindOptions::default()).unwrap();
+        assert_eq!(bound.sql, "'{}'");
+        assert!(bound.param.is_none());
+    }
+
+    #[test]
+    fn nested_empty_array_binds_as_quoted_empty_literal_at_every_level() {
+        let bound = bind_pg_value(json!([[]]), 1, &BindOptions::default()).unwrap();
+        assert_eq!(bound.sql, "ARRAY['{}']");
+    }
+
+    #[test]
     fn string_array_escapes_single_quotes() {
         let bound = bind_pg_value(json!(["it's", "ok"]), 1, &BindOptions::default()).unwrap();
         assert_eq!(bound.sql, "ARRAY['it''s', 'ok']");
@@ -257,6 +275,15 @@ mod bind_pg_value_tests {
     fn array_literal_embedded_in_string_is_parsed_as_pg_array() {
         let bound = bind_pg_value(json!("[1,2,3]"), 1, &BindOptions::default()).unwrap();
         assert_eq!(bound.sql, "ARRAY[1, 2, 3]");
+        assert!(bound.param.is_none());
+    }
+
+    #[test]
+    fn empty_array_literal_embedded_in_string_binds_as_quoted_empty_literal() {
+        // Same #86 guard, reached via bind_pg_string's inline array-literal
+        // parse ("[]") rather than a native JSON array value.
+        let bound = bind_pg_value(json!("[]"), 1, &BindOptions::default()).unwrap();
+        assert_eq!(bound.sql, "'{}'");
         assert!(bound.param.is_none());
     }
 

@@ -436,6 +436,16 @@ fn decode_blob_wire_format(value: &str) -> Option<Vec<u8>> {
 /// Convert a JSON array to a PostgreSQL `ARRAY[...]` literal string.
 /// Recursively handles nested arrays (multi-dimensional PG arrays).
 fn json_array_to_pg_literal(arr: &[Value]) -> Result<String, String> {
+    // `ARRAY[]` (an ARRAY constructor with no elements) is only accepted
+    // when the target column type is unambiguous — in many contexts
+    // (e.g. INSERT ... VALUES) it's a syntax/type error. `'{}'` is the
+    // canonical PostgreSQL empty-array literal the server always accepts;
+    // it must be quoted — a bare `{}` is itself a syntax error. Matches the
+    // builtin driver's `json_array_to_pg_literal` exactly.
+    if arr.is_empty() {
+        return Ok("'{}'".to_string());
+    }
+
     let mut parts = Vec::with_capacity(arr.len());
     for elem in arr {
         let part = match elem {
