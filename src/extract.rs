@@ -1325,7 +1325,7 @@ impl<'a> FromSql<'a> for Polygon {
             .into());
         }
         let mut points = Vec::with_capacity(num_points);
-        for chunk in raw[4..4 + num_points * 16].chunks_exact(16) {
+        for chunk in raw[4..4 + num_points * 16].as_chunks::<16>().0 {
             points.push(Point::extract(chunk)?);
         }
         Ok(Self { points })
@@ -1389,7 +1389,7 @@ impl<'a> FromSql<'a> for Path {
             .into());
         }
         let mut points = Vec::with_capacity(num_points);
-        for chunk in raw[5..5 + num_points * 16].chunks_exact(16) {
+        for chunk in raw[5..5 + num_points * 16].as_chunks::<16>().0 {
             points.push(Point::extract(chunk)?);
         }
         Ok(Self { flag, points })
