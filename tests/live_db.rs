@@ -1027,3 +1027,107 @@ fn execute_query_decodes_every_currently_supported_type_correctly() {
         );
     }
 }
+
+// Coverage for #82's first type-coverage batch: BIT/VARBIT, MACADDR8, and
+// the system-identifier / object-reference ("Reg") types had no dispatch
+// arm at all in extract.rs, so they previously fell to the string-fallback
+// (which tokio_postgres's String: FromSql rejects for these types) and
+// silently decoded to `null` — the same failure pattern as the already-fixed
+// #39 (MONEY). Verifies each decodes to a real value instead.
+#[test]
+fn execute_query_decodes_bit_network_and_system_identifier_types_correctly() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "DROP TABLE IF EXISTS live_db_type_coverage_2_scratch" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_type_coverage_2_scratch ( \
+                id serial PRIMARY KEY, \
+                c_macaddr8 macaddr8, \
+                c_bit bit(12), \
+                c_varbit varbit(12), \
+                c_xid xid, \
+                c_cid cid, \
+                c_tid tid, \
+                c_xid8 xid8, \
+                c_regproc regproc, \
+                c_regclass regclass, \
+                c_regtype regtype \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_2_scratch VALUES ( \
+                DEFAULT, \
+                '08:00:2b:01:02:03:04:05', \
+                B'101101101101', \
+                B'101101101101', \
+                '123'::xid, \
+                '456'::cid, \
+                '(3,7)', \
+                '9007199254740993'::xid8, \
+                'now'::regproc, \
+                'pg_type'::regclass, \
+                'int4'::regtype \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_2_scratch (id) VALUES (DEFAULT)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT * FROM live_db_type_coverage_2_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let populated = &rows[0];
+    assert_eq!(populated[1], json!("08:00:2b:01:02:03:04:05"), "c_macaddr8");
+    assert_eq!(populated[2], json!("101101101101"), "c_bit");
+    assert_eq!(populated[3], json!("101101101101"), "c_varbit");
+    assert_eq!(populated[4], json!(123), "c_xid");
+    assert_eq!(populated[5], json!(456), "c_cid");
+    assert_eq!(populated[6], json!("(3, 7)"), "c_tid");
+    assert_eq!(populated[7], json!("9007199254740993"), "c_xid8");
+    assert_eq!(populated[8], json!(1299), "c_regproc");
+    assert_eq!(populated[9], json!(1247), "c_regclass");
+    assert_eq!(populated[10], json!(23), "c_regtype");
+
+    let all_null = &rows[1];
+    for (col_idx, col_name) in [
+        (1, "c_macaddr8"),
+        (2, "c_bit"),
+        (3, "c_varbit"),
+        (4, "c_xid"),
+        (5, "c_cid"),
+        (6, "c_tid"),
+        (7, "c_xid8"),
+        (8, "c_regproc"),
+        (9, "c_regclass"),
+        (10, "c_regtype"),
+    ] {
+        assert_eq!(
+            all_null[col_idx],
+            Value::Null,
+            "{col_name} must decode to null when the column is genuinely NULL"
+        );
+    }
+}
