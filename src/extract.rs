@@ -16,6 +16,10 @@ use uuid::Uuid;
 /// JavaScript's Number.MAX_SAFE_INTEGER (2^53 - 1).
 pub(crate) const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
+/// Mirror of [`JS_MAX_SAFE_INTEGER`] for unsigned values (XID8's wire format
+/// is unsigned). Matches the builtin driver's `common/safe_int.rs::JS_MAX_SAFE_UINT`.
+const JS_MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
+
 /// Extract a single column value from a row as a JSON value.
 /// Matches the builtin driver's extraction behavior exactly.
 ///
@@ -102,6 +106,33 @@ fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
             try_extract::<CidrOrInet>(row, index, JsonValue::from)
         }
         ref t if *t == Type::MACADDR => try_extract::<MacAddr>(row, index, JsonValue::from),
+        ref t if *t == Type::MACADDR8 => try_extract::<MacAddr8>(row, index, JsonValue::from),
+        ref t if *t == Type::BIT || *t == Type::VARBIT => {
+            try_extract::<BitOrVarBit>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::XID => try_extract::<Xid>(row, index, JsonValue::from),
+        ref t if *t == Type::CID => try_extract::<Cid>(row, index, JsonValue::from),
+        ref t if *t == Type::TID => try_extract::<Tid>(row, index, JsonValue::from),
+        ref t if *t == Type::XID8 => try_extract::<Xid8>(row, index, JsonValue::from),
+        ref t if *t == Type::REGPROC => try_extract::<RegProc>(row, index, JsonValue::from),
+        ref t if *t == Type::REGPROCEDURE => {
+            try_extract::<RegProcedure>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::REGOPER => try_extract::<RegOper>(row, index, JsonValue::from),
+        ref t if *t == Type::REGOPERATOR => try_extract::<RegOperator>(row, index, JsonValue::from),
+        ref t if *t == Type::REGCLASS => try_extract::<RegClass>(row, index, JsonValue::from),
+        ref t if *t == Type::REGTYPE => try_extract::<RegType>(row, index, JsonValue::from),
+        ref t if *t == Type::REGCONFIG => try_extract::<RegConfig>(row, index, JsonValue::from),
+        ref t if *t == Type::REGDICTIONARY => {
+            try_extract::<RegDictionary>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::REGNAMESPACE => {
+            try_extract::<RegNamespace>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::REGROLE => try_extract::<RegRole>(row, index, JsonValue::from),
+        ref t if *t == Type::REGCOLLATION => {
+            try_extract::<RegCollation>(row, index, JsonValue::from)
+        }
         ref t if *t == Type::OID => try_extract::<u32>(row, index, JsonValue::from),
         ref t if *t == Type::MONEY => try_extract::<Money>(row, index, JsonValue::from),
         // hstore is an extension type (no well-known OID), matched by name like
@@ -232,6 +263,16 @@ fn extract_string_or_null_fallback(row: &Row, index: usize) -> JsonValue {
 /// JSON numbers; larger values become JSON strings to prevent precision loss.
 fn i64_to_json(v: i64) -> JsonValue {
     if v.abs() <= JS_MAX_SAFE_INTEGER {
+        JsonValue::from(v)
+    } else {
+        JsonValue::String(v.to_string())
+    }
+}
+
+/// Safely convert u64 to JSON: mirrors [`i64_to_json`] for XID8's unsigned
+/// wire format. Matches the builtin driver's `common/safe_int.rs::u64_to_json`.
+fn u64_to_json(v: u64) -> JsonValue {
+    if v <= JS_MAX_SAFE_UINT {
         JsonValue::from(v)
     } else {
         JsonValue::String(v.to_string())
@@ -533,6 +574,57 @@ fn extract_element_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
             .map(JsonValue::from)
             .unwrap_or(JsonValue::Null),
         _ if *ty == Type::MACADDR => MacAddr::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::MACADDR8 => MacAddr8::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::BIT || *ty == Type::VARBIT => BitOrVarBit::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::XID => Xid::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::CID => Cid::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::TID => Tid::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::XID8 => Xid8::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGPROC => RegProc::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGPROCEDURE => RegProcedure::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGOPER => RegOper::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGOPERATOR => RegOperator::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGCLASS => RegClass::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGTYPE => RegType::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGCONFIG => RegConfig::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGDICTIONARY => RegDictionary::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGNAMESPACE => RegNamespace::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGROLE => RegRole::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGCOLLATION => RegCollation::from_sql(ty, buf)
             .map(JsonValue::from)
             .unwrap_or(JsonValue::Null),
         _ if *ty == Type::MONEY => Money::from_sql(ty, buf)
@@ -857,5 +949,204 @@ impl From<MacAddr> for JsonValue {
             "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             v.bytes[0], v.bytes[1], v.bytes[2], v.bytes[3], v.bytes[4], v.bytes[5]
         ))
+    }
+}
+
+/// MACADDR8 (EUI-64): exactly 8 raw bytes. Matches
+/// `extract/advanced_types.rs::MacAddr8`.
+pub(crate) struct MacAddr8 {
+    bytes: [u8; 8],
+}
+
+impl<'a> FromSql<'a> for MacAddr8 {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 8 {
+            return Err(format!("expected 8 bytes for MACADDR8, got {}", raw.len()).into());
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(raw);
+        Ok(Self { bytes })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::MACADDR8
+    }
+}
+
+impl From<MacAddr8> for JsonValue {
+    fn from(v: MacAddr8) -> Self {
+        JsonValue::String(format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            v.bytes[0],
+            v.bytes[1],
+            v.bytes[2],
+            v.bytes[3],
+            v.bytes[4],
+            v.bytes[5],
+            v.bytes[6],
+            v.bytes[7]
+        ))
+    }
+}
+
+/// BIT/VARBIT: 4-byte bit count, then the packed bits (padded to a byte
+/// boundary), formatted as a string of '0'/'1' characters. Matches
+/// `extract/advanced_types.rs::BitOrVarBit`.
+pub(crate) struct BitOrVarBit {
+    bits: String,
+}
+
+impl<'a> FromSql<'a> for BitOrVarBit {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err(format!(
+                "expected at least 4 bytes for BIT/VARBIT, got {}",
+                raw.len()
+            )
+            .into());
+        }
+
+        let bits_num = i32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        let mut bits_len = bits_num / 8;
+        let remainder = bits_num % 8;
+        if remainder > 0 {
+            bits_len += 1;
+        }
+
+        if raw.len() < 4 + bits_len {
+            return Err(format!(
+                "expected at least {} bytes for BIT/VARBIT, got {}",
+                4 + bits_len,
+                raw.len()
+            )
+            .into());
+        }
+
+        if bits_len == 0 {
+            return Ok(Self {
+                bits: String::new(),
+            });
+        }
+
+        let mut bits = String::with_capacity(bits_num);
+        for b in &raw[4..4 + bits_len - 1] {
+            bits.push_str(&format!("{:08b}", b));
+        }
+
+        let last_byte = format!("{:08b}", raw[4 + bits_len - 1]);
+        if remainder > 0 {
+            // Remove the zero-padding PostgreSQL appends to fill the last byte.
+            bits.push_str(&last_byte[..remainder]);
+        } else {
+            bits.push_str(&last_byte);
+        }
+
+        Ok(Self { bits })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::BIT || *ty == Type::VARBIT
+    }
+}
+
+impl From<BitOrVarBit> for JsonValue {
+    fn from(v: BitOrVarBit) -> Self {
+        JsonValue::String(v.bits)
+    }
+}
+
+/// System-identifier and object-reference ("Reg") types are all plain u32
+/// OIDs under the hood. Matches the builtin driver's `advanced_types.rs`
+/// `u32_wrapper!` macro — introduced here (the plugin's only macro) rather
+/// than hand-writing eleven near-identical structs.
+macro_rules! u32_oid_wrapper {
+    ($name:ident, $pg_type:ident) => {
+        pub(crate) struct $name(u32);
+
+        impl<'a> FromSql<'a> for $name {
+            fn from_sql(
+                ty: &Type,
+                raw: &[u8],
+            ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+                Ok(Self(<u32 as FromSql>::from_sql(ty, raw)?))
+            }
+
+            fn accepts(ty: &Type) -> bool {
+                *ty == Type::$pg_type
+            }
+        }
+
+        impl From<$name> for JsonValue {
+            fn from(v: $name) -> Self {
+                JsonValue::from(v.0)
+            }
+        }
+    };
+}
+
+u32_oid_wrapper!(Xid, XID);
+u32_oid_wrapper!(Cid, CID);
+u32_oid_wrapper!(RegProc, REGPROC);
+u32_oid_wrapper!(RegProcedure, REGPROCEDURE);
+u32_oid_wrapper!(RegOper, REGOPER);
+u32_oid_wrapper!(RegOperator, REGOPERATOR);
+u32_oid_wrapper!(RegClass, REGCLASS);
+u32_oid_wrapper!(RegType, REGTYPE);
+u32_oid_wrapper!(RegConfig, REGCONFIG);
+u32_oid_wrapper!(RegDictionary, REGDICTIONARY);
+u32_oid_wrapper!(RegNamespace, REGNAMESPACE);
+u32_oid_wrapper!(RegRole, REGROLE);
+u32_oid_wrapper!(RegCollation, REGCOLLATION);
+
+/// XID8: an 8-byte transaction ID, wire-identical to INT8 but logically
+/// unsigned — reinterpret the bits as u64 and use the same JS-safe-integer
+/// stringification u64 gets. Matches `extract/advanced_types.rs::Xid8`.
+pub(crate) struct Xid8(u64);
+
+impl<'a> FromSql<'a> for Xid8 {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(<i64 as FromSql>::from_sql(ty, raw)? as u64))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::XID8
+    }
+}
+
+impl From<Xid8> for JsonValue {
+    fn from(v: Xid8) -> Self {
+        u64_to_json(v.0)
+    }
+}
+
+/// TID: a tuple identifier — 4-byte block number, 2-byte offset — formatted
+/// as `"(block, offset)"`. Matches `extract/advanced_types.rs::Tid`.
+pub(crate) struct Tid {
+    block_num: u32,
+    offset: u16,
+}
+
+impl<'a> FromSql<'a> for Tid {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 6 {
+            return Err(format!("expected 6 bytes for TID, got {}", raw.len()).into());
+        }
+        Ok(Self {
+            block_num: <u32 as FromSql>::from_sql(&Type::OID, &raw[..4])?,
+            offset: <i16 as FromSql>::from_sql(&Type::INT2, &raw[4..])? as u16,
+        })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::TID
+    }
+}
+
+impl From<Tid> for JsonValue {
+    fn from(v: Tid) -> Self {
+        JsonValue::String(format!("({}, {})", v.block_num, v.offset))
     }
 }
