@@ -803,6 +803,41 @@ fn broken_startup_script_fails_fast_with_clear_attribution() {
     );
 }
 
+// Coverage for #85: preflight_startup_script ran the caller-supplied script
+// with no timeout, so a script that blocks (or a stalled host) wedged pool
+// creation — and therefore every RPC that needs a pool — indefinitely.
+// pg_sleep(35) outlasts the 30-second timeout, so this must fail with a
+// clear "Timed out" message well before 35s, not hang until the script
+// itself finishes.
+#[test]
+fn hung_startup_script_times_out_instead_of_hanging_pool_creation() {
+    let mut plugin = Plugin::spawn();
+    let mut params = conn_params();
+    // Use a startup_script unique to this test so the pool cache key (which
+    // folds in startup_script) can't reuse a pool already validated by
+    // another test — a fresh identity guarantees the preflight actually runs.
+    params["startup_script"] = json!("SELECT pg_sleep(35)");
+
+    let started = std::time::Instant::now();
+    let response = plugin.call("test_connection", json!({ "params": params }));
+    let elapsed = started.elapsed();
+
+    let error = response
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .expect("a hung startup script must produce a JSON-RPC error, not hang forever");
+    assert_eq!(
+        error, "Timed out running PostgreSQL startup script after 30000 ms",
+        "error should clearly attribute the failure to the startup-script timeout"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(33),
+        "preflight should fail at the 30s timeout, not wait for the 35s pg_sleep to finish \
+         (took {elapsed:?})"
+    );
+}
+
 // Coverage for #43: build_pool never called cfg.ssl_mode(...), so
 // tokio_postgres's own default (SslMode::Prefer) applied regardless of the
 // plugin's ssl_mode value, letting ssl_mode=require silently connect over

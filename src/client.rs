@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime, SslMode};
 use tokio_postgres::types::{ToSql, Type};
@@ -426,6 +427,12 @@ fn startup_script_error(err: tokio_postgres::Error) -> String {
     format!("Startup script failed: {}", format_pg_error(&err))
 }
 
+/// The startup-script preflight opens a real network connection, so bound
+/// it: a broken script or a stalled host must never wedge pool creation
+/// indefinitely. Matches the builtin driver's
+/// `POSTGRES_STARTUP_SCRIPT_TIMEOUT_MS` (`src-tauri/src/pool_manager.rs`).
+const STARTUP_SCRIPT_TIMEOUT_MS: u64 = 30_000;
+
 /// Build the `post_create` hook that runs the startup script on every new
 /// pooled connection (matches the builtin driver's `post_create` hook — see
 /// `src-tauri/src/pool_manager.rs`).
@@ -449,6 +456,11 @@ fn startup_script_hook(script: &str) -> deadpool_postgres::Hook {
 /// preflight exists only for early, well-labelled failures — the per-pool
 /// `post_create` hook is the single place the script actually takes effect.
 /// Matches the builtin driver's `run_postgres_startup_script` preflight.
+///
+/// Bounded by [`STARTUP_SCRIPT_TIMEOUT_MS`]: this opens a real network
+/// connection and runs caller-supplied SQL, so a broken script or a stalled
+/// host must never wedge pool creation (and therefore every RPC that needs
+/// a pool) indefinitely.
 async fn preflight_startup_script<T>(cfg: &Config, tls: T, script: &str) -> Result<(), String>
 where
     T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone + Sync + Send + 'static,
@@ -459,6 +471,31 @@ where
     let pg_config = cfg
         .get_pg_config()
         .map_err(|e| format!("Pool creation failed: {e}"))?;
+    let timeout = Duration::from_millis(STARTUP_SCRIPT_TIMEOUT_MS);
+    tokio::time::timeout(
+        timeout,
+        run_startup_script_preflight(pg_config, tls, script),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out running PostgreSQL startup script after {} ms",
+            timeout.as_millis()
+        )
+    })?
+}
+
+async fn run_startup_script_preflight<T>(
+    pg_config: tokio_postgres::Config,
+    tls: T,
+    script: &str,
+) -> Result<(), String>
+where
+    T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone + Sync + Send + 'static,
+    T::Stream: Sync + Send,
+    T::TlsConnect: Sync + Send,
+    <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
+{
     let (mut client, connection) = pg_config
         .connect(tls)
         .await
