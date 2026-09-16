@@ -1199,3 +1199,114 @@ fn execute_query_decodes_arrays_of_the_new_system_identifier_types_correctly() {
         "c_xid8_arr (one past JS_MAX_SAFE_INTEGER, must stringify)"
     );
 }
+
+// Coverage for #82's second additive batch: POINT/LSEG/BOX/POLYGON/PATH/
+// LINE/CIRCLE had no dispatch arm in either extract_simple_kind (scalar
+// columns) or extract_element_from_bytes (array elements), so they fell to
+// the string-or-null fallback and silently decoded to `null` — both as
+// scalars and as array elements.
+#[test]
+fn execute_query_decodes_geometric_types_correctly_scalar_and_array() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "DROP TABLE IF EXISTS live_db_type_coverage_4_scratch" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_type_coverage_4_scratch ( \
+                id serial PRIMARY KEY, \
+                c_point point, \
+                c_lseg lseg, \
+                c_box box, \
+                c_polygon polygon, \
+                c_path_closed path, \
+                c_path_open path, \
+                c_line line, \
+                c_circle circle, \
+                c_point_arr point[] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_4_scratch VALUES ( \
+                DEFAULT, \
+                '(1.5, 2.5)', \
+                '((1,1),(4,4))', \
+                '((3,3),(1,1))', \
+                '((0,0),(1,0),(1,1),(0,1))', \
+                '((0,0),(1,1),(2,0))', \
+                '[(0,0),(1,1),(2,0)]', \
+                '{1,-2,3}', \
+                '<(1,1),5>', \
+                ARRAY['(1,1)'::point, '(2,2)'::point] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_4_scratch (id) VALUES (DEFAULT)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT * FROM live_db_type_coverage_4_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let populated = &rows[0];
+    assert_eq!(populated[1], json!("(1.5, 2.5)"), "c_point");
+    assert_eq!(populated[2], json!("[(1, 1), (4, 4)]"), "c_lseg");
+    assert_eq!(populated[3], json!("((3, 3), (1, 1))"), "c_box");
+    assert_eq!(
+        populated[4],
+        json!("((0, 0), (1, 0), (1, 1), (0, 1))"),
+        "c_polygon"
+    );
+    assert_eq!(
+        populated[5],
+        json!("((0, 0), (1, 1), (2, 0))"),
+        "c_path_closed"
+    );
+    assert_eq!(
+        populated[6],
+        json!("[(0, 0), (1, 1), (2, 0)]"),
+        "c_path_open"
+    );
+    assert_eq!(populated[7], json!("{1, -2, 3}"), "c_line");
+    assert_eq!(populated[8], json!("<(1, 1), 5>"), "c_circle");
+    assert_eq!(populated[9], json!(["(1, 1)", "(2, 2)"]), "c_point_arr");
+
+    let all_null = &rows[1];
+    for (col_idx, col_name) in [
+        (1, "c_point"),
+        (2, "c_lseg"),
+        (3, "c_box"),
+        (4, "c_polygon"),
+        (5, "c_path_closed"),
+        (6, "c_path_open"),
+        (7, "c_line"),
+        (8, "c_circle"),
+        (9, "c_point_arr"),
+    ] {
+        assert_eq!(
+            all_null[col_idx],
+            Value::Null,
+            "{col_name} must decode to null when the column is genuinely NULL"
+        );
+    }
+}
