@@ -10,8 +10,8 @@
 //! `extract/enum.rs::extract_or_null`.
 
 use crate::extract::{
-    ArrayValue, BitOrVarBit, Cid, EnumLabel, MacAddr8, Money, RegClass, RegProc, RegType, Tid, Xid,
-    Xid8,
+    ArrayValue, BitOrVarBit, Cid, Circle, EnumLabel, Line, Lseg, MacAddr8, Money, Path, PgBox,
+    Point, Polygon, RegClass, RegProc, RegType, Tid, Xid, Xid8,
 };
 use std::collections::HashMap;
 use tokio_postgres::types::{FromSql, Kind, Type};
@@ -565,4 +565,260 @@ fn reg_type_accepts_rejects_mismatched_types() {
     assert!(RegProc::accepts(&Type::REGPROC));
     assert!(!RegProc::accepts(&Type::REGCLASS));
     assert!(!RegProc::accepts(&Type::OID));
+}
+
+// Geometric types — wire bytes below were captured from a real PostgreSQL
+// 16 instance (not hand-derived from the format spec), same as the
+// BIT/network/system-identifier batch. Before this fix, POINT/LSEG/BOX/
+// POLYGON/PATH/LINE/CIRCLE had no dispatch arm at all in extract.rs, so
+// they fell to the string-or-null fallback and silently decoded to `null`.
+
+#[test]
+fn point_decodes_two_f64_coordinates() {
+    // `'(1.5, 2.5)'::point`
+    let bytes = [
+        63, 248, 0, 0, 0, 0, 0, 0, // 1.5
+        64, 4, 0, 0, 0, 0, 0, 0, // 2.5
+    ];
+    let v = Point::from_sql(&Type::POINT, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("(1.5, 2.5)"));
+}
+
+#[test]
+fn point_decodes_negative_coordinates() {
+    // `'(-1.25, -2.75)'::point`
+    let bytes = [
+        191, 244, 0, 0, 0, 0, 0, 0, // -1.25
+        192, 6, 0, 0, 0, 0, 0, 0, // -2.75
+    ];
+    let v = Point::from_sql(&Type::POINT, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("(-1.25, -2.75)")
+    );
+}
+
+#[test]
+fn point_rejects_wrong_length() {
+    assert!(Point::from_sql(&Type::POINT, &[0; 8]).is_err());
+    assert!(Point::from_sql(&Type::POINT, &[0; 24]).is_err());
+}
+
+#[test]
+fn point_accepts_rejects_other_types() {
+    assert!(Point::accepts(&Type::POINT));
+    assert!(!Point::accepts(&Type::LSEG));
+}
+
+#[test]
+fn lseg_decodes_two_consecutive_points() {
+    // `'((1,1),(4,4))'::lseg`
+    let bytes = [
+        63, 240, 0, 0, 0, 0, 0, 0, // 1.0
+        63, 240, 0, 0, 0, 0, 0, 0, // 1.0
+        64, 16, 0, 0, 0, 0, 0, 0, // 4.0
+        64, 16, 0, 0, 0, 0, 0, 0, // 4.0
+    ];
+    let v = Lseg::from_sql(&Type::LSEG, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("[(1, 1), (4, 4)]")
+    );
+}
+
+#[test]
+fn lseg_rejects_wrong_length() {
+    assert!(Lseg::from_sql(&Type::LSEG, &[0; 16]).is_err());
+}
+
+#[test]
+fn box_decodes_upper_right_and_lower_left_points() {
+    // `'((3,3),(1,1))'::box` — PostgreSQL normalizes the corners so the
+    // first point is always the upper-right one, regardless of input order.
+    let bytes = [
+        64, 8, 0, 0, 0, 0, 0, 0, // 3.0
+        64, 8, 0, 0, 0, 0, 0, 0, // 3.0
+        63, 240, 0, 0, 0, 0, 0, 0, // 1.0
+        63, 240, 0, 0, 0, 0, 0, 0, // 1.0
+    ];
+    let v = PgBox::from_sql(&Type::BOX, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("((3, 3), (1, 1))")
+    );
+}
+
+#[test]
+fn box_rejects_wrong_length() {
+    assert!(PgBox::from_sql(&Type::BOX, &[0; 16]).is_err());
+}
+
+#[test]
+fn polygon_decodes_a_variable_point_count() {
+    // `'((0,0),(1,0),(1,1),(0,1))'::polygon`
+    let mut bytes = vec![0, 0, 0, 4]; // 4 points
+    for (x, y) in [(0.0_f64, 0.0_f64), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&y.to_be_bytes());
+    }
+    let v = Polygon::from_sql(&Type::POLYGON, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("((0, 0), (1, 0), (1, 1), (0, 1))")
+    );
+}
+
+#[test]
+fn polygon_with_a_single_point_has_no_comma_separator() {
+    // PostgreSQL's minimum polygon has 1 point (there is no true "empty
+    // polygon" literal) — the join-with-", "-between-elements logic must
+    // not emit a leading/trailing separator for a single-element polygon.
+    let bytes = [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let v = Polygon::from_sql(&Type::POLYGON, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("((0, 0))"));
+}
+
+#[test]
+fn polygon_with_zero_points_decodes_to_empty_parens() {
+    // Not reachable through a real INSERT (Postgres rejects 0-point
+    // polygons), but the decoder is defensive rather than assuming the
+    // server always sends a well-formed value.
+    let bytes = [0, 0, 0, 0];
+    let v = Polygon::from_sql(&Type::POLYGON, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("()"));
+}
+
+#[test]
+fn polygon_rejects_negative_point_count() {
+    let bytes = (-1_i32).to_be_bytes();
+    assert!(Polygon::from_sql(&Type::POLYGON, &bytes).is_err());
+}
+
+#[test]
+fn path_closed_uses_parentheses() {
+    // `'((0,0),(1,1),(2,0))'::path` — closed path, flag bit 0 set.
+    let mut bytes = vec![1, 0, 0, 0, 3]; // flag=1 (closed), 3 points
+    for (x, y) in [(0.0_f64, 0.0_f64), (1.0, 1.0), (2.0, 0.0)] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&y.to_be_bytes());
+    }
+    let v = Path::from_sql(&Type::PATH, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("((0, 0), (1, 1), (2, 0))")
+    );
+}
+
+#[test]
+fn path_open_uses_square_brackets() {
+    // `'[(0,0),(1,1),(2,0)]'::path` — open path, flag bit 0 clear.
+    let mut bytes = vec![0, 0, 0, 0, 3]; // flag=0 (open), 3 points
+    for (x, y) in [(0.0_f64, 0.0_f64), (1.0, 1.0), (2.0, 0.0)] {
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&y.to_be_bytes());
+    }
+    let v = Path::from_sql(&Type::PATH, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(v),
+        serde_json::json!("[(0, 0), (1, 1), (2, 0)]")
+    );
+}
+
+#[test]
+fn path_with_a_single_point_has_no_comma_separator() {
+    let bytes = [
+        1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let v = Path::from_sql(&Type::PATH, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("((0, 0))"));
+}
+
+#[test]
+fn path_rejects_negative_point_count() {
+    let mut bytes = vec![1];
+    bytes.extend_from_slice(&(-1_i32).to_be_bytes());
+    assert!(Path::from_sql(&Type::PATH, &bytes).is_err());
+}
+
+#[test]
+fn line_decodes_three_coefficients() {
+    // `'{1,-2,3}'::line`
+    let bytes = [
+        63, 240, 0, 0, 0, 0, 0, 0, // 1.0
+        192, 0, 0, 0, 0, 0, 0, 0, // -2.0
+        64, 8, 0, 0, 0, 0, 0, 0, // 3.0
+    ];
+    let v = Line::from_sql(&Type::LINE, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("{1, -2, 3}"));
+}
+
+#[test]
+fn line_rejects_wrong_length() {
+    assert!(Line::from_sql(&Type::LINE, &[0; 16]).is_err());
+}
+
+#[test]
+fn circle_decodes_center_point_and_radius() {
+    // `'<(1,1),5>'::circle`
+    let bytes = [
+        63, 240, 0, 0, 0, 0, 0, 0, // center x = 1.0
+        63, 240, 0, 0, 0, 0, 0, 0, // center y = 1.0
+        64, 20, 0, 0, 0, 0, 0, 0, // radius = 5.0
+    ];
+    let v = Circle::from_sql(&Type::CIRCLE, &bytes).unwrap();
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("<(1, 1), 5>"));
+}
+
+#[test]
+fn circle_rejects_wrong_length() {
+    assert!(Circle::from_sql(&Type::CIRCLE, &[0; 16]).is_err());
+}
+
+#[test]
+fn geometric_types_accepts_do_not_cross_match_each_other() {
+    // All seven share the same underlying f64/Point building blocks — this
+    // guards against an accepts() copy-paste bug routing one geometric
+    // type's wire bytes through another's parser.
+    assert!(!Lseg::accepts(&Type::BOX));
+    assert!(!PgBox::accepts(&Type::LSEG));
+    assert!(!Polygon::accepts(&Type::PATH));
+    assert!(!Path::accepts(&Type::POLYGON));
+    assert!(!Line::accepts(&Type::CIRCLE));
+    assert!(!Circle::accepts(&Type::LINE));
+    assert!(!Point::accepts(&Type::CIRCLE));
+}
+
+// Array-element coverage for the same seven types (a separate dispatch
+// table from the scalar decoder above — see the BIT/network/system-
+// identifier batch, where this exact gap was found and fixed after the
+// scalar-only fix shipped first).
+
+#[test]
+fn point_array_decodes_each_element() {
+    let ty = array_type(Type::POINT);
+    let p1 = [63, 240, 0, 0, 0, 0, 0, 0, 63, 240, 0, 0, 0, 0, 0, 0]; // (1, 1)
+    let p2 = [64, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0]; // (2, 2)
+    let bytes = array_wire_bytes(Type::POINT.oid(), &[Some(&p1), Some(&p2)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["(1, 1)", "(2, 2)"]));
+}
+
+#[test]
+fn polygon_array_decodes_each_element() {
+    let ty = array_type(Type::POLYGON);
+    let square = [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // single point (0,0)
+    let bytes = array_wire_bytes(Type::POLYGON.oid(), &[Some(&square)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["((0, 0))"]));
+}
+
+#[test]
+fn circle_array_decodes_each_element() {
+    let ty = array_type(Type::CIRCLE);
+    let c = [
+        63, 240, 0, 0, 0, 0, 0, 0, 63, 240, 0, 0, 0, 0, 0, 0, 64, 20, 0, 0, 0, 0, 0, 0,
+    ];
+    let bytes = array_wire_bytes(Type::CIRCLE.oid(), &[Some(&c)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["<(1, 1), 5>"]));
 }
