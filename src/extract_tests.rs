@@ -1284,6 +1284,39 @@ fn internal_statistics_blob_types_decode_and_accept_correctly() {
 }
 
 #[test]
+fn internal_statistics_blob_types_truncate_a_large_buffer_to_the_preview_cap() {
+    // #106: binary_blob_wrapper! had its own untruncated copy of the BLOB:
+    // encoding, independently drifted from the Type::BYTEA arm #87 fixed.
+    // A large value for any of these internal-stats types must also be
+    // capped at MAX_BLOB_PREVIEW_SIZE, with the header still reporting the
+    // true size -- same contract as an ordinary BYTEA column.
+    let large_buf = vec![0x37u8; 20 * 1024]; // 20 KB, over the 10 KB cap
+
+    let v = PgNdistinct::from_sql(&Type::PG_NDISTINCT, &large_buf).unwrap();
+    let serde_json::Value::String(wire) = serde_json::Value::from(v) else {
+        panic!("expected a string");
+    };
+    let header_prefix = format!("BLOB:{}:", large_buf.len());
+    assert!(
+        wire.starts_with(&header_prefix),
+        "header must report the true size (20480), not the truncated preview size: {wire}"
+    );
+    let mime_and_b64 = &wire[header_prefix.len()..];
+    let (_, b64_payload) = mime_and_b64.split_once(':').unwrap();
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_payload).unwrap();
+    assert_eq!(
+        decoded.len(),
+        crate::utils::blob::MAX_BLOB_PREVIEW_SIZE,
+        "base64 payload must be truncated to the preview cap, not the full 20480 bytes"
+    );
+    assert_eq!(
+        decoded,
+        large_buf[..crate::utils::blob::MAX_BLOB_PREVIEW_SIZE]
+    );
+}
+
+#[test]
 fn tsvector_array_decodes_each_element() {
     let ty = array_type(Type::TS_VECTOR);
     let single_lexeme: [u8; 12] = [0, 0, 0, 1, 104, 105, 0, 0, 1, 0, 1, 0]; // 'hi':1
