@@ -215,6 +215,62 @@ fn hstore_array_decodes_each_element_as_a_json_object() {
     assert_eq!(array.0, serde_json::json!([{"a": "1"}, {"b": "2"}]));
 }
 
+// Coverage for a gap found during a thoroughness pass on #82: the array
+// decoder (`extract_element_from_bytes`) is a *separate* per-element
+// dispatch table from the scalar dispatch (`extract_simple_kind`) — adding
+// a type to one does not automatically cover it in the other. The scalar
+// fix alone left `xid[]`/`macaddr8[]`/`bit[]`/`regclass[]` (and every other
+// new #82 type) still decoding every array element to `null`, confirmed
+// live against a real PostgreSQL instance before this fix.
+
+#[test]
+fn xid_array_decodes_each_element_as_a_number() {
+    let ty = array_type(Type::XID);
+    let bytes = array_wire_bytes(
+        Type::XID.oid(),
+        &[Some(&1_u32.to_be_bytes()), Some(&2_u32.to_be_bytes())],
+    );
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!([1, 2]));
+}
+
+#[test]
+fn macaddr8_array_decodes_each_element_as_a_formatted_string() {
+    let ty = array_type(Type::MACADDR8);
+    let addr = [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03, 0x04, 0x05];
+    let bytes = array_wire_bytes(Type::MACADDR8.oid(), &[Some(&addr)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["08:00:2b:01:02:03:04:05"]));
+}
+
+#[test]
+fn bit_array_decodes_each_element_as_a_bit_string() {
+    let ty = array_type(Type::BIT);
+    let bits_a = [0, 0, 0, 4, 0b1010_0000]; // B'1010', padded
+    let bits_b = [0, 0, 0, 4, 0b0101_0000]; // B'0101', padded
+    let bytes = array_wire_bytes(Type::BIT.oid(), &[Some(&bits_a), Some(&bits_b)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!(["1010", "0101"]));
+}
+
+#[test]
+fn regclass_array_decodes_each_element_as_its_oid() {
+    let ty = array_type(Type::REGCLASS);
+    let bytes = array_wire_bytes(Type::REGCLASS.oid(), &[Some(&1247_u32.to_be_bytes())]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!([1247]));
+}
+
+#[test]
+fn xid8_array_decodes_each_element_respecting_the_js_safe_integer_boundary() {
+    let ty = array_type(Type::XID8);
+    let small = 42_i64.to_be_bytes();
+    let large = 9_007_199_254_740_993_i64.to_be_bytes();
+    let bytes = array_wire_bytes(Type::XID8.oid(), &[Some(&small), Some(&large)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    assert_eq!(array.0, serde_json::json!([42, "9007199254740993"]));
+}
+
 #[test]
 fn numeric_array_decodes_via_the_extract_simple_from_bytes_fallback() {
     // INT8 isn't one of extract_element_from_bytes's explicit arms, so this

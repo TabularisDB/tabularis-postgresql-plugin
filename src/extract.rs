@@ -576,6 +576,57 @@ fn extract_element_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
         _ if *ty == Type::MACADDR => MacAddr::from_sql(ty, buf)
             .map(JsonValue::from)
             .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::MACADDR8 => MacAddr8::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::BIT || *ty == Type::VARBIT => BitOrVarBit::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::XID => Xid::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::CID => Cid::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::TID => Tid::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::XID8 => Xid8::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGPROC => RegProc::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGPROCEDURE => RegProcedure::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGOPER => RegOper::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGOPERATOR => RegOperator::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGCLASS => RegClass::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGTYPE => RegType::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGCONFIG => RegConfig::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGDICTIONARY => RegDictionary::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGNAMESPACE => RegNamespace::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGROLE => RegRole::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REGCOLLATION => RegCollation::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
         _ if *ty == Type::MONEY => Money::from_sql(ty, buf)
             .map(JsonValue::from)
             .unwrap_or(JsonValue::Null),
