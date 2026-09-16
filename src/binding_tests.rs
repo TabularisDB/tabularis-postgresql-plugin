@@ -366,6 +366,120 @@ mod bind_pg_value_tests {
 
         assert!(err.contains("hstore"));
     }
+
+    #[test]
+    fn vector_column_binds_as_inline_cast_not_array_literal() {
+        let options = BindOptions {
+            column_type: Some("vector"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: None,
+        };
+        let bound = bind_pg_value(json!("[1,2,3]"), 1, &options).unwrap();
+
+        assert_eq!(bound.sql, "'[1,2,3]'::vector");
+        assert!(bound.param.is_none());
+    }
+
+    #[test]
+    fn halfvec_column_binds_as_inline_cast() {
+        let options = BindOptions {
+            column_type: Some("halfvec"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: None,
+        };
+        let bound = bind_pg_value(json!("[1,2,3]"), 1, &options).unwrap();
+
+        assert_eq!(bound.sql, "'[1,2,3]'::halfvec");
+    }
+
+    #[test]
+    fn sparsevec_column_binds_as_inline_cast() {
+        let options = BindOptions {
+            column_type: Some("sparsevec"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: None,
+        };
+        let bound = bind_pg_value(json!("{1:1,3:2}/5"), 1, &options).unwrap();
+
+        assert_eq!(bound.sql, "'{1:1,3:2}/5'::sparsevec");
+    }
+
+    #[test]
+    fn vector_column_rejects_non_numeric_literal() {
+        let options = BindOptions {
+            column_type: Some("vector"),
+            enum_type: None,
+            allow_default: false,
+            hstore_oid: None,
+        };
+        let err = bind_pg_value(json!("'; DROP TABLE users; --"), 1, &options).unwrap_err();
+
+        assert!(err.contains("Invalid vector value"));
+    }
+
+    #[test]
+    fn non_vector_column_with_bracket_string_still_binds_as_array_literal() {
+        let bound = bind_pg_value(json!("[1,2,3]"), 1, &BindOptions::default()).unwrap();
+
+        assert_eq!(bound.sql, "ARRAY[1, 2, 3]");
+    }
+
+    #[test]
+    fn raw_st_function_call_is_inlined_verbatim_with_no_parameter() {
+        let bound = bind_pg_value(
+            json!("ST_GeomFromText('POINT(1 2)', 4326)"),
+            1,
+            &BindOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bound.sql, "ST_GeomFromText('POINT(1 2)', 4326)");
+        assert!(bound.param.is_none());
+    }
+
+    #[test]
+    fn legacy_geomfromtext_call_is_inlined_verbatim() {
+        let bound = bind_pg_value(
+            json!("GeomFromText('POINT(1 2)', 4326)"),
+            1,
+            &BindOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bound.sql, "GeomFromText('POINT(1 2)', 4326)");
+        assert!(bound.param.is_none());
+    }
+
+    #[test]
+    fn wkt_point_literal_binds_via_st_geomfromtext() {
+        let bound = bind_pg_value(json!("POINT(1 2)"), 1, &BindOptions::default()).unwrap();
+
+        assert_eq!(bound.sql, "ST_GeomFromText($1)");
+        assert!(bound.param.is_some());
+    }
+
+    #[test]
+    fn wkt_polygon_literal_binds_via_st_geomfromtext() {
+        let bound = bind_pg_value(
+            json!("POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))"),
+            1,
+            &BindOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bound.sql, "ST_GeomFromText($1)");
+    }
+
+    #[test]
+    fn plain_text_matching_neither_vector_nor_wkt_falls_through_to_text() {
+        let bound = bind_pg_value(json!("hello world"), 1, &BindOptions::default()).unwrap();
+
+        assert_eq!(bound.sql, "$1");
+        assert!(bound.param.is_some());
+    }
 }
 
 mod bind_pk_value_tests {
