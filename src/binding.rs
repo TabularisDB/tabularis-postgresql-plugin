@@ -223,7 +223,17 @@ fn bind_pg_string(
         });
     }
 
-    // 2. Blob wire format — must run before the boolean/numeric heuristics
+    // 2. pgvector column (`vector`/`halfvec`/`sparsevec`) — must run before
+    // the blob/array heuristics below: "[1,2,3]" would otherwise be turned
+    // into a PostgreSQL ARRAY[...] literal by the array-literal step, and
+    // pgvector has no text->vector cast for a bound parameter.
+    if let Some(bt) = base_type {
+        if let Some(bound) = bind_pg_vector_string(s, bt) {
+            return bound;
+        }
+    }
+
+    // 3. Blob wire format — must run before the boolean/numeric heuristics
     // below, since a base64 blob string could otherwise look like a
     // plausible (if garbage) numeric/boolean value for a mistyped column.
     if let Some(bytes) = decode_blob_wire_format(s) {
@@ -233,14 +243,14 @@ fn bind_pg_string(
         });
     }
 
-    // 3. Enum column — always coerces through its own type. Any of the later
+    // 4. Enum column — always coerces through its own type. Any of the later
     // shape-based heuristics (uuid-shaped, array-shaped strings) would
     // otherwise misinterpret a label that merely looks like one of those.
     if let Some(enum_type) = options.enum_type {
         return Ok(bind_pg_enum_string(s, enum_type, placeholder_idx));
     }
 
-    // 4. Boolean column
+    // 5. Boolean column
     if matches!(base_type, Some("BOOLEAN") | Some("BOOL")) {
         let lower = s.trim().to_lowercase();
         let b = match lower.as_str() {
@@ -259,21 +269,41 @@ fn bind_pg_string(
         });
     }
 
-    // 5. Numeric column
+    // 6. Numeric column
     if let Some(bt) = base_type {
         if let Some(bound) = bind_pg_numeric_string(s, bt, placeholder_idx) {
             return bound;
         }
     }
 
-    // 6. Temporal column
+    // 7. Temporal column
     if let Some(bt) = base_type {
         if let Some(bound) = bind_pg_temporal_string(s, bt, placeholder_idx) {
             return bound;
         }
     }
 
-    // 7. UUID shape (value-based fallback, independent of column type)
+    // 8. Raw SQL function passthrough (e.g. `ST_GeomFromText('POINT(1 2)', 4326)`)
+    // — inlined verbatim, no bound parameter, so the function actually
+    // executes server-side instead of being stored as its literal text.
+    if is_raw_sql_function(s) {
+        return Ok(BoundValue {
+            sql: s.to_string(),
+            param: None,
+        });
+    }
+
+    // 9. WKT geometry literal (e.g. `POINT(1 2)`) — wrapped in
+    // `ST_GeomFromText($N)` so PostGIS parses it into a geometry instead of
+    // storing the raw WKT text.
+    if is_wkt_geometry(s) {
+        return Ok(BoundValue {
+            sql: format!("ST_GeomFromText(${})", placeholder_idx),
+            param: Some((Box::new(s.to_string()), Type::TEXT)),
+        });
+    }
+
+    // 10. UUID shape (value-based fallback, independent of column type)
     if s.parse::<Uuid>().is_ok() {
         return Ok(BoundValue {
             sql: format!("CAST(${} AS uuid)", placeholder_idx),
@@ -281,7 +311,7 @@ fn bind_pg_string(
         });
     }
 
-    // 8. PG array literal (JSON array embedded in a string, e.g. "[1,2,3]")
+    // 11. PG array literal (JSON array embedded in a string, e.g. "[1,2,3]")
     let trimmed = s.trim();
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(trimmed) {
@@ -293,7 +323,7 @@ fn bind_pg_string(
         }
     }
 
-    // 9. Final fallback: plain TEXT
+    // 12. Final fallback: plain TEXT
     Ok(BoundValue {
         sql: format!("${}", placeholder_idx),
         param: Some((Box::new(s.to_string()), Type::TEXT)),
@@ -310,6 +340,81 @@ fn bind_pg_enum_string(s: &str, qualified_enum: &str, placeholder_idx: usize) ->
         sql: format!("CAST(${} AS {})", placeholder_idx, qualified_enum),
         param: Some((Box::new(s.to_string()), Type::TEXT)),
     }
+}
+
+/// Bind a value into a pgvector column (`vector`, `halfvec`, `sparsevec`).
+///
+/// pgvector registers no `text -> vector` cast, so a bound TEXT parameter —
+/// even via `CAST($N AS vector)` — is rejected by PostgreSQL. The literal
+/// only reaches the type's input function when it arrives as an
+/// *unknown*-typed literal, so it's inlined as `'<value>'::<type>`. To keep
+/// that safe, the value is validated against a strict allow-list of
+/// characters that make up a vector literal; a non-pgvector column returns
+/// `None` so the caller falls through to its normal binding logic. Ported
+/// from the builtin driver's `bind_pg_vector_string`.
+fn bind_pg_vector_string(s: &str, base_type: &str) -> Option<Result<BoundValue, String>> {
+    let pg_type = match base_type {
+        "VECTOR" => "vector",
+        "HALFVEC" => "halfvec",
+        "SPARSEVEC" => "sparsevec",
+        _ => return None,
+    };
+
+    let trimmed = s.trim();
+
+    // Characters that can legitimately appear in a vector / halfvec /
+    // sparsevec literal: digits, sign, decimal point, exponent marker, the
+    // bracket/brace delimiters, element separators, the sparsevec index
+    // (':') and dimension ('/') separators, and whitespace. Anything else
+    // cannot be inlined safely.
+    let is_vector_literal = !trimmed.is_empty()
+        && trimmed.chars().all(|c| {
+            c.is_ascii_digit()
+                || matches!(
+                    c,
+                    '+' | '-' | '.' | 'e' | 'E' | '[' | ']' | '{' | '}' | ',' | ':' | '/' | ' '
+                )
+        });
+
+    if !is_vector_literal {
+        return Some(Err(format!(
+            "Invalid {pg_type} value: expected a numeric vector literal such as [1,2,3]"
+        )));
+    }
+
+    Some(Ok(BoundValue {
+        sql: format!("'{trimmed}'::{pg_type}"),
+        param: None,
+    }))
+}
+
+/// Detect a raw SQL function call (e.g. `ST_GeomFromText(...)`) entered as a
+/// cell value — used to insert the call directly into the query text instead
+/// of binding it as a parameter. Ported from the builtin driver's
+/// `is_raw_sql_function`.
+fn is_raw_sql_function(s: &str) -> bool {
+    let trimmed = s.trim().to_uppercase();
+    if trimmed.starts_with("ST_") {
+        return trimmed.contains('(');
+    }
+    trimmed.starts_with("GEOMFROMTEXT(")
+        || trimmed.starts_with("GEOMFROMWKB(")
+        || trimmed.starts_with("POINTFROMTEXT(")
+        || trimmed.starts_with("POINTFROMWKB(")
+}
+
+/// Detect a WKT (Well-Known Text) geometry literal (e.g. `POINT(1 2)`).
+/// Ported from the builtin driver's `is_wkt_geometry`.
+fn is_wkt_geometry(s: &str) -> bool {
+    let s_upper = s.trim().to_uppercase();
+    s_upper.starts_with("POINT(")
+        || s_upper.starts_with("LINESTRING(")
+        || s_upper.starts_with("POLYGON(")
+        || s_upper.starts_with("MULTIPOINT(")
+        || s_upper.starts_with("MULTILINESTRING(")
+        || s_upper.starts_with("MULTIPOLYGON(")
+        || s_upper.starts_with("GEOMETRYCOLLECTION(")
+        || s_upper.starts_with("GEOMETRY(")
 }
 
 /// Decode the canonical BLOB wire format back to raw bytes.
