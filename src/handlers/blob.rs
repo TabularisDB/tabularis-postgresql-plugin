@@ -60,7 +60,10 @@ pub async fn fetch_blob_as_data_url(id: Value, params: &Value) -> Value {
         .unwrap_or_default();
 
     match fetch_blob_bytes(&conn_params, table, col_name, &pk_map, schema).await {
-        Ok(bytes) => ok_response(id, Value::from(encode_blob_full(&bytes))),
+        Ok(bytes) => ok_response(
+            id,
+            Value::from(crate::utils::blob::encode_blob_full(&bytes)),
+        ),
         Err(e) => error_response(id, -32603, &e),
     }
 }
@@ -124,19 +127,6 @@ fn validate_writable_file_path(file_path: &str) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
-}
-
-/// Encode raw bytes into the canonical BLOB wire format:
-/// `"BLOB:<size>:<mime_type>:<base64_data>"`. MIME type is sniffed from the
-/// content's magic bytes; unrecognized content falls back to
-/// `application/octet-stream`. Matches `encode_blob_full` in
-/// `src-tauri/src/drivers/common/blob.rs`.
-fn encode_blob_full(data: &[u8]) -> String {
-    let mime_type = infer::get(data)
-        .map(|k| k.mime_type())
-        .unwrap_or("application/octet-stream");
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
-    format!("BLOB:{}:{}:{}", data.len(), mime_type, b64)
 }
 
 #[cfg(test)]

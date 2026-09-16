@@ -104,8 +104,7 @@ fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
             try_extract::<serde_json::Value>(row, index, |v| v)
         }
         ref t if *t == Type::BYTEA => try_extract::<Vec<u8>>(row, index, |v| {
-            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &v);
-            JsonValue::String(format!("BLOB:{}:application/octet-stream:{}", v.len(), b64))
+            JsonValue::String(crate::utils::blob::encode_blob(&v))
         }),
         ref t if *t == Type::INET || *t == Type::CIDR => {
             try_extract::<CidrOrInet>(row, index, JsonValue::from)
@@ -878,10 +877,7 @@ fn extract_simple_kind_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
             serde_json::Value::from_sql(ty, buf).unwrap_or(JsonValue::Null)
         }
         _ if *ty == Type::BYTEA => Vec::<u8>::from_sql(ty, buf)
-            .map(|v| {
-                let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &v);
-                JsonValue::String(format!("BLOB:{}:application/octet-stream:{}", v.len(), b64))
-            })
+            .map(|v| JsonValue::String(crate::utils::blob::encode_blob(&v)))
             .unwrap_or(JsonValue::Null),
         _ if *ty == Type::INET || *ty == Type::CIDR => CidrOrInet::from_sql(ty, buf)
             .map(JsonValue::from)
