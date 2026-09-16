@@ -1310,3 +1310,126 @@ fn execute_query_decodes_geometric_types_correctly_scalar_and_array() {
         );
     }
 }
+
+// Coverage for #82's fourth additive batch: full-text-search
+// (TS_VECTOR/TSQUERY), JSONPATH, XML, REFCURSOR, PG_LSN, and PG_SNAPSHOT
+// had no dispatch arm in either extract_simple_kind or
+// extract_element_from_bytes, so they fell to the string-or-null fallback.
+// Most silently decoded to `null`; JSONPATH specifically decoded to a
+// *corrupted* string (the fallback's String: FromSql happens to accept
+// JSONPATH's wire format, but without stripping the leading version byte
+// that prefixes every value). Exercises the two hardest cases in this
+// batch's TSQUERY decoder — a NOT-of-AND expression (parens required) and
+// a phrase-distance operator — since those are the branches most likely
+// to hide a subtle bug behind a passing happy-path test.
+#[test]
+fn execute_query_decodes_fts_and_introspection_types_correctly() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "DROP TABLE IF EXISTS live_db_type_coverage_5_scratch" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_type_coverage_5_scratch ( \
+                id serial PRIMARY KEY, \
+                c_tsvector tsvector, \
+                c_tsquery_notand tsquery, \
+                c_tsquery_phrase tsquery, \
+                c_jsonpath jsonpath, \
+                c_xml xml, \
+                c_refcursor refcursor, \
+                c_pg_lsn pg_lsn, \
+                c_pg_snapshot pg_snapshot, \
+                c_pg_lsn_arr pg_lsn[] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_5_scratch VALUES ( \
+                DEFAULT, \
+                to_tsvector('english', 'a fat cat sat on a mat and ate a fat rat'), \
+                to_tsquery('english', '!(fat & cat)'), \
+                to_tsquery('english', 'fat <3> rat'), \
+                '$.store.book[*].author', \
+                '<foo>bar</foo>', \
+                'my_cursor'::refcursor, \
+                '16/B374D848', \
+                pg_current_snapshot(), \
+                ARRAY['16/B374D848'::pg_lsn, '0/0'::pg_lsn] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_5_scratch (id) VALUES (DEFAULT)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT * FROM live_db_type_coverage_5_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let populated = &rows[0];
+    assert_eq!(
+        populated[1],
+        json!("'ate':9 'cat':3 'fat':2,11 'mat':7 'rat':12 'sat':4"),
+        "c_tsvector"
+    );
+    assert_eq!(populated[2], json!("!('fat' & 'cat')"), "c_tsquery_notand");
+    assert_eq!(populated[3], json!("'fat' <3> 'rat'"), "c_tsquery_phrase");
+    assert_eq!(
+        populated[4],
+        json!("$.\"store\".\"book\"[*].\"author\""),
+        "c_jsonpath"
+    );
+    assert_eq!(populated[5], json!("<foo>bar</foo>"), "c_xml");
+    assert_eq!(populated[6], json!("my_cursor"), "c_refcursor");
+    assert_eq!(populated[7], json!("16/B374D848"), "c_pg_lsn");
+    // pg_current_snapshot()'s xmin/xmax are non-deterministic (they depend
+    // on the server's current transaction counter), so only assert the
+    // shape ("xmin:xmax:" with no active xids on an otherwise-idle
+    // connection) rather than an exact value.
+    let snapshot = populated[8]
+        .as_str()
+        .expect("c_pg_snapshot must be a string");
+    assert!(
+        snapshot.ends_with(':'),
+        "c_pg_snapshot must end with ':' (no active xids), got: {snapshot}"
+    );
+    assert_eq!(populated[9], json!(["16/B374D848", "0/0"]), "c_pg_lsn_arr");
+
+    let all_null = &rows[1];
+    for (col_idx, col_name) in [
+        (1, "c_tsvector"),
+        (2, "c_tsquery_notand"),
+        (3, "c_tsquery_phrase"),
+        (4, "c_jsonpath"),
+        (5, "c_xml"),
+        (6, "c_refcursor"),
+        (7, "c_pg_lsn"),
+        (8, "c_pg_snapshot"),
+        (9, "c_pg_lsn_arr"),
+    ] {
+        assert_eq!(
+            all_null[col_idx],
+            Value::Null,
+            "{col_name} must decode to null when the column is genuinely NULL"
+        );
+    }
+}

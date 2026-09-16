@@ -142,6 +142,30 @@ fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
         ref t if *t == Type::PATH => try_extract::<Path>(row, index, JsonValue::from),
         ref t if *t == Type::LINE => try_extract::<Line>(row, index, JsonValue::from),
         ref t if *t == Type::CIRCLE => try_extract::<Circle>(row, index, JsonValue::from),
+        ref t if *t == Type::XML => try_extract::<Xml>(row, index, JsonValue::from),
+        ref t if *t == Type::REFCURSOR => try_extract::<RefCursor>(row, index, JsonValue::from),
+        ref t if *t == Type::PG_NODE_TREE => try_extract::<PgNodeTree>(row, index, JsonValue::from),
+        ref t if *t == Type::JSONPATH => try_extract::<JsonPath>(row, index, JsonValue::from),
+        ref t if *t == Type::TS_VECTOR => try_extract::<TsVector>(row, index, JsonValue::from),
+        ref t if *t == Type::TSQUERY => try_extract::<TsQuery>(row, index, JsonValue::from),
+        ref t if *t == Type::GTS_VECTOR => try_extract::<GtsVector>(row, index, JsonValue::from),
+        ref t if *t == Type::PG_LSN => try_extract::<PgLsn>(row, index, JsonValue::from),
+        ref t if *t == Type::TXID_SNAPSHOT || *t == Type::PG_SNAPSHOT => {
+            try_extract::<TxidSnapshotOrPgSnapshot>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::PG_MCV_LIST => try_extract::<PgMcvList>(row, index, JsonValue::from),
+        ref t if *t == Type::PG_DEPENDENCIES => {
+            try_extract::<PgDependencies>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::PG_NDISTINCT => {
+            try_extract::<PgNdistinct>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::PG_BRIN_BLOOM_SUMMARY => {
+            try_extract::<PgBrinBloomSummary>(row, index, JsonValue::from)
+        }
+        ref t if *t == Type::PG_BRIN_MINMAX_MULTI_SUMMARY => {
+            try_extract::<PgBrinMinmaxMultiSummary>(row, index, JsonValue::from)
+        }
         // hstore is an extension type (no well-known OID), matched by name like
         // the builtin driver's `extract/simple.rs::extract_or_null`. tokio-postgres
         // decodes it natively as HashMap<String, Option<String>>.
@@ -658,6 +682,52 @@ fn extract_element_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
         _ if *ty == Type::CIRCLE => Circle::from_sql(ty, buf)
             .map(JsonValue::from)
             .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::XML => Xml::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::REFCURSOR => RefCursor::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::PG_NODE_TREE => PgNodeTree::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::JSONPATH => JsonPath::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::TS_VECTOR => TsVector::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::TSQUERY => TsQuery::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::GTS_VECTOR => GtsVector::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::PG_LSN => PgLsn::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::TXID_SNAPSHOT || *ty == Type::PG_SNAPSHOT => {
+            TxidSnapshotOrPgSnapshot::from_sql(ty, buf)
+                .map(JsonValue::from)
+                .unwrap_or(JsonValue::Null)
+        }
+        _ if *ty == Type::PG_MCV_LIST => PgMcvList::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::PG_DEPENDENCIES => PgDependencies::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::PG_NDISTINCT => PgNdistinct::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::PG_BRIN_BLOOM_SUMMARY => PgBrinBloomSummary::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if *ty == Type::PG_BRIN_MINMAX_MULTI_SUMMARY => {
+            PgBrinMinmaxMultiSummary::from_sql(ty, buf)
+                .map(JsonValue::from)
+                .unwrap_or(JsonValue::Null)
+        }
         _ if matches!(ty.kind(), Kind::Enum(_)) => EnumLabel::from_sql(ty, buf)
             .map(|v| JsonValue::String(v.0))
             .unwrap_or(JsonValue::Null),
@@ -1481,3 +1551,559 @@ impl From<Circle> for JsonValue {
         JsonValue::String(format!("<({}, {}), {}>", v.center.x, v.center.y, v.radius))
     }
 }
+
+/// A wire format that's just the raw UTF-8 bytes of a value, no length
+/// prefix or other framing. Matches the builtin driver's `utf8_wrapper!`
+/// macro (`extract/advanced_types.rs`).
+macro_rules! utf8_wrapper {
+    ($name:ident, $pg_type:ident) => {
+        pub(crate) struct $name(String);
+
+        impl<'a> FromSql<'a> for $name {
+            fn from_sql(
+                _ty: &Type,
+                raw: &[u8],
+            ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+                Ok(Self(String::from_utf8(raw.to_vec())?))
+            }
+
+            fn accepts(ty: &Type) -> bool {
+                *ty == Type::$pg_type
+            }
+        }
+
+        impl From<$name> for JsonValue {
+            fn from(v: $name) -> Self {
+                JsonValue::String(v.0)
+            }
+        }
+    };
+}
+
+utf8_wrapper!(Xml, XML);
+utf8_wrapper!(RefCursor, REFCURSOR);
+// ACLITEM is deliberately NOT implemented: PostgreSQL has no binary send
+// function for it at all (confirmed live — the server itself rejects the
+// query with "no binary output function available for type aclitem",
+// SQLSTATE 42883, before any client-side decoding ever runs). Every
+// tokio_postgres/deadpool-postgres query uses the binary protocol, so an
+// ACLITEM/ACLITEM[] column can never reach either driver's decode layer —
+// this matches the builtin's own FIXME comment in `advanced_types.rs`,
+// which implements a struct for it anyway but notes it's unreachable.
+utf8_wrapper!(PgNodeTree, PG_NODE_TREE);
+
+/// JSONPATH: 1-byte version prefix, then the path's UTF-8 bytes. Matches
+/// `extract/advanced_types.rs::JsonPath`. Without stripping the version
+/// byte, the raw bytes still happen to decode as a `String` via
+/// `tokio_postgres`'s built-in `FromSql` (JSONPATH is text-like), but with
+/// the version byte prepended as a stray control character — a silent
+/// corruption rather than a `null`, which is why this type needs an
+/// explicit arm even though the generic string fallback "works" for it.
+pub(crate) struct JsonPath {
+    path: String,
+}
+
+impl<'a> FromSql<'a> for JsonPath {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.is_empty() {
+            return Err("invalid JSON path".into());
+        }
+        let path = String::from_utf8(raw[1..].to_vec())?;
+        Ok(Self { path })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::JSONPATH
+    }
+}
+
+impl From<JsonPath> for JsonValue {
+    fn from(v: JsonPath) -> Self {
+        JsonValue::String(v.path)
+    }
+}
+
+/// One lexeme entry within a TSVECTOR: a NUL-terminated text, then a
+/// 2-byte position count, then that many 2-byte (weight: top 2 bits,
+/// position: low 14 bits) entries. Matches
+/// `extract/advanced_types.rs::Lexeme`.
+struct Lexeme {
+    text: String,
+    positions_weights: Vec<(u16, char)>,
+}
+
+impl Lexeme {
+    fn try_extract_from(buf: &mut &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let text = extract_nul_terminated_text(buf)?;
+
+        if buf.len() < 2 {
+            return Err("buf too short for position count".into());
+        }
+        let position_count = i16::from_be_bytes(buf[..2].try_into().unwrap());
+        if position_count < 0 {
+            return Err(format!(
+                "expected non-negative position count, got: {}",
+                position_count
+            )
+            .into());
+        }
+        if position_count == 0 {
+            return Ok(Self {
+                text,
+                positions_weights: Vec::new(),
+            });
+        }
+        *buf = &buf[2..];
+
+        let position_count = position_count as usize;
+        if buf.len() < position_count * 2 {
+            return Err(format!(
+                "buf too short for positions and weights: expected {} bytes, got {}",
+                position_count * 2,
+                buf.len()
+            )
+            .into());
+        }
+
+        let mut positions_weights = Vec::with_capacity(position_count);
+        for _ in 0..position_count {
+            let position_weight = u16::from_be_bytes(buf[..2].try_into().unwrap());
+            let weight = match position_weight >> 14 {
+                0 => 'D',
+                1 => 'C',
+                2 => 'B',
+                3 => 'A',
+                _ => unreachable!(),
+            };
+            let position = position_weight & 0x3FFF;
+            *buf = &buf[2..];
+            positions_weights.push((position, weight));
+        }
+
+        Ok(Self {
+            text,
+            positions_weights,
+        })
+    }
+}
+
+/// Read a NUL-terminated string from the front of `buf`, advancing `buf`
+/// past the terminator. Shared by `Lexeme` and the TSQUERY operand parser
+/// (both formats use this exact framing for lexeme text). Matches
+/// `extract/advanced_types.rs::try_extract_lexeme_text`.
+fn extract_nul_terminated_text(
+    buf: &mut &[u8],
+) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
+    let nul_pos = buf
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or("lexeme string not terminated")?;
+    let text = String::from_utf8(buf[..nul_pos].to_vec())?;
+    *buf = &buf[nul_pos + 1..];
+    Ok(text)
+}
+
+/// TSVECTOR: 4-byte lexeme count, then that many `Lexeme` entries.
+/// Formatted as PostgreSQL's own `'lexeme':pos,pos ...` text form. Matches
+/// `extract/advanced_types.rs::TsVector`.
+pub(crate) struct TsVector {
+    lexemes: Vec<Lexeme>,
+}
+
+impl<'a> FromSql<'a> for TsVector {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err(format!(
+                "raw buffer too short for TsVector: expected at least 4 bytes, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        let count = i32::from_be_bytes(raw[..4].try_into().unwrap());
+        if count == 0 {
+            return Ok(Self {
+                lexemes: Vec::new(),
+            });
+        }
+        let mut buf = &raw[4..];
+        let mut lexemes = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            lexemes.push(Lexeme::try_extract_from(&mut buf)?);
+        }
+        Ok(Self { lexemes })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::TS_VECTOR
+    }
+}
+
+impl From<TsVector> for JsonValue {
+    fn from(v: TsVector) -> Self {
+        let mut ss = Vec::with_capacity(v.lexemes.len());
+        for lexeme in v.lexemes {
+            let mut s = format!("'{}':", lexeme.text);
+            let mut positions_weights = lexeme.positions_weights.into_iter();
+            if let Some((position, weight)) = positions_weights.next() {
+                s.push_str(&position.to_string());
+                if weight != 'D' {
+                    s.push(weight);
+                }
+            }
+            for (position, weight) in positions_weights {
+                s.push(',');
+                s.push_str(&position.to_string());
+                if weight != 'D' {
+                    s.push(weight);
+                }
+            }
+            ss.push(s);
+        }
+        JsonValue::String(ss.join(" "))
+    }
+}
+
+/// TSQUERY: a 4-byte length prefix (ignored — the recursive tree below is
+/// self-delimiting), then a binary tree of operand/operator nodes.
+/// Genuinely complex enough that it's decoded straight to its text
+/// representation rather than an intermediate structure. Matches
+/// `extract/advanced_types.rs::TsQuery` + `try_extract_ts_query`.
+pub(crate) struct TsQuery {
+    query: String,
+}
+
+impl<'a> FromSql<'a> for TsQuery {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err(format!(
+                "error extracting TsQuery: expected at least 4 bytes, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        let mut buf = &raw[4..];
+        let query = extract_ts_query_node(&mut buf, 4)
+            .map_err(|e| -> Box<dyn std::error::Error + Sync + Send> { e.into() })?;
+        Ok(Self { query })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::TSQUERY
+    }
+}
+
+impl From<TsQuery> for JsonValue {
+    fn from(v: TsQuery) -> Self {
+        JsonValue::String(v.query)
+    }
+}
+
+/// Recursively decode one TSQUERY tree node: `buf[0] == 1` is an operand
+/// (lexeme + weight + prefix flag), `buf[0] == 2` is an operator (NOT/AND/
+/// OR/phrase-distance) with left/right subtrees. `pre_lvl` is the parent
+/// operator's precedence level, used to decide whether this subtree needs
+/// parenthesizing when rendered — matches PostgreSQL's own `tsquery`
+/// output rules. Matches `extract/advanced_types.rs::try_extract_ts_query`.
+fn extract_ts_query_node(buf: &mut &[u8], pre_lvl: u8) -> Result<String, String> {
+    if buf.is_empty() {
+        return Err("fail to extract ts_query: buffer is empty".into());
+    }
+
+    match buf[0] {
+        1 => {
+            if buf.len() < 3 {
+                return Err("fail to extract ts_query operand: buffer is too short".into());
+            }
+            let weight = match buf[1] {
+                0 => None,
+                1 => Some('D'),
+                2 => Some('C'),
+                4 => Some('B'),
+                8 => Some('A'),
+                _ => {
+                    return Err(
+                        "fail to extract ts_query operand weight: invalid weight value".into(),
+                    )
+                }
+            };
+            let prefixed = buf[2] == 1;
+            *buf = &buf[3..];
+
+            let lexeme = extract_nul_terminated_text(buf).map_err(|e| e.to_string())?;
+
+            let mut s = format!("'{}'", lexeme);
+            if prefixed {
+                s.push_str(":*");
+            }
+            if let Some(weight) = weight {
+                if prefixed {
+                    s.push(weight);
+                } else {
+                    s.push(':');
+                    s.push(weight);
+                }
+            }
+            Ok(s)
+        }
+        2 => {
+            let operator = *buf
+                .get(1)
+                .ok_or("fail to extract ts_query operator: buffer is too short")?;
+            *buf = &buf[2..];
+
+            let (cur_lvl, operator): (u8, String) = match operator {
+                1 => {
+                    let operand = extract_ts_query_node(buf, 1)?;
+                    return Ok(format!("!{}", operand));
+                }
+                2 => (3, "&".into()),
+                3 => (4, "|".into()),
+                4 => {
+                    if buf.len() < 2 {
+                        return Err(
+                            "fail to extract ts_query phrase operator distance: buffer is too short"
+                                .into(),
+                        );
+                    }
+                    let distance = i16::from_be_bytes(buf[..2].try_into().unwrap());
+                    *buf = &buf[2..];
+                    if distance == 1 {
+                        (2, "<->".into())
+                    } else {
+                        (2, format!("<{}>", distance))
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "fail to extract ts_query operator: invalid operator expected 1, 2, 3, or 4, got: {}",
+                        operator
+                    ));
+                }
+            };
+
+            let right_operand = extract_ts_query_node(buf, cur_lvl)?;
+            let left_operand = extract_ts_query_node(buf, cur_lvl)?;
+
+            if pre_lvl < cur_lvl {
+                Ok(format!("({} {} {})", left_operand, operator, right_operand))
+            } else {
+                Ok(format!("{} {} {}", left_operand, operator, right_operand))
+            }
+        }
+        other => Err(format!(
+            "fail to extract ts_query: expected 1 or 2 got: {}",
+            other
+        )),
+    }
+}
+
+/// GTSVECTOR (a signature-compressed index-internal representation of
+/// TSVECTOR, distinct from TS_VECTOR itself): a 4-byte header + 1-byte
+/// signature flag, rendered as a blob string since it has no meaningful
+/// text form. Matches `extract/advanced_types.rs::GtsVector`.
+pub(crate) struct GtsVector {
+    header: [u8; 4],
+    signature: u8,
+}
+
+impl<'a> FromSql<'a> for GtsVector {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 5 {
+            return Err(format!(
+                "fail to extract gts_vector: expected at least 5 bytes, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        Ok(Self {
+            header: [raw[0], raw[1], raw[2], raw[3]],
+            signature: raw[4],
+        })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::GTS_VECTOR
+    }
+}
+
+impl From<GtsVector> for JsonValue {
+    fn from(v: GtsVector) -> Self {
+        let bytes = [
+            v.header[0],
+            v.header[1],
+            v.header[2],
+            v.header[3],
+            v.signature,
+        ];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        JsonValue::String(format!("BLOB:{}:application/octet-stream:{}", 5, b64))
+    }
+}
+
+/// PG_LSN: two 4-byte big-endian halves of a log sequence number,
+/// formatted as uppercase-hex `"UPPER/LOWER"`. Matches
+/// `extract/advanced_types.rs::PgLsn`.
+pub(crate) struct PgLsn {
+    upper: u32,
+    lower: u32,
+}
+
+impl<'a> FromSql<'a> for PgLsn {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 8 {
+            return Err(
+                format!("fail to extract PgLsn: expected 8 bytes, got {}", raw.len()).into(),
+            );
+        }
+        Ok(Self {
+            upper: u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            lower: u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]),
+        })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::PG_LSN
+    }
+}
+
+impl From<PgLsn> for JsonValue {
+    fn from(v: PgLsn) -> Self {
+        JsonValue::String(format!("{:X}/{:X}", v.upper, v.lower))
+    }
+}
+
+/// TXID_SNAPSHOT / PG_SNAPSHOT (both share this wire layout): 4-byte
+/// active-xid count, 8-byte xmin, 8-byte xmax, then that many 8-byte
+/// active xids. Formatted as `"xmin:xmax:active,active,..."`. Matches
+/// `extract/advanced_types.rs::TxidSnapshotOrPgSnapshot`.
+pub(crate) struct TxidSnapshotOrPgSnapshot {
+    xmin: i64,
+    xmax: i64,
+    active_xids: Vec<i64>,
+}
+
+impl<'a> FromSql<'a> for TxidSnapshotOrPgSnapshot {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 20 {
+            return Err(format!(
+                "fail to extract TxidSnapshotOrPgSnapshot: expected at least 20 bytes, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        let count = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        if count < 0 {
+            return Err(format!(
+                "fail to extract TxidSnapshot/PgSnapshot: count is negative: {}",
+                count
+            )
+            .into());
+        }
+        let xmin = i64::from_be_bytes(raw[4..12].try_into().unwrap());
+        let xmax = i64::from_be_bytes(raw[12..20].try_into().unwrap());
+        let count = count as usize;
+        if count == 0 {
+            return Ok(Self {
+                xmin,
+                xmax,
+                active_xids: Vec::new(),
+            });
+        }
+        let chunks = raw[20..].as_chunks::<8>().0;
+        if chunks.len() < count {
+            return Err(format!(
+                "fail to extract TxidSnapshot/PgSnapshot: expected {} 8-byte chunks, got {}",
+                count,
+                chunks.len()
+            )
+            .into());
+        }
+        let active_xids = chunks[..count]
+            .iter()
+            .map(|chunk| i64::from_be_bytes(*chunk))
+            .collect();
+        Ok(Self {
+            xmin,
+            xmax,
+            active_xids,
+        })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::TXID_SNAPSHOT || *ty == Type::PG_SNAPSHOT
+    }
+}
+
+impl From<TxidSnapshotOrPgSnapshot> for JsonValue {
+    fn from(v: TxidSnapshotOrPgSnapshot) -> Self {
+        JsonValue::String(format!(
+            "{}:{}:{}",
+            v.xmin,
+            v.xmax,
+            v.active_xids
+                .into_iter()
+                .map(|xid| xid.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    }
+}
+
+/// A wire format that's just an opaque byte blob with no meaningful text
+/// representation — encoded the same way this plugin's existing `BYTEA`
+/// arm does (see `extract_simple_kind`'s `Type::BYTEA` arm): the full
+/// base64 payload with a hardcoded `application/octet-stream` MIME type,
+/// no truncation. Matches the builtin's `binary_wrapper!` macro
+/// (`extract/advanced_types.rs`), used for internal planner-statistics
+/// types too rarely queried directly to be worth a real text
+/// representation.
+macro_rules! binary_blob_wrapper {
+    ($name:ident, $pg_type:ident) => {
+        pub(crate) struct $name(Vec<u8>);
+
+        impl<'a> FromSql<'a> for $name {
+            fn from_sql(
+                _ty: &Type,
+                raw: &[u8],
+            ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+                Ok(Self(raw.to_vec()))
+            }
+
+            fn accepts(ty: &Type) -> bool {
+                *ty == Type::$pg_type
+            }
+        }
+
+        impl From<$name> for JsonValue {
+            fn from(v: $name) -> Self {
+                let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &v.0);
+                JsonValue::String(format!(
+                    "BLOB:{}:application/octet-stream:{}",
+                    v.0.len(),
+                    b64
+                ))
+            }
+        }
+    };
+}
+
+binary_blob_wrapper!(PgMcvList, PG_MCV_LIST);
+binary_blob_wrapper!(PgDependencies, PG_DEPENDENCIES);
+binary_blob_wrapper!(PgNdistinct, PG_NDISTINCT);
+binary_blob_wrapper!(PgBrinBloomSummary, PG_BRIN_BLOOM_SUMMARY);
+binary_blob_wrapper!(PgBrinMinmaxMultiSummary, PG_BRIN_MINMAX_MULTI_SUMMARY);
