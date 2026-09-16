@@ -218,6 +218,48 @@ fn hstore_array_decodes_each_element_as_a_json_object() {
     assert_eq!(array.0, serde_json::json!([{"a": "1"}, {"b": "2"}]));
 }
 
+#[test]
+fn bytea_array_element_uses_the_same_truncated_preview_encoding_as_a_scalar_bytea_column() {
+    // #87: a bytea column reached through the array-element decode path
+    // (extract_kind_from_bytes -> extract_simple_kind_from_bytes) previously
+    // had its OWN untruncated copy of the BLOB: encoding, independently
+    // drifted from the scalar Type::BYTEA arm this issue fixed. Prove a
+    // large element in a bytea[] column is also truncated to
+    // MAX_BLOB_PREVIEW_SIZE, with the header still reporting the true size.
+    let ty = array_type(Type::BYTEA);
+    let large_elem = vec![0x41u8; 20 * 1024]; // 20 KB, over the 10 KB cap
+    let small_elem = vec![0xCAu8, 0xFE, 0xBA, 0xBE];
+    let bytes = array_wire_bytes(Type::BYTEA.oid(), &[Some(&large_elem), Some(&small_elem)]);
+    let array = ArrayValue::from_sql(&ty, &bytes).unwrap();
+    let serde_json::Value::Array(elems) = array.0 else {
+        panic!("expected a JSON array");
+    };
+
+    let serde_json::Value::String(large_wire) = &elems[0] else {
+        panic!("expected a string");
+    };
+    let header_prefix = format!("BLOB:{}:", large_elem.len());
+    assert!(
+        large_wire.starts_with(&header_prefix),
+        "the header must report the TRUE size (20480), not the truncated preview size: \
+         {large_wire}"
+    );
+    let mime_and_b64 = &large_wire[header_prefix.len()..];
+    let (_, b64_payload) = mime_and_b64.split_once(':').unwrap();
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_payload).unwrap();
+    assert_eq!(
+        decoded.len(),
+        crate::utils::blob::MAX_BLOB_PREVIEW_SIZE,
+        "the base64 payload for a bytea[] element must be truncated to the preview cap too"
+    );
+
+    assert_eq!(
+        elems[1],
+        serde_json::json!("BLOB:4:application/octet-stream:yv66vg==")
+    );
+}
+
 // Coverage for a gap found during a thoroughness pass on #82: the array
 // decoder (`extract_element_from_bytes`) is a *separate* per-element
 // dispatch table from the scalar dispatch (`extract_simple_kind`) — adding
