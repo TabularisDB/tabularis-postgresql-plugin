@@ -1347,27 +1347,25 @@ fn multirange_accepts_rejects_a_plain_range() {
 
 #[test]
 fn multirange_with_truncated_range_length_prefix_stops_early() {
-    // count says 2 ranges, but only 1 fits. Verified this exact scenario
-    // against the builtin's own loop structure (`for _ in 0..count - 1 {
-    // ...push a comma... } // then the last range separately`, in
-    // `extract/multi_range.rs`) before writing this assertion: with
-    // count=2, the loop body runs once (for range 0, which succeeds and
-    // pushes its trailing comma expecting range 1 to follow), then the
-    // "final range" code detects the truncation and closes with `}`
-    // immediately — producing a trailing comma before the closing brace.
-    // This is the builtin's own real, shared behavior for this specific
-    // truncation shape (a range's bytes present but its length prefix
-    // missing when it is NOT the very first range), not a bug this port
-    // introduced — parity with the builtin is the contract here, not an
-    // "improvement" on an edge case the builtin itself doesn't handle
-    // more gracefully.
+    // count says 2 ranges, but only 1 fits — the second range's length
+    // prefix is missing. The builtin's algorithm produces `"{[1, 5),}"` here
+    // (a trailing comma before the closing brace, which is invalid multirange
+    // syntax). We deliberately deviate: strip the trailing comma on early
+    // close so the output is valid (`"{[1, 5)}"`) even for truncated input.
+    // Rationale: `"{[1, 5),}"` cannot be cast back to a multirange; it
+    // would silently surface as a valid-looking but actually invalid string
+    // in the data grid. The builtin quirk is unreachable in practice
+    // (tokio_postgres always receives complete, atomic wire frames from PG),
+    // so deviating here costs nothing in the normal case while producing
+    // better output if the unreachable path is ever hit. See the PR
+    // discussion on #101 for the full analysis.
     let mut bytes = vec![0, 0, 0, 2]; // count = 2
     let range = [2u8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5];
     bytes.extend_from_slice(&(range.len() as i32).to_be_bytes());
     bytes.extend_from_slice(&range);
     // no second range's bytes follow
     let v = MultirangeValue::from_sql(&multirange_type(Type::INT4), &bytes).unwrap();
-    assert_eq!(serde_json::Value::from(v), serde_json::json!("{[1, 5),}"));
+    assert_eq!(serde_json::Value::from(v), serde_json::json!("{[1, 5)}"));
 }
 
 fn composite_type(name: &str, fields: Vec<Field>) -> Type {

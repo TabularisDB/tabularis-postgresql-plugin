@@ -498,23 +498,20 @@ impl<'a> FromSql<'a> for MultirangeValue {
         let mut ranges = String::from('{');
 
         for _ in 0..count - 1 {
-            // 4-byte length prefix ahead of each range's own bytes — skip it
-            // (extract_range_or_null consumes exactly the range's own byte
-            // count on its own, so the length prefix itself carries no
-            // information this decoder needs, same as the builtin).
-            // Mirrors the builtin's own loop shape exactly (`for _ in
-            // 0..count - 1 { ...push a comma... }` then the last range
-            // handled separately below) — including a shared, verified-
-            // against-the-builtin quirk: if a later range's own length
-            // prefix is missing/truncated, the comma already pushed after
-            // an earlier, successfully-decoded range is NOT retracted, so
-            // the output can end with a trailing comma before the closing
-            // `}` (e.g. `"{[1, 5),}"`). This isn't a bug introduced here —
-            // running the builtin's exact algorithm against the same
-            // truncated input produces the identical trailing comma; see
-            // the `multirange_with_truncated_range_length_prefix_stops_early`
-            // test.
+            // 4-byte length prefix ahead of each range's own bytes — skip it.
+            // The builtin's loop also pushes a comma unconditionally after each
+            // non-last range and relies on the next iteration starting cleanly.
+            // If the next range's length prefix is missing/truncated, the comma
+            // already in `ranges` would produce invalid syntax (e.g. `"{[1, 5),}"`).
+            // The builtin shares this truncation-path quirk, but unlike the builtin
+            // we strip the trailing comma before closing — producing a valid, parseable
+            // multirange string even for truncated wire data. This is a deliberate,
+            // documented deviation from the builtin in an otherwise-unreachable
+            // code path (the server always sends complete, atomic wire values).
             if buf.len() < 4 {
+                if ranges.ends_with(',') {
+                    ranges.pop();
+                }
                 ranges.push('}');
                 return Ok(Self(JsonValue::String(ranges)));
             }
@@ -527,8 +524,12 @@ impl<'a> FromSql<'a> for MultirangeValue {
             ranges.push(',');
         }
 
-        // The final range has no trailing comma.
+        // The final range has no trailing comma. Strip any leftover comma from
+        // a prior loop iteration in case the final length prefix is missing.
         if buf.len() < 4 {
+            if ranges.ends_with(',') {
+                ranges.pop();
+            }
             ranges.push('}');
             return Ok(Self(JsonValue::String(ranges)));
         }
