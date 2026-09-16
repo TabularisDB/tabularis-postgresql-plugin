@@ -654,15 +654,21 @@ pub async fn get_routines(id: Value, params: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("public");
 
-    // PG 11+ uses prokind; older versions use proisagg/proiswindow flags.
-    // CI runs PG 16, so we use the modern query.
-    let query = r#"
-        SELECT proname, prokind
-        FROM pg_proc
-        WHERE pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-        AND prokind IN ('f', 'p')
-        ORDER BY proname
-    "#;
+    let server_version_num: i32 = match client::query_rows(
+        &conn_params,
+        "SELECT current_setting('server_version_num')::int4 AS v",
+        &[],
+    )
+    .await
+    {
+        Ok(rows) => rows
+            .first()
+            .and_then(|r| r.try_get::<_, i32>("v").ok())
+            .unwrap_or(0),
+        Err(e) => return error_response(id, -32603, &e),
+    };
+
+    let query = routine_query_for_version(server_version_num);
 
     match client::query_rows(&conn_params, query, &[&schema]).await {
         Ok(rows) => {
@@ -686,6 +692,35 @@ pub async fn get_routines(id: Value, params: &Value) -> Value {
             ok_response(id, json!(routines))
         }
         Err(e) => error_response(id, -32603, &e),
+    }
+}
+
+/// Pick the `get_routines` query by server version. `pg_proc.prokind` was
+/// introduced in PostgreSQL 11, replacing the boolean columns `proisagg` /
+/// `proiswindow`. On 9.x/10 the column does not exist, so referencing it
+/// fails at parse time (SQLSTATE 42703). Matches the builtin driver's
+/// `get_routines` version branch exactly (`src-tauri/src/drivers/postgres/mod.rs`).
+fn routine_query_for_version(server_version_num: i32) -> &'static str {
+    if server_version_num >= 110_000 {
+        r#"
+            SELECT proname, prokind
+            FROM pg_proc
+            WHERE pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+            AND prokind IN ('f', 'p')
+            ORDER BY proname
+        "#
+    } else {
+        // Pre-11: procedures don't exist; exclude aggregates and window
+        // functions and report everything else as a plain function ('f').
+        // Cast to the internal "char" type so it maps to i8 like prokind.
+        r#"
+            SELECT proname, 'f'::"char" AS prokind
+            FROM pg_proc
+            WHERE pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+            AND NOT proisagg
+            AND NOT proiswindow
+            ORDER BY proname
+        "#
     }
 }
 
@@ -923,3 +958,7 @@ pub async fn get_all_columns_batch(id: Value, _params: &Value) -> Value {
 pub async fn get_all_foreign_keys_batch(id: Value, _params: &Value) -> Value {
     not_implemented(id, "get_all_foreign_keys_batch")
 }
+
+#[cfg(test)]
+#[path = "metadata_tests.rs"]
+mod metadata_tests;
