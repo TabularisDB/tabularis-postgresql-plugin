@@ -38,10 +38,15 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         Kind::Enum(_) => try_extract::<EnumLabel>(row, index, |v| JsonValue::String(v.0)),
         Kind::Array(_) => extract_array_kind(&col_type, row, index),
         Kind::Range(_) => extract_range_kind(&col_type, row, index),
-        // Composite, Domain, Multirange, and anything else not yet modeled
-        // by a dedicated bucket above fall through to the same
+        Kind::Multirange(_) => try_extract::<MultirangeValue>(row, index, |v| v.0),
+        // Domain types unwrap to their base type and recurse — a domain
+        // over int4 decodes exactly like a plain int4 column. Matches the
+        // builtin's `Kind::Domain(ty) => simple::extract_or_null(ty, raw)`.
+        Kind::Domain(ref base) => extract_simple_kind(base, row, index),
+        Kind::Composite(_) => try_extract::<CompositeValue>(row, index, |v| v.0),
+        // Anything not yet modeled above falls through to the same
         // string-or-null fallback every unmatched type used before this
-        // restructure — no new types are added here.
+        // restructure.
         _ => extract_string_or_null_fallback(row, index),
     }
 }
@@ -165,6 +170,14 @@ fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
         }
         ref t if *t == Type::PG_BRIN_MINMAX_MULTI_SUMMARY => {
             try_extract::<PgBrinMinmaxMultiSummary>(row, index, JsonValue::from)
+        }
+        // pgvector types have dynamic OIDs (no `Type::` constant exists),
+        // so they must be matched by name rather than by equality above —
+        // same reasoning as the `hstore` arm just below.
+        ref t if t.name() == "vector" => try_extract::<PgVector>(row, index, JsonValue::from),
+        ref t if t.name() == "halfvec" => try_extract::<PgHalfVector>(row, index, JsonValue::from),
+        ref t if t.name() == "sparsevec" => {
+            try_extract::<PgSparseVector>(row, index, JsonValue::from)
         }
         // hstore is an extension type (no well-known OID), matched by name like
         // the builtin driver's `extract/simple.rs::extract_or_null`. tokio-postgres
@@ -356,56 +369,71 @@ impl<'a> FromSql<'a> for RangeValue {
             Kind::Range(t) => t.clone(),
             _ => return Err("expected a range type".into()),
         };
-
-        if raw.is_empty() {
-            return Err("empty range buffer".into());
+        let mut buf = raw;
+        match extract_range_or_null(&subtype, &mut buf) {
+            JsonValue::String(s) => Ok(Self(s)),
+            _ => Err("empty range buffer".into()),
         }
-        let flag = raw[0];
-        let mut buf = &raw[1..];
-
-        // RANGE_EMPTY flag bit 0
-        if (flag & 1) == 1 {
-            return Ok(Self("empty".to_string()));
-        }
-
-        let lower_char = if (flag & (1 << 1)) == 0 { '(' } else { '[' };
-        let upper_char = if (flag & (1 << 2)) == 0 { ')' } else { ']' };
-
-        let mut out = String::new();
-        out.push(lower_char);
-
-        // RANGE_LB_INF flag bit 3 — lower bound is unbounded (nothing pushed).
-        if flag & (1 << 3) == 0 {
-            // A present-but-unextractable lower bound short-circuits the
-            // whole range to "null, null" and returns immediately — matches
-            // the builtin's early-return on lower-bound extraction failure.
-            match extract_range_bound(&subtype, &mut buf) {
-                Some(s) => out.push_str(&s),
-                None => {
-                    out.push_str("null, null");
-                    out.push(upper_char);
-                    return Ok(Self(out));
-                }
-            }
-        }
-        out.push_str(", ");
-
-        // RANGE_UB_INF flag bit 4 — upper bound is unbounded (nothing pushed).
-        if flag & (1 << 4) == 0 {
-            if let Some(s) = extract_range_bound(&subtype, &mut buf) {
-                out.push_str(&s);
-            } else {
-                out.push_str("null");
-            }
-        }
-        out.push(upper_char);
-
-        Ok(Self(out))
     }
 
     fn accepts(ty: &Type) -> bool {
         matches!(ty.kind(), Kind::Range(_))
     }
+}
+
+/// Decode one range value from a mutable buffer, advancing `buf` past
+/// everything it consumes — the shape every caller with a shared, advancing
+/// buffer needs (both the scalar `RangeValue` wrapper above and
+/// `Multirange`'s per-range loop, which must call this repeatedly without
+/// re-slicing from scratch each time). Matches
+/// `extract/range.rs::extract_or_null` in the builtin, including its
+/// `Null` return for an empty buffer (used by both callers to signal
+/// "nothing left to decode").
+fn extract_range_or_null(subtype: &Type, buf: &mut &[u8]) -> JsonValue {
+    if buf.is_empty() {
+        return JsonValue::Null;
+    }
+    let flag = buf[0];
+    *buf = &buf[1..];
+
+    // RANGE_EMPTY flag bit 0
+    if (flag & 1) == 1 {
+        return JsonValue::String("empty".to_string());
+    }
+
+    let lower_char = if (flag & (1 << 1)) == 0 { '(' } else { '[' };
+    let upper_char = if (flag & (1 << 2)) == 0 { ')' } else { ']' };
+
+    let mut out = String::new();
+    out.push(lower_char);
+
+    // RANGE_LB_INF flag bit 3 — lower bound is unbounded (nothing pushed).
+    if flag & (1 << 3) == 0 {
+        // A present-but-unextractable lower bound short-circuits the
+        // whole range to "null, null" and returns immediately — matches
+        // the builtin's early-return on lower-bound extraction failure.
+        match extract_range_bound(subtype, buf) {
+            Some(s) => out.push_str(&s),
+            None => {
+                out.push_str("null, null");
+                out.push(upper_char);
+                return JsonValue::String(out);
+            }
+        }
+    }
+    out.push_str(", ");
+
+    // RANGE_UB_INF flag bit 4 — upper bound is unbounded (nothing pushed).
+    if flag & (1 << 4) == 0 {
+        if let Some(s) = extract_range_bound(subtype, buf) {
+            out.push_str(&s);
+        } else {
+            out.push_str("null");
+        }
+    }
+    out.push(upper_char);
+
+    JsonValue::String(out)
 }
 
 /// Read one length-prefixed bound value from a range buffer and format it
@@ -435,6 +463,213 @@ fn extract_range_bound(subtype: &Type, buf: &mut &[u8]) -> Option<String> {
         // (producing `1` not `"1"`) — do not special-case String here.
         other => Some(other.to_string()),
     }
+}
+
+/// MULTIRANGE (`int4multirange`, `int8multirange`, `nummultirange`,
+/// `tsmultirange`, `tstzmultirange`, `datemultirange`): 4-byte range count,
+/// then that many ranges, each a 4-byte length prefix followed by that
+/// many bytes in the same wire format `extract_range_or_null` already
+/// decodes. Formatted as `"{range1,range2,...}"` (ranges joined by a bare
+/// comma, no space — distinct from the `", "` separator used *inside* each
+/// range between its own bounds). Matches
+/// `extract/multi_range.rs::extract_or_null`.
+pub(crate) struct MultirangeValue(JsonValue);
+
+impl<'a> FromSql<'a> for MultirangeValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let subtype = match ty.kind() {
+            Kind::Multirange(t) => t.clone(),
+            _ => return Err("expected a multirange type".into()),
+        };
+
+        if raw.len() < 4 {
+            return Ok(Self(JsonValue::Null));
+        }
+        let count = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let mut buf = &raw[4..];
+
+        if count == 0 {
+            return Ok(Self(JsonValue::from("{}")));
+        }
+
+        let mut ranges = String::from('{');
+
+        for _ in 0..count - 1 {
+            // 4-byte length prefix ahead of each range's own bytes — skip it
+            // (extract_range_or_null consumes exactly the range's own byte
+            // count on its own, so the length prefix itself carries no
+            // information this decoder needs, same as the builtin).
+            // Mirrors the builtin's own loop shape exactly (`for _ in
+            // 0..count - 1 { ...push a comma... }` then the last range
+            // handled separately below) — including a shared, verified-
+            // against-the-builtin quirk: if a later range's own length
+            // prefix is missing/truncated, the comma already pushed after
+            // an earlier, successfully-decoded range is NOT retracted, so
+            // the output can end with a trailing comma before the closing
+            // `}` (e.g. `"{[1, 5),}"`). This isn't a bug introduced here —
+            // running the builtin's exact algorithm against the same
+            // truncated input produces the identical trailing comma; see
+            // the `multirange_with_truncated_range_length_prefix_stops_early`
+            // test.
+            if buf.len() < 4 {
+                ranges.push('}');
+                return Ok(Self(JsonValue::String(ranges)));
+            }
+            buf = &buf[4..];
+
+            match extract_range_or_null(&subtype, &mut buf) {
+                JsonValue::String(r) => ranges.push_str(&r),
+                other => ranges.push_str(&other.to_string()),
+            }
+            ranges.push(',');
+        }
+
+        // The final range has no trailing comma.
+        if buf.len() < 4 {
+            ranges.push('}');
+            return Ok(Self(JsonValue::String(ranges)));
+        }
+        buf = &buf[4..];
+
+        match extract_range_or_null(&subtype, &mut buf) {
+            JsonValue::String(r) => ranges.push_str(&r),
+            other => ranges.push_str(&other.to_string()),
+        }
+        ranges.push('}');
+
+        Ok(Self(JsonValue::String(ranges)))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Multirange(_))
+    }
+}
+
+impl From<MultirangeValue> for JsonValue {
+    fn from(v: MultirangeValue) -> Self {
+        v.0
+    }
+}
+
+/// COMPOSITE (any user-defined `CREATE TYPE ... AS (...)` row type, e.g.
+/// `pg_type`'s row type itself, or a custom struct-like type): 4-byte
+/// field count (unused here — the real field names/types come from
+/// `Type::fields()`, known ahead of time from the column's type metadata,
+/// not from the wire), then per field a 4-byte type OID (skipped — the
+/// type is already known from `Field::type_()`) and a 4-byte
+/// length-prefixed value (-1 length = NULL). Decodes each field the same
+/// way `extract_simple_kind`/`extract_array_kind`/etc. would for a scalar
+/// column of that type. A field whose value can't be extracted (buffer
+/// truncated, unsupported type) gets `null`, and every field after it
+/// also gets `null` rather than aborting the whole composite — matches
+/// the builtin's "extract or fill nulls" recovery behavior. Matches
+/// `extract/composite.rs::extract_or_null`.
+pub(crate) struct CompositeValue(JsonValue);
+
+impl<'a> FromSql<'a> for CompositeValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let fields = match ty.kind() {
+            Kind::Composite(fields) => fields,
+            _ => return Err("expected a composite type".into()),
+        };
+
+        if raw.is_empty() {
+            return Ok(Self(JsonValue::Null));
+        }
+
+        let mut buf = raw;
+        Ok(Self(extract_composite_fields(fields, &mut buf)))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Composite(_))
+    }
+}
+
+impl From<CompositeValue> for JsonValue {
+    fn from(v: CompositeValue) -> Self {
+        v.0
+    }
+}
+
+fn extract_composite_fields(fields: &[tokio_postgres::types::Field], buf: &mut &[u8]) -> JsonValue {
+    let mut map = serde_json::Map::with_capacity(fields.len());
+
+    // Skip the 4-byte field count — the real field list comes from `fields`.
+    if buf.len() < 4 {
+        fill_composite_nulls(fields, &mut map);
+        return JsonValue::Object(map);
+    }
+    *buf = &buf[4..];
+
+    for (i, field) in fields.iter().enumerate() {
+        // Skip the 4-byte field type OID — already known from `field.type_()`.
+        if buf.len() < 4 {
+            fill_composite_nulls(&fields[i..], &mut map);
+            return JsonValue::Object(map);
+        }
+        *buf = &buf[4..];
+
+        match extract_composite_field_value(field.type_(), buf) {
+            Some(value) => {
+                map.insert(field.name().to_string(), value);
+            }
+            None => {
+                map.insert(field.name().to_string(), JsonValue::Null);
+                if i + 1 < fields.len() {
+                    fill_composite_nulls(&fields[i + 1..], &mut map);
+                    return JsonValue::Object(map);
+                }
+            }
+        }
+    }
+
+    JsonValue::Object(map)
+}
+
+fn fill_composite_nulls(
+    fields: &[tokio_postgres::types::Field],
+    map: &mut serde_json::Map<String, JsonValue>,
+) {
+    for field in fields {
+        map.insert(field.name().to_string(), JsonValue::Null);
+    }
+}
+
+/// Extract one composite field's length-prefixed value (-1 length = NULL,
+/// returned as `None` so the caller can fill it and every later field with
+/// `null` per the builtin's recovery behavior — see `extract_composite_fields`).
+/// Delegates to `extract_kind_from_bytes` (shared with array-element
+/// decoding) for the actual per-`Kind` dispatch, rather than duplicating
+/// it — a composite field's type can be any `Kind` an array element can
+/// be, plus `Composite` again (nested composites) and `Range`/
+/// `Multirange` (PostgreSQL allows range/multirange-typed composite
+/// fields; it does NOT allow them as array element types recursively in
+/// the same way, but the dispatch function handles both callers' needs
+/// identically either way).
+fn extract_composite_field_value(field_type: &Type, buf: &mut &[u8]) -> Option<JsonValue> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let len = i32::from_be_bytes(buf[..4].try_into().ok()?);
+    *buf = &buf[4..];
+    if len < 0 {
+        return Some(JsonValue::Null);
+    }
+    let len = len as usize;
+    if buf.len() < len {
+        return None;
+    }
+    let (value_buf, rest) = buf.split_at(len);
+    *buf = rest;
+
+    Some(extract_kind_from_bytes(field_type, value_buf))
 }
 
 /// Format a raw byte buffer as JSON for the subset of simple PG types that
@@ -545,11 +780,57 @@ impl<'a> FromSql<'a> for ArrayValue {
     }
 }
 
-/// Decode one array element's raw bytes as JSON, covering the scalar types
-/// `extract_value` handles (minus ranges/arrays, which can't appear as a
-/// single array's element type here) plus enum and hstore, mirroring the
-/// builtin's `try_extract_elem`.
+/// Decode one array element's raw bytes as JSON. A thin wrapper around
+/// `extract_kind_from_bytes` — kept as a separate name for readability at
+/// `ArrayValue::from_sql`'s call site.
 fn extract_element_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
+    extract_kind_from_bytes(ty, buf)
+}
+
+/// Decode a raw byte buffer as JSON for *any* `Kind` — the shared dispatcher
+/// behind both `ArrayValue`'s per-element decoding and
+/// `CompositeValue`'s per-field decoding. A value nested inside an array or
+/// a composite can be any of these `Kind`s (PostgreSQL allows composite
+/// fields of array/range/multirange/domain/nested-composite type; it does
+/// NOT allow an array's element type to itself be an array, but the
+/// dispatch is identical either way, so one function serves both callers).
+/// Mirrors the builtin's `try_extract_elem`/`try_extract_field`, which are
+/// themselves near-identical `Kind` dispatches for the same reason.
+fn extract_kind_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
+    match ty.kind() {
+        Kind::Range(subtype) => {
+            let mut inner_buf = buf;
+            extract_range_or_null(subtype, &mut inner_buf)
+        }
+        Kind::Multirange(_) => MultirangeValue::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        Kind::Domain(base) => extract_kind_from_bytes(base, buf),
+        Kind::Composite(fields) => {
+            let mut inner_buf = buf;
+            extract_composite_fields(fields, &mut inner_buf)
+        }
+        // Array-of-array is not a real PostgreSQL element type (multi-
+        // dimensional arrays use a different wire encoding entirely, and
+        // ArrayValue::from_sql already rejects `dimensions != 1` for
+        // that), but dispatch here defensively rather than assuming a
+        // caller never passes one.
+        Kind::Array(_) => ArrayValue::from_sql(ty, buf)
+            .map(|v| v.0)
+            .unwrap_or(JsonValue::Null),
+        _ => extract_simple_kind_from_bytes(ty, buf),
+    }
+}
+
+/// `Kind::Simple` + `Kind::Enum` + hstore-by-name dispatch, from raw bytes
+/// with no `Row`/`index` available (used by array elements and composite
+/// fields, both of which only ever hand this function a length-delimited
+/// value slice, not a whole row). Covers the exact same type set as
+/// `extract_simple_kind` (the `Row`-based scalar-column dispatcher) — kept
+/// as a separate function because every arm here calls `T::from_sql`
+/// directly against a byte slice rather than `try_extract`'s
+/// `row.try_get::<_, Option<T>>`.
+fn extract_simple_kind_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
     match ty {
         _ if *ty == Type::BOOL => bool::from_sql(ty, buf)
             .map(JsonValue::Bool)
@@ -730,6 +1011,17 @@ fn extract_element_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
         }
         _ if matches!(ty.kind(), Kind::Enum(_)) => EnumLabel::from_sql(ty, buf)
             .map(|v| JsonValue::String(v.0))
+            .unwrap_or(JsonValue::Null),
+        // pgvector types have dynamic OIDs (no `Type::` constant exists),
+        // so they must be matched by name rather than by equality above.
+        _ if ty.name() == "vector" => PgVector::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if ty.name() == "halfvec" => PgHalfVector::from_sql(ty, buf)
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+        _ if ty.name() == "sparsevec" => PgSparseVector::from_sql(ty, buf)
+            .map(JsonValue::from)
             .unwrap_or(JsonValue::Null),
         _ if ty.name() == "hstore" => HashMap::<String, Option<String>>::from_sql(ty, buf)
             .map(|v| serde_json::to_value(v).unwrap_or(JsonValue::Null))
@@ -2107,3 +2399,196 @@ binary_blob_wrapper!(PgDependencies, PG_DEPENDENCIES);
 binary_blob_wrapper!(PgNdistinct, PG_NDISTINCT);
 binary_blob_wrapper!(PgBrinBloomSummary, PG_BRIN_BLOOM_SUMMARY);
 binary_blob_wrapper!(PgBrinMinmaxMultiSummary, PG_BRIN_MINMAX_MULTI_SUMMARY);
+
+// pgvector extension types (`vector`, `halfvec`, `sparsevec`). These are
+// extension-defined base types with dynamic OIDs — not available as
+// `Type::*` constants — so `accepts` matches on the type name instead,
+// same as `hstore`. Rendered as pgvector's own canonical text form, since
+// pgvector accepts that same text form back on input. Matches
+// `extract/advanced_types.rs`'s pgvector section.
+
+/// Format an `f32` the way pgvector's text output does: shortest
+/// round-trippable decimal (e.g. `1.0` -> `"1"`, `1.5` -> `"1.5"`). Rust's
+/// default `f32` formatter already produces the shortest round-trip
+/// representation.
+fn format_vector_float(value: f32) -> String {
+    value.to_string()
+}
+
+/// pgvector `vector`: `int16 dim`, `int16 unused`, then `dim` big-endian
+/// `float4` values.
+pub(crate) struct PgVector(Vec<f32>);
+
+impl<'a> FromSql<'a> for PgVector {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err(format!("expected at least 4 bytes for vector, got {}", raw.len()).into());
+        }
+        let dim = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+        let expected = 4 + dim * 4;
+        if raw.len() < expected {
+            return Err(format!(
+                "vector of dim {dim} expects {expected} bytes, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        let mut values = Vec::with_capacity(dim);
+        for i in 0..dim {
+            let off = 4 + i * 4;
+            values.push(f32::from_be_bytes([
+                raw[off],
+                raw[off + 1],
+                raw[off + 2],
+                raw[off + 3],
+            ]));
+        }
+        Ok(Self(values))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.name() == "vector"
+    }
+}
+
+impl From<PgVector> for JsonValue {
+    fn from(v: PgVector) -> Self {
+        let body =
+            v.0.iter()
+                .map(|f| format_vector_float(*f))
+                .collect::<Vec<_>>()
+                .join(",");
+        JsonValue::String(format!("[{body}]"))
+    }
+}
+
+/// Decode an IEEE 754 half-precision (`binary16`) value into `f32`.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = if (bits >> 15) & 1 == 1 {
+        -1.0f32
+    } else {
+        1.0f32
+    };
+    let exp = (bits >> 10) & 0x1f;
+    let mant = bits & 0x3ff;
+    match exp {
+        0 => sign * (mant as f32) * 2f32.powi(-24), // zero / subnormal
+        0x1f if mant == 0 => sign * f32::INFINITY,
+        0x1f => f32::NAN,
+        _ => sign * (1.0 + (mant as f32) / 1024.0) * 2f32.powi(exp as i32 - 15),
+    }
+}
+
+/// pgvector `halfvec`: `int16 dim`, `int16 unused`, then `dim` big-endian
+/// `float2` (half-precision) values.
+pub(crate) struct PgHalfVector(Vec<f32>);
+
+impl<'a> FromSql<'a> for PgHalfVector {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err(format!("expected at least 4 bytes for halfvec, got {}", raw.len()).into());
+        }
+        let dim = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+        let expected = 4 + dim * 2;
+        if raw.len() < expected {
+            return Err(format!(
+                "halfvec of dim {dim} expects {expected} bytes, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        let mut values = Vec::with_capacity(dim);
+        for i in 0..dim {
+            let off = 4 + i * 2;
+            values.push(f16_bits_to_f32(u16::from_be_bytes([
+                raw[off],
+                raw[off + 1],
+            ])));
+        }
+        Ok(Self(values))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.name() == "halfvec"
+    }
+}
+
+impl From<PgHalfVector> for JsonValue {
+    fn from(v: PgHalfVector) -> Self {
+        let body =
+            v.0.iter()
+                .map(|f| format_vector_float(*f))
+                .collect::<Vec<_>>()
+                .join(",");
+        JsonValue::String(format!("[{body}]"))
+    }
+}
+
+/// pgvector `sparsevec`: `int32 dim`, `int32 nnz`, `int32 unused`, then
+/// `nnz` big-endian `int32` indices (0-based on the wire), then `nnz`
+/// big-endian `float4` values. Text form is `{i1:v1,i2:v2}/dim` with
+/// 1-based indices — the wire's 0-based indices get `+1`'d when rendered.
+pub(crate) struct PgSparseVector {
+    dim: i32,
+    entries: Vec<(i32, f32)>,
+}
+
+impl<'a> FromSql<'a> for PgSparseVector {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 12 {
+            return Err(format!(
+                "expected at least 12 bytes for sparsevec, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        let dim = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let nnz = i32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+        // raw[8..12] is the unused/reserved header field.
+        let expected = 12 + nnz * 4 + nnz * 4;
+        if raw.len() < expected {
+            return Err(format!(
+                "sparsevec with {nnz} entries expects {expected} bytes, got {}",
+                raw.len()
+            )
+            .into());
+        }
+        let mut entries = Vec::with_capacity(nnz);
+        let values_off = 12 + nnz * 4;
+        for i in 0..nnz {
+            let idx_off = 12 + i * 4;
+            let index = i32::from_be_bytes([
+                raw[idx_off],
+                raw[idx_off + 1],
+                raw[idx_off + 2],
+                raw[idx_off + 3],
+            ]);
+            let val_off = values_off + i * 4;
+            let value = f32::from_be_bytes([
+                raw[val_off],
+                raw[val_off + 1],
+                raw[val_off + 2],
+                raw[val_off + 3],
+            ]);
+            entries.push((index, value));
+        }
+        Ok(Self { dim, entries })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.name() == "sparsevec"
+    }
+}
+
+impl From<PgSparseVector> for JsonValue {
+    fn from(v: PgSparseVector) -> Self {
+        let body = v
+            .entries
+            .iter()
+            // pgvector prints indices 1-based; the wire format stores them 0-based.
+            .map(|(idx, val)| format!("{}:{}", idx + 1, format_vector_float(*val)))
+            .collect::<Vec<_>>()
+            .join(",");
+        JsonValue::String(format!("{{{body}}}/{}", v.dim))
+    }
+}
