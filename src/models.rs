@@ -69,3 +69,16 @@ pub struct ColumnDefinition {
     pub is_auto_increment: bool,
     pub default_value: Option<String>,
 }
+
+/// Mirrors `crate::models::RoutineCallArg` on the host — one argument of a
+/// stored-routine invocation built by `build_routine_call_sql`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoutineCallArg {
+    pub name: String,
+    /// "IN", "OUT", or "INOUT".
+    pub mode: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub is_raw: bool,
+}
