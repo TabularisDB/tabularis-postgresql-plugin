@@ -866,3 +866,164 @@ fn connecting_with_a_wrong_password_surfaces_the_real_postgres_message() {
          tokio_postgres::Error::Display fallback, got: {error}"
     );
 }
+
+// Characterizes `extract.rs`'s decode behavior across every type the flat
+// `Type::` dispatch table supported before it was restructured into a
+// `Kind`-first dispatch (mirroring the builtin driver's `extract/mod.rs`
+// shape — see #82's tracking issue). This is the regression guard for that
+// restructure: a future change to the dispatch shape that silently drops or
+// misroutes a type would show up here as a wrong value, not just a `null`.
+// Covers one column per scalar type, all six built-in range types, all
+// eight hardcoded array fast-paths, and a fully-NULL row exercising every
+// type's NULL path in one query.
+#[test]
+fn execute_query_decodes_every_currently_supported_type_correctly() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "DROP TABLE IF EXISTS live_db_type_coverage_scratch" }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_type_coverage_scratch ( \
+                id serial PRIMARY KEY, \
+                c_bool boolean, \
+                c_int2 smallint, \
+                c_int4 integer, \
+                c_int8 bigint, \
+                c_numeric numeric(10,2), \
+                c_text text, \
+                c_uuid uuid, \
+                c_date date, \
+                c_time time, \
+                c_timestamp timestamp, \
+                c_timestamptz timestamptz, \
+                c_json json, \
+                c_jsonb jsonb, \
+                c_bytea bytea, \
+                c_inet inet, \
+                c_macaddr macaddr, \
+                c_oid oid, \
+                c_money money, \
+                c_int4range int4range, \
+                c_int8range int8range, \
+                c_numrange numrange, \
+                c_daterange daterange, \
+                c_int4_arr integer[], \
+                c_text_arr text[], \
+                c_bool_arr boolean[] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_scratch VALUES ( \
+                DEFAULT, true, 123, 123456, 123456789012, 12345.67, \
+                'hello', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', \
+                '2026-01-15', '13:45:30', '2026-01-15 13:45:30', \
+                '2026-01-15 13:45:30+00', '{\"a\":1}', '{\"b\":2}', \
+                E'\\\\xDEADBEEF', '192.168.1.1/24', '08:00:2b:01:02:03', \
+                12345, 123.45, '[1,10)', '[100,1000)', '[1.5,9.5)', \
+                '[2026-01-01,2026-02-01)', ARRAY[1,2,NULL]::int[], \
+                ARRAY['a','b',NULL]::text[], ARRAY[true,false,NULL]::boolean[] \
+            )",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_type_coverage_scratch (id) VALUES (DEFAULT)",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT * FROM live_db_type_coverage_scratch ORDER BY id",
+        }),
+    );
+    let rows = result.get("rows").and_then(Value::as_array).unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let populated = &rows[0];
+    assert_eq!(populated[1], json!(true), "c_bool");
+    assert_eq!(populated[2], json!(123), "c_int2");
+    assert_eq!(populated[3], json!(123456), "c_int4");
+    assert_eq!(populated[4], json!(123456789012_i64), "c_int8");
+    assert_eq!(populated[5], json!("12345.67"), "c_numeric");
+    assert_eq!(populated[6], json!("hello"), "c_text");
+    assert_eq!(
+        populated[7],
+        json!("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+        "c_uuid"
+    );
+    assert_eq!(populated[8], json!("2026-01-15"), "c_date");
+    assert_eq!(populated[9], json!("13:45:30"), "c_time");
+    assert_eq!(populated[10], json!("2026-01-15 13:45:30"), "c_timestamp");
+    assert_eq!(populated[11], json!("2026-01-15 13:45:30"), "c_timestamptz");
+    assert_eq!(populated[12], json!({"a": 1}), "c_json");
+    assert_eq!(populated[13], json!({"b": 2}), "c_jsonb");
+    assert_eq!(
+        populated[14],
+        json!("BLOB:4:application/octet-stream:3q2+7w=="),
+        "c_bytea"
+    );
+    assert_eq!(populated[15], json!("192.168.1.1/24"), "c_inet");
+    assert_eq!(populated[16], json!("08:00:2b:01:02:03"), "c_macaddr");
+    assert_eq!(populated[17], json!(12345), "c_oid");
+    assert_eq!(populated[18], json!(12345), "c_money");
+    assert_eq!(populated[19], json!("[1, 10)"), "c_int4range");
+    assert_eq!(populated[20], json!("[100, 1000)"), "c_int8range");
+    assert_eq!(populated[21], json!("[\"1.5\", \"9.5\")"), "c_numrange");
+    assert_eq!(
+        populated[22],
+        json!("[\"2026-01-01\", \"2026-02-01\")"),
+        "c_daterange"
+    );
+    assert_eq!(populated[23], json!([1, 2, null]), "c_int4_arr");
+    assert_eq!(populated[24], json!(["a", "b", null]), "c_text_arr");
+    assert_eq!(populated[25], json!([true, false, null]), "c_bool_arr");
+
+    let all_null = &rows[1];
+    for (col_idx, col_name) in [
+        (1, "c_bool"),
+        (2, "c_int2"),
+        (3, "c_int4"),
+        (4, "c_int8"),
+        (5, "c_numeric"),
+        (6, "c_text"),
+        (7, "c_uuid"),
+        (8, "c_date"),
+        (9, "c_time"),
+        (10, "c_timestamp"),
+        (11, "c_timestamptz"),
+        (12, "c_json"),
+        (13, "c_jsonb"),
+        (14, "c_bytea"),
+        (15, "c_inet"),
+        (16, "c_macaddr"),
+        (17, "c_oid"),
+        (18, "c_money"),
+        (19, "c_int4range"),
+        (20, "c_int8range"),
+        (21, "c_numrange"),
+        (22, "c_daterange"),
+        (23, "c_int4_arr"),
+        (24, "c_text_arr"),
+        (25, "c_bool_arr"),
+    ] {
+        assert_eq!(
+            all_null[col_idx],
+            Value::Null,
+            "{col_name} must decode to null when the column is genuinely NULL"
+        );
+    }
+}

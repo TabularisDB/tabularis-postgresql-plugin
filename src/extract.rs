@@ -18,11 +18,35 @@ pub(crate) const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 /// Extract a single column value from a row as a JSON value.
 /// Matches the builtin driver's extraction behavior exactly.
+///
+/// Dispatches on `ty.kind()` first — Simple/Enum/Array/Range — mirroring the
+/// builtin driver's `extract/mod.rs` structure, so new types slot into the
+/// bucket that matches how the builtin organizes `extract/simple.rs`,
+/// `extract/array.rs`, `extract/range.rs`, etc. Each bucket below still runs
+/// the exact same `Type::` equality checks (and falls through to the same
+/// string-or-null fallback) the single flat match used before this
+/// restructure — this change is purely structural.
 pub fn extract_value(row: &Row, index: usize) -> JsonValue {
     let col_type = row.columns()[index].type_().clone();
 
-    // NULL check: try to get as Option first
-    match col_type {
+    match col_type.kind() {
+        Kind::Simple => extract_simple_kind(&col_type, row, index),
+        Kind::Enum(_) => try_extract::<EnumLabel>(row, index, |v| JsonValue::String(v.0)),
+        Kind::Array(_) => extract_array_kind(&col_type, row, index),
+        Kind::Range(_) => extract_range_kind(&col_type, row, index),
+        // Composite, Domain, Multirange, and anything else not yet modeled
+        // by a dedicated bucket above fall through to the same
+        // string-or-null fallback every unmatched type used before this
+        // restructure — no new types are added here.
+        _ => extract_string_or_null_fallback(row, index),
+    }
+}
+
+/// `Kind::Simple` bucket: scalar types with no element/subtype (everything
+/// except enum/array/range/composite/domain/multirange). Every arm here is
+/// unchanged from the pre-restructure flat match.
+fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
+    match *col_type {
         ref t if *t == Type::BOOL => try_extract::<bool>(row, index, JsonValue::Bool),
         ref t if *t == Type::INT2 => try_extract::<i16>(row, index, JsonValue::from),
         ref t if *t == Type::INT4 => try_extract::<i32>(row, index, JsonValue::from),
@@ -80,16 +104,24 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         ref t if *t == Type::MACADDR => try_extract::<MacAddr>(row, index, JsonValue::from),
         ref t if *t == Type::OID => try_extract::<u32>(row, index, JsonValue::from),
         ref t if *t == Type::MONEY => try_extract::<Money>(row, index, JsonValue::from),
-        ref t
-            if *t == Type::INT4_RANGE
-                || *t == Type::INT8_RANGE
-                || *t == Type::NUM_RANGE
-                || *t == Type::TS_RANGE
-                || *t == Type::TSTZ_RANGE
-                || *t == Type::DATE_RANGE =>
-        {
-            try_extract_range(row, index)
+        // hstore is an extension type (no well-known OID), matched by name like
+        // the builtin driver's `extract/simple.rs::extract_or_null`. tokio-postgres
+        // decodes it natively as HashMap<String, Option<String>>.
+        ref t if t.name() == "hstore" => {
+            try_extract::<HashMap<String, Option<String>>>(row, index, |v| {
+                serde_json::to_value(v).unwrap_or(JsonValue::Null)
+            })
         }
+        _ => extract_string_or_null_fallback(row, index),
+    }
+}
+
+/// `Kind::Array(_)` bucket: the eight hardcoded fast-paths (checked against
+/// the outer array `Type::` constant, unchanged from the pre-restructure
+/// flat match), falling back to the generic per-element decoder for any
+/// other array element type (e.g. `enum[]`, `hstore[]`).
+fn extract_array_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
+    match *col_type {
         ref t if *t == Type::INT2_ARRAY => try_extract::<Vec<Option<i16>>>(row, index, |v| {
             JsonValue::Array(
                 v.into_iter()
@@ -149,21 +181,6 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
                     .collect(),
             )
         }),
-        // Enums are custom-OID types, so tokio_postgres's built-in `FromSql for
-        // String` (which enforces known-OID checks) can't decode them — read the
-        // raw label bytes directly, matching the builtin driver's
-        // `extract/enum.rs::extract_or_null`.
-        ref t if matches!(t.kind(), Kind::Enum(_)) => {
-            try_extract::<EnumLabel>(row, index, |v| JsonValue::String(v.0))
-        }
-        // hstore is an extension type (no well-known OID), matched by name like
-        // the builtin driver's `extract/simple.rs::extract_or_null`. tokio-postgres
-        // decodes it natively as HashMap<String, Option<String>>.
-        ref t if t.name() == "hstore" => {
-            try_extract::<HashMap<String, Option<String>>>(row, index, |v| {
-                serde_json::to_value(v).unwrap_or(JsonValue::Null)
-            })
-        }
         // Generic fallback for arrays whose element type isn't one of the
         // hardcoded fast-paths above (int2/int4/int8/float4/float8/bool/
         // text/varchar) — e.g. enum[] or hstore[]. tokio_postgres's built-in
@@ -172,20 +189,42 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
         // scalar column of that type" — so this parses the array wire
         // format directly and recurses per-element, matching the builtin
         // driver's generic `Kind::Array` dispatch (`extract/mod.rs` +
-        // `extract/array.rs::try_extract_elem`). Placed after the hardcoded
-        // array arms so their exact existing behavior is unaffected.
-        ref t if matches!(t.kind(), Kind::Array(_)) => {
-            try_extract::<ArrayValue>(row, index, |v| v.0)
+        // `extract/array.rs::try_extract_elem`).
+        _ => try_extract::<ArrayValue>(row, index, |v| v.0),
+    }
+}
+
+/// `Kind::Range(_)` bucket. PostgreSQL's six built-in range types are
+/// enumerated explicitly (unchanged from the pre-restructure flat match)
+/// rather than accepting any `Kind::Range` generically — an
+/// extension-defined range type falls to the same string-or-null fallback
+/// every other unhandled type does, matching pre-restructure behavior
+/// exactly (broadening this to "any Kind::Range" is new-type scope, not a
+/// restructure).
+fn extract_range_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
+    match *col_type {
+        ref t
+            if *t == Type::INT4_RANGE
+                || *t == Type::INT8_RANGE
+                || *t == Type::NUM_RANGE
+                || *t == Type::TS_RANGE
+                || *t == Type::TSTZ_RANGE
+                || *t == Type::DATE_RANGE =>
+        {
+            try_extract_range(row, index)
         }
-        // For types not explicitly handled (ranges, composites, geometric, etc.),
-        // fall back to text representation via the Display trait on the raw bytes.
-        _ => {
-            // Try as string — many types have text representations
-            match row.try_get::<_, String>(index) {
-                Ok(s) => JsonValue::String(s),
-                Err(_) => JsonValue::Null,
-            }
-        }
+        _ => extract_string_or_null_fallback(row, index),
+    }
+}
+
+/// Fallback for any type not explicitly handled: many types have text
+/// representations, so try decoding as a plain string before giving up and
+/// returning `Null`. This is the single fallback path every unmatched type
+/// (in any `Kind`) reaches — unchanged from the pre-restructure catch-all.
+fn extract_string_or_null_fallback(row: &Row, index: usize) -> JsonValue {
+    match row.try_get::<_, String>(index) {
+        Ok(s) => JsonValue::String(s),
+        Err(_) => JsonValue::Null,
     }
 }
 
