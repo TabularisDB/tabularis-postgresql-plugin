@@ -1,0 +1,277 @@
+name: Prepare release
+
+# Manual only — no push/schedule/pull_request trigger. This job pushes a
+# version-bump commit and tag directly to main, so it only ever runs when a
+# human explicitly asks for it from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview the version bump and changelog without committing/tagging/pushing"
+        type: boolean
+        default: true
+
+concurrency: prepare-release
+
+jobs:
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure running from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::This workflow must be run from main (got ${{ github.ref }}) — releases are cut from main only."
+          exit 1
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve baseline version
+        id: baseline
+        run: |
+          git fetch --tags --quiet
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$TAG" ]; then
+            BASELINE="${TAG#v}"
+          else
+            BASELINE=$(jq -r .version .tabularium)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$BASELINE" >> "$GITHUB_OUTPUT"
+
+      # Every squash-merge commit in this repo's history carries a "(#NN)"
+      # suffix. Commits without one (direct pushes, e.g. past bump commits)
+      # are skipped — a bump commit sits AT the tag, never after it, so
+      # this range never actually contains one in practice.
+      - name: Gather merged PRs since last tag
+        id: gather
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.baseline.outputs.tag }}"
+          RANGE="HEAD"
+          [ -n "$TAG" ] && RANGE="$TAG..HEAD"
+
+          PR_NUMBERS=$(git log "$RANGE" --first-parent --oneline | grep -oE '\(#[0-9]+\)$' | grep -oE '[0-9]+' || true)
+
+          PRS_JSON="[]"
+          for N in $PR_NUMBERS; do
+            PR=$(gh pr view "$N" --json number,title,body,labels 2>/dev/null || echo "")
+            if [ -z "$PR" ]; then
+              echo "::warning::Could not fetch PR #$N (commit had a (#$N) suffix but gh pr view failed) — skipping"
+              continue
+            fi
+            PRS_JSON=$(echo "$PRS_JSON" | jq --argjson pr "$PR" '. + [$pr]')
+          done
+
+          {
+            echo "prs<<PRSEOF"
+            echo "$PRS_JSON"
+            echo "PRSEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Classify PRs, compute next version, draft changelog
+        id: plan
+        env:
+          # Routed through env vars (not interpolated directly into the
+          # script text) because PR titles/bodies are attacker-influenceable
+          # — any external contributor's PR title ends up here. Reading via
+          # process.env avoids the classic Actions script-injection hole
+          # where ${{ }} text-substitutes untrusted content into code.
+          PRS_JSON: ${{ steps.gather.outputs.prs }}
+          BASELINE_VERSION: ${{ steps.baseline.outputs.version }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { classifyTitle, highestChannel, CHANNEL_RANK, computeNextVersion } = require("./.github/scripts/version.js");
+
+            const prs = JSON.parse(process.env.PRS_JSON);
+            const baselineStr = process.env.BASELINE_VERSION;
+            const classRank = { none: 0, patch: 1, minor: 2, major: 3 };
+
+            const errors = [];
+            const classified = [];
+            let maxClass = "none";
+
+            for (const pr of prs) {
+              let result;
+              try {
+                result = classifyTitle(pr.title, pr.body || "");
+              } catch (e) {
+                errors.push(`PR #${pr.number}: ${e.message}`);
+                continue;
+              }
+              classified.push({ ...pr, ...result });
+              if (classRank[result.class] > classRank[maxClass]) maxClass = result.class;
+            }
+            if (errors.length) {
+              core.setFailed(errors.join("\n"));
+              return;
+            }
+
+            const releasable = classified.filter(pr => pr.class !== "none");
+
+            if (releasable.length === 0) {
+              core.setOutput("has_release", "false");
+              return;
+            }
+
+            let channel = null;
+            for (const pr of releasable) {
+              const names = pr.labels.map(l => l.name);
+              const prChannel = highestChannel(names);
+              if (!prChannel) {
+                errors.push(`PR #${pr.number} ("${pr.title}") classifies as '${pr.class}' but has no prerelease:alpha|beta|rc|stable label.`);
+                continue;
+              }
+              if (!channel || CHANNEL_RANK[prChannel] > CHANNEL_RANK[channel]) channel = prChannel;
+            }
+            if (errors.length) {
+              core.setFailed(errors.join("\n"));
+              return;
+            }
+
+            const nextVersion = computeNextVersion(baselineStr, maxClass, channel);
+
+            const sectionFor = (type) => {
+              if (type === "feat") return "Added";
+              if (type === "fix") return "Fixed";
+              return "Changed";
+            };
+            const bySection = {};
+            for (const pr of releasable) {
+              const section = sectionFor(pr.type);
+              (bySection[section] ??= []).push(`- ${pr.title} (#${pr.number})`);
+            }
+            const draftLines = [];
+            for (const section of ["Added", "Changed", "Fixed", "Removed"]) {
+              if (bySection[section]) {
+                draftLines.push(`### ${section}`, "", ...bySection[section], "");
+              }
+            }
+
+            core.setOutput("has_release", "true");
+            core.setOutput("next_version", nextVersion);
+            core.setOutput("channel", channel);
+            core.setOutput("class", maxClass);
+            core.setOutput("changelog_draft", draftLines.join("\n").trimEnd());
+            core.setOutput("pr_summary", releasable.map(pr => `- #${pr.number} (${pr.type}): ${pr.title}`).join("\n"));
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          HAS_RELEASE: ${{ steps.plan.outputs.has_release }}
+          BASELINE_TAG: ${{ steps.baseline.outputs.tag }}
+          BASELINE_VERSION: ${{ steps.baseline.outputs.version }}
+          NEXT_VERSION: ${{ steps.plan.outputs.next_version }}
+          CHANNEL: ${{ steps.plan.outputs.channel }}
+          PR_SUMMARY: ${{ steps.plan.outputs.pr_summary }}
+          CHANGELOG_DRAFT: ${{ steps.plan.outputs.changelog_draft }}
+        run: |
+          {
+            if [ "$HAS_RELEASE" != "true" ]; then
+              echo "## Dry run"
+              echo ""
+              echo "No releasable changes since \`$BASELINE_TAG\`."
+            else
+              echo "## Dry run — no changes committed, tagged, or pushed"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Current | \`$BASELINE_VERSION\` |"
+              echo "| Next version | \`$NEXT_VERSION\` |"
+              echo "| Channel | \`$CHANNEL\` |"
+              echo ""
+              echo "### PRs included"
+              echo ""
+              echo "$PR_SUMMARY"
+              echo ""
+              echo "### Draft CHANGELOG section"
+              echo ""
+              echo '```markdown'
+              echo "$CHANGELOG_DRAFT"
+              echo '```'
+              echo ""
+              echo "Re-run with \`dry_run: false\` to commit, tag, and push this release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bump version files
+        if: ${{ !inputs.dry_run && steps.plan.outputs.has_release == 'true' }}
+        env:
+          NEXT_VERSION: ${{ steps.plan.outputs.next_version }}
+        run: |
+          cargo install cargo-edit --locked
+          cargo set-version "$NEXT_VERSION"
+
+          jq --arg v "$NEXT_VERSION" '.version = $v' .tabularium > .tabularium.tmp
+          mv .tabularium.tmp .tabularium
+
+      - name: Update CHANGELOG
+        if: ${{ !inputs.dry_run && steps.plan.outputs.has_release == 'true' }}
+        env:
+          NEXT_VERSION: ${{ steps.plan.outputs.next_version }}
+          CHANGELOG_DRAFT: ${{ steps.plan.outputs.changelog_draft }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require("fs");
+
+            const version = process.env.NEXT_VERSION;
+            const draft = process.env.CHANGELOG_DRAFT;
+            const date = new Date().toISOString().slice(0, 10);
+            const newHeader = `## [${version}] - ${date}`;
+
+            let content = fs.readFileSync("CHANGELOG.md", "utf8");
+            const unreleasedMatch = content.match(/^## \[Unreleased\]\n([\s\S]*?)(?=\n## |\n?$)/m);
+
+            if (unreleasedMatch) {
+              const existingSection = unreleasedMatch[1];
+              const missing = draft
+                .split("\n\n")
+                .filter(block => block.trim())
+                .filter(block => {
+                  const prMatch = block.match(/\(#(\d+)\)/);
+                  return prMatch && !existingSection.includes(`(#${prMatch[1]})`);
+                });
+              const appended = missing.length ? `${existingSection.trimEnd()}\n\n${missing.join("\n\n")}\n` : existingSection;
+              content = content.replace(unreleasedMatch[0], `${newHeader}\n${appended}`);
+            } else {
+              content = content.replace(/^# Changelog\n/, `# Changelog\n\n${newHeader}\n\n${draft}\n`);
+            }
+
+            fs.writeFileSync("CHANGELOG.md", content);
+
+      - name: Verify
+        if: ${{ !inputs.dry_run && steps.plan.outputs.has_release == 'true' }}
+        run: |
+          cargo build
+          cargo test --lib --bins
+          cargo clippy --all-targets -- -D warnings
+          cargo fmt --all -- --check
+          npx --yes markdownlint-cli CHANGELOG.md
+          npx --yes @tabularium/cli validate .tabularium --registry https://registry.tabularis.dev --kind driver
+
+      - name: Commit, tag, and push
+        if: ${{ !inputs.dry_run && steps.plan.outputs.has_release == 'true' }}
+        env:
+          NEXT_VERSION: ${{ steps.plan.outputs.next_version }}
+          PR_SUMMARY: ${{ steps.plan.outputs.pr_summary }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .tabularium Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "Bump version to $NEXT_VERSION" -m "PRs included:" -m "$PR_SUMMARY" -m "Verified: cargo build/test/clippy/fmt, markdownlint, and .tabularium schema validation all passed in CI."
+          git tag -a "v$NEXT_VERSION" -m "v$NEXT_VERSION"
+          git push origin HEAD:main --follow-tags
+
+      - name: No-release summary
+        if: ${{ !inputs.dry_run && steps.plan.outputs.has_release != 'true' }}
+        env:
+          BASELINE_TAG: ${{ steps.baseline.outputs.tag }}
+        run: echo "No releasable changes since \`$BASELINE_TAG\` — nothing to do." >> "$GITHUB_STEP_SUMMARY"

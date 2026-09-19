@@ -74,50 +74,42 @@ jobs:
       # flag into a version-bump class. Requires the prerelease:* label to
       # know which channel (alpha/beta/rc/stable) to suggest — see README's
       # "Contributing: PR Titles & Versioning" for the full convention.
+      # Logic lives in .github/scripts/version.js, shared with
+      # prepare-release.yml's multi-PR aggregation.
       - name: Classify PR title and resolve prerelease channel
         id: classify
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_LABELS: ${{ toJson(github.event.pull_request.labels) }}
-        run: |
-          PATTERN='^([a-zA-Z]+)(\(([^)]+)\))?(!)?: (.+)$'
-          if [[ "$PR_TITLE" =~ $PATTERN ]]; then
-            TYPE="${BASH_REMATCH[1]}"
-            BANG="${BASH_REMATCH[4]}"
-          else
-            echo "::error::PR title does not match Conventional Commits format (type: subject) — cannot classify."
-            exit 1
-          fi
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { classifyTitle, highestChannel, CHANNEL_RANK } = require("./.github/scripts/version.js");
 
-          BREAKING=false
-          [ -n "$BANG" ] && BREAKING=true
-          if echo "$PR_BODY" | grep -qiE "^BREAKING[ -]CHANGE:"; then
-            BREAKING=true
-          fi
+            let result;
+            try {
+              result = classifyTitle(context.payload.pull_request.title, context.payload.pull_request.body || "");
+            } catch (e) {
+              core.setFailed(`${e.message} — cannot classify.`);
+              return;
+            }
 
-          case "$TYPE" in
-            feat) CLASS=minor ;;
-            fix|refactor|perf) CLASS=patch ;;
-            docs|style|chore|test|ci|build) CLASS=none ;;
-            *) CLASS=none ;;
-          esac
-          [ "$BREAKING" = true ] && CLASS=major
+            const labelNames = context.payload.pull_request.labels.map(l => l.name);
+            for (const name of labelNames.filter(n => n.startsWith("prerelease:"))) {
+              const value = name.slice("prerelease:".length);
+              if (!(value in CHANNEL_RANK)) {
+                core.setFailed(`Unrecognized prerelease label value '${value}' — expected alpha, beta, rc, or stable.`);
+                return;
+              }
+            }
 
-          CHANNEL=$(echo "$PR_LABELS" | jq -r '[.[] | select(.name | startswith("prerelease:")) | .name][0] // ""' | sed 's/^prerelease://')
-          if [ -z "$CHANNEL" ]; then
-            echo "::error::No prerelease:alpha|beta|rc|stable label found on this PR. Add one so the version suggestion knows which channel to target — see README's 'Contributing: PR Titles & Versioning'."
-            exit 1
-          fi
-          case "$CHANNEL" in
-            alpha|beta|rc|stable) ;;
-            *) echo "::error::Unrecognized prerelease label value '$CHANNEL' — expected alpha, beta, rc, or stable."; exit 1 ;;
-          esac
+            const channel = highestChannel(labelNames);
+            if (!channel) {
+              core.setFailed("No prerelease:alpha|beta|rc|stable label found on this PR. Add one so the version suggestion knows which channel to target — see README's 'Contributing: PR Titles & Versioning'.");
+              return;
+            }
 
-          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
-          echo "breaking=$BREAKING" >> "$GITHUB_OUTPUT"
-          echo "class=$CLASS" >> "$GITHUB_OUTPUT"
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+            core.setOutput("type", result.type);
+            core.setOutput("breaking", result.breaking);
+            core.setOutput("class", result.class);
+            core.setOutput("channel", channel);
 
       - name: Resolve baseline version
         id: baseline
@@ -135,50 +127,14 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
+            const { computeNextVersion } = require("./.github/scripts/version.js");
+
             const classification = "${{ steps.classify.outputs.class }}";
             const channel = "${{ steps.classify.outputs.channel }}";
             const type = "${{ steps.classify.outputs.type }}";
             const breaking = "${{ steps.classify.outputs.breaking }}" === "true";
             const baselineStr = "${{ steps.baseline.outputs.version }}";
             const marker = "<!-- version-suggestion-bot";
-
-            function parseVersion(v) {
-              const m = v.match(/^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z]+)\.(\d+))?$/);
-              if (!m) throw new Error(`Cannot parse version: ${v}`);
-              return {
-                major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]),
-                stage: m[4] || null, stageNum: m[5] ? Number(m[5]) : null,
-              };
-            }
-            function formatVersion(v) {
-              const base = `${v.major}.${v.minor}.${v.patch}`;
-              return v.stage ? `${base}-${v.stage}.${v.stageNum}` : base;
-            }
-            function bumpStable(v, cls) {
-              const out = { major: v.major, minor: v.minor, patch: v.patch, stage: null, stageNum: null };
-              if (cls === "major") { out.major += 1; out.minor = 0; out.patch = 0; }
-              else if (cls === "minor") { out.minor += 1; out.patch = 0; }
-              else if (cls === "patch") { out.patch += 1; }
-              return out;
-            }
-            function computeNextVersion(baselineStr, classification, channelLabel) {
-              const baseline = parseVersion(baselineStr);
-              if (channelLabel === "stable") {
-                if (baseline.stage) {
-                  return formatVersion({ major: baseline.major, minor: baseline.minor, patch: baseline.patch, stage: null, stageNum: null });
-                }
-                return formatVersion(bumpStable(baseline, classification));
-              }
-              if (baseline.stage === channelLabel) {
-                return formatVersion({ ...baseline, stageNum: baseline.stageNum + 1 });
-              }
-              let base = { major: baseline.major, minor: baseline.minor, patch: baseline.patch };
-              if (!baseline.stage) {
-                const bumped = bumpStable(baseline, classification);
-                base = { major: bumped.major, minor: bumped.minor, patch: bumped.patch };
-              }
-              return formatVersion({ ...base, stage: channelLabel, stageNum: 1 });
-            }
 
             const prNumber = context.payload.pull_request.number;
 
