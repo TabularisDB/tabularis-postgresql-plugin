@@ -133,13 +133,14 @@ pub async fn release(session_id: &str) {
 }
 
 /// Roll back and release every pinned connection, so shutdown leaves no
-/// transaction open on the server.
+/// transaction open on the server. A session a run still holds is skipped
+/// rather than waited for; its connection closes with the process.
 pub async fn release_all() {
     let slots: Vec<Arc<Mutex<Slot>>> = sessions().lock().await.drain().map(|(_, s)| s).collect();
-    let mut clients = Vec::new();
-    for slot in slots {
-        clients.extend(slot.lock().await.take());
-    }
+    let clients: Vec<Client> = slots
+        .iter()
+        .filter_map(|slot| slot.try_lock().ok().and_then(|mut s| s.take()))
+        .collect();
 
     if clients.is_empty() {
         return;

@@ -41,3 +41,13 @@ async fn sweep_keeps_a_slot_that_a_run_holds() {
     drop(held);
     waiter.await.unwrap();
 }
+
+#[tokio::test]
+async fn sweep_forgets_a_slot_nothing_uses() {
+    drop(lock("session-tests-unused").await);
+    sweep_idle().await;
+    assert!(!super::sessions()
+        .lock()
+        .await
+        .contains_key("session-tests-unused"));
+}
