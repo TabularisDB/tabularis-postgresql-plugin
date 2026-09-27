@@ -168,6 +168,10 @@ pub async fn get_table_ddl(id: Value, params: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("public");
 
+    if let Err(e) = ensure_base_table(&conn_params, table, schema).await {
+        return error_response(id, -32603, &e);
+    }
+
     let columns = match fetch_table_columns(&conn_params, table, schema).await {
         Ok(columns) => columns,
         Err(e) => return error_response(id, -32603, &e),
@@ -176,6 +180,36 @@ pub async fn get_table_ddl(id: Value, params: &Value) -> Value {
     match build_table_ddl(schema, table, &columns) {
         Ok(ddl) => ok_response(id, json!(ddl)),
         Err(e) => error_response(id, -32603, &e),
+    }
+}
+
+/// `dump_database` normally lists tables via `get_tables` (already
+/// restricted to `BASE TABLE`), but an explicit table selection bypasses
+/// that and can name a view — or a foreign/partitioned table — directly.
+/// Reject anything that isn't an ordinary table instead of silently
+/// reconstructing DDL that doesn't reflect what the object actually is.
+async fn ensure_base_table(
+    conn_params: &ConnectionParams,
+    table: &str,
+    schema: &str,
+) -> Result<(), String> {
+    let rows = client::query_rows(
+        conn_params,
+        "SELECT table_type::text FROM information_schema.tables \
+         WHERE table_schema = $1 AND table_name = $2",
+        &[&schema, &table],
+    )
+    .await?;
+
+    match rows
+        .first()
+        .and_then(|r| r.try_get::<_, String>("table_type").ok())
+    {
+        Some(t) if t == "BASE TABLE" => Ok(()),
+        Some(other) => Err(format!(
+            "{table} is a {other}, not a base table; get_table_ddl only supports base tables"
+        )),
+        None => Err(format!("Table {table} not found or empty")),
     }
 }
 
@@ -196,12 +230,13 @@ fn build_table_ddl(schema: &str, table: &str, columns: &[Value]) -> Result<Strin
         let is_nullable = col["is_nullable"].as_bool().unwrap_or(false);
         let is_pk = col["is_pk"].as_bool().unwrap_or(false);
 
-        let mut def = format!("\"{name}\" {data_type}");
+        let quoted_name = crate::utils::identifiers::quote_identifier(name);
+        let mut def = format!("{quoted_name} {data_type}");
         if !is_nullable {
             def.push_str(" NOT NULL");
         }
         if is_pk {
-            pks.push(format!("\"{name}\""));
+            pks.push(quoted_name);
         }
         defs.push(def);
     }

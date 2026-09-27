@@ -1753,8 +1753,57 @@ fn get_table_ddl_reports_an_error_for_a_missing_table() {
         }),
     );
 
+    let error = response
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .expect("get_table_ddl on a nonexistent table must return a JSON-RPC error");
+    assert_eq!(
+        error, "Table live_db_ddl_table_that_does_not_exist not found or empty",
+        "the not-found message must name the missing table, not a generic failure"
+    );
+}
+
+#[test]
+fn get_table_ddl_rejects_a_view_instead_of_fabricating_wrong_ddl() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // dump_database normally lists tables via get_tables (BASE TABLE
+    // only), but an explicit table selection bypasses that and can name a
+    // view directly — get_table_ddl must reject it, not silently return a
+    // CREATE TABLE that doesn't reflect the view's real definition.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP VIEW IF EXISTS live_db_ddl_view_scratch",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE VIEW live_db_ddl_view_scratch AS SELECT 1 AS id",
+        }),
+    );
+
+    let response = plugin.call(
+        "get_table_ddl",
+        json!({
+            "params": params,
+            "table": "live_db_ddl_view_scratch",
+            "schema": "public",
+        }),
+    );
+
+    let error = response
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .expect("get_table_ddl on a view must return a JSON-RPC error, not fabricated DDL");
     assert!(
-        response.get("error").is_some(),
-        "get_table_ddl on a nonexistent table must return a JSON-RPC error, got: {response:?}"
+        error.contains("live_db_ddl_view_scratch") && error.contains("VIEW"),
+        "error should name the object and the kind mismatch, got: {error}"
     );
 }

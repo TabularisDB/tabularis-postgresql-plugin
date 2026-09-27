@@ -124,3 +124,23 @@ fn schema_and_table_are_quote_escaped_in_the_qualified_name() {
 
     assert!(ddl.starts_with("CREATE TABLE \"public\".\"weird\"\"table\" ("));
 }
+
+#[test]
+fn column_names_with_embedded_quotes_are_escaped_not_truncated() {
+    // A column named `we"ird` is legal PostgreSQL (CREATE TABLE t
+    // ("we""ird" int)). Bare `"{name}"` interpolation would terminate the
+    // identifier early and corrupt the statement; it must come out escaped
+    // as `"we""ird"`, exactly like the schema/table name is.
+    let columns = vec![column("we\"ird", "integer", false, true)];
+
+    let ddl = build_table_ddl("public", "t", &columns).unwrap();
+
+    assert!(
+        ddl.contains("\"we\"\"ird\" integer NOT NULL"),
+        "column def not escaped correctly: {ddl}"
+    );
+    assert!(
+        ddl.contains("PRIMARY KEY (\"we\"\"ird\")"),
+        "primary key column not escaped correctly: {ddl}"
+    );
+}
