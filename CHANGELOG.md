@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `get_table_ddl` RPC method, returning a reconstructed `CREATE TABLE`
+  statement for an existing table so the host's `dump_database` can write
+  a schema-preserving dump for plugin-registered PostgreSQL connections
+  instead of failing with "method not implemented" (#118).
+
 ## [1.0.0-rc.4] - 2026-09-17
 
 ### Added
