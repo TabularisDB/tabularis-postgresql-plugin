@@ -14,13 +14,17 @@
 //! which resets nothing, so a pinned connection is always rolled back
 //! before it goes back to the pool — otherwise the next borrower would
 //! inherit the transaction and its locks.
+//!
+//! Each session has its own lock, held for a whole run, so two overlapping
+//! calls for one session run one after the other on the same connection
+//! instead of each taking a fresh one.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use deadpool_postgres::Client;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// A pooled client held between batches because the session that owns it
 /// left an explicit transaction open.
@@ -29,13 +33,32 @@ struct PinnedSession {
     last_used: Instant,
 }
 
+/// A session's pinned connection, if any. Holding the guard serializes runs.
+#[derive(Default)]
+pub struct Slot(Option<PinnedSession>);
+
+impl Slot {
+    /// Take the pinned connection; the caller must [`Slot::pin`] it again or end its transaction.
+    pub fn take(&mut self) -> Option<Client> {
+        self.0.take().map(|s| s.client)
+    }
+
+    /// Pin `client` until the session ends its transaction.
+    pub fn pin(&mut self, client: Client) {
+        self.0 = Some(PinnedSession {
+            client,
+            last_used: Instant::now(),
+        });
+    }
+}
+
 /// A pinned connection holds its transaction's locks until the session ends
 /// it. An abandoned session would hold them indefinitely, so one untouched
 /// for this long is rolled back and released by the periodic
 /// [`sweep_idle`].
 const MAX_IDLE: Duration = Duration::from_secs(30 * 60);
 
-type SessionMap = HashMap<String, PinnedSession>;
+type SessionMap = HashMap<String, Arc<Mutex<Slot>>>;
 
 fn sessions() -> &'static Mutex<SessionMap> {
     static SESSIONS: OnceLock<Mutex<SessionMap>> = OnceLock::new();
@@ -52,29 +75,39 @@ pub async fn rollback_and_release(client: Client) {
     }
 }
 
-/// Take the connection pinned to `session_id`, if any.
-///
-/// The caller owns the returned client and must either hand it back via
-/// [`store`] or end the transaction itself.
-pub async fn take(session_id: &str) -> Option<Client> {
-    sessions().lock().await.remove(session_id).map(|s| s.client)
+/// Lock `session_id`'s slot, waiting for any run already holding it.
+pub async fn lock(session_id: &str) -> OwnedMutexGuard<Slot> {
+    let slot = sessions()
+        .lock()
+        .await
+        .entry(session_id.to_string())
+        .or_default()
+        .clone();
+    slot.lock_owned().await
 }
 
-/// Roll back and release every session idle past [`MAX_IDLE`].
+/// Roll back and release every session idle past [`MAX_IDLE`], and forget
+/// slots nothing holds. A slot in use by a run is skipped.
 pub async fn sweep_idle() {
-    let expired: Vec<Client> = {
-        let mut map = sessions().lock().await;
+    let mut expired = Vec::new();
+    {
         let now = Instant::now();
-        let stale: Vec<String> = map
-            .iter()
-            .filter(|(_, s)| now.duration_since(s.last_used) > MAX_IDLE)
-            .map(|(id, _)| id.clone())
-            .collect();
-        stale
-            .iter()
-            .filter_map(|id| map.remove(id).map(|s| s.client))
-            .collect()
-    };
+        let mut map = sessions().lock().await;
+        map.retain(|_, slot| {
+            let Ok(mut guard) = slot.try_lock() else {
+                return true;
+            };
+            if guard
+                .0
+                .as_ref()
+                .is_some_and(|s| now.duration_since(s.last_used) > MAX_IDLE)
+            {
+                expired.extend(guard.take());
+            }
+            // Only the map holds it and nothing is pinned, so nobody can be waiting on it.
+            guard.0.is_some() || Arc::strong_count(slot) > 1
+        });
+    }
 
     if expired.is_empty() {
         return;
@@ -89,33 +122,10 @@ pub async fn sweep_idle() {
     }
 }
 
-/// Pin `client` to `session_id` until the session ends its transaction.
-pub async fn store(session_id: &str, client: Client) {
-    let previous = {
-        let mut map = sessions().lock().await;
-        map.insert(
-            session_id.to_string(),
-            PinnedSession {
-                client,
-                last_used: Instant::now(),
-            },
-        )
-    };
-
-    // Only reachable if two batches for one session overlapped; the older
-    // connection is no longer referenced by anything.
-    if let Some(stale) = previous {
-        rollback_and_release(stale.client).await;
-    }
-}
-
-/// Roll back and release the connection pinned to `session_id`, if any.
+/// Roll back and release the connection pinned to `session_id`, if any,
+/// after any run still in flight for it finishes.
 pub async fn release(session_id: &str) {
-    let client = {
-        let mut map = sessions().lock().await;
-        map.remove(session_id).map(|s| s.client)
-    };
-
+    let client = lock(session_id).await.take();
     if let Some(client) = client {
         log::info!("Releasing pinned session {session_id}");
         rollback_and_release(client).await;
@@ -125,10 +135,11 @@ pub async fn release(session_id: &str) {
 /// Roll back and release every pinned connection, so shutdown leaves no
 /// transaction open on the server.
 pub async fn release_all() {
-    let clients: Vec<Client> = {
-        let mut map = sessions().lock().await;
-        map.drain().map(|(_, s)| s.client).collect()
-    };
+    let slots: Vec<Arc<Mutex<Slot>>> = sessions().lock().await.drain().map(|(_, s)| s).collect();
+    let mut clients = Vec::new();
+    for slot in slots {
+        clients.extend(slot.lock().await.take());
+    }
 
     if clients.is_empty() {
         return;
@@ -138,3 +149,7 @@ pub async fn release_all() {
         rollback_and_release(client).await;
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod session_tests;

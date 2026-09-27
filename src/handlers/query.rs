@@ -108,10 +108,12 @@ async fn run_batch_in_session(
     schema: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<(Vec<Value>, bool), String> {
-    let pinned = match session_id {
-        Some(sid) => session::take(sid).await,
+    // Held for the whole run, so an overlapping call for the same session waits its turn.
+    let mut slot = match session_id {
+        Some(sid) => Some(session::lock(sid).await),
         None => None,
     };
+    let pinned = slot.as_mut().and_then(|s| s.take());
     // A pinned connection only exists because its transaction is still open.
     let mut in_transaction = pinned.is_some();
     let reused = pinned.is_some();
@@ -163,8 +165,8 @@ async fn run_batch_in_session(
         }
     }
 
-    match session_id {
-        Some(sid) if in_transaction => session::store(sid, pg_client).await,
+    match slot.as_mut() {
+        Some(slot) if in_transaction => slot.pin(pg_client),
         _ => {
             if in_transaction {
                 session::rollback_and_release(pg_client).await;
