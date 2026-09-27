@@ -1688,3 +1688,73 @@ fn execute_query_decodes_pgvector_types_correctly() {
         assert_eq!(all_null[col_idx], Value::Null, "{col_name} must be null");
     }
 }
+
+#[test]
+fn get_table_ddl_reconstructs_create_table_from_a_live_table() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // #118: dump_database routes schema dumps through get_table_ddl. This
+    // exercises the real query path (fetch_table_columns against a live
+    // server) end to end, not just the pure build_table_ddl string builder.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TABLE IF EXISTS live_db_ddl_scratch",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_ddl_scratch (\
+                       id integer NOT NULL, \
+                       tenant_id integer NOT NULL, \
+                       label text, \
+                       PRIMARY KEY (id, tenant_id))",
+        }),
+    );
+
+    let ddl = plugin.call_ok(
+        "get_table_ddl",
+        json!({
+            "params": params,
+            "table": "live_db_ddl_scratch",
+            "schema": "public",
+        }),
+    );
+
+    assert_eq!(
+        ddl,
+        json!(
+            "CREATE TABLE \"public\".\"live_db_ddl_scratch\" (\n  \
+             \"id\" integer NOT NULL,\n  \
+             \"tenant_id\" integer NOT NULL,\n  \
+             \"label\" text,\n  \
+             PRIMARY KEY (\"id\", \"tenant_id\")\n\
+             );"
+        ),
+        "get_table_ddl must reconstruct the CREATE TABLE byte-for-byte from live column metadata"
+    );
+}
+
+#[test]
+fn get_table_ddl_reports_an_error_for_a_missing_table() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    let response = plugin.call(
+        "get_table_ddl",
+        json!({
+            "params": params,
+            "table": "live_db_ddl_table_that_does_not_exist",
+            "schema": "public",
+        }),
+    );
+
+    assert!(
+        response.get("error").is_some(),
+        "get_table_ddl on a nonexistent table must return a JSON-RPC error, got: {response:?}"
+    );
+}
