@@ -272,6 +272,7 @@ fn in_transaction_after_treats_a_failed_commit_as_closing() {
     assert!(!Closes.in_transaction_after(false, true));
     assert!(!Chains.in_transaction_after(false, true));
     assert!(Chains.in_transaction_after(true, true));
+    assert!(Chains.in_transaction_after(true, false));
     assert!(Opens.in_transaction_after(true, false));
     // A failed BEGIN or ordinary statement leaves the state as it was.
     assert!(!Opens.in_transaction_after(false, false));

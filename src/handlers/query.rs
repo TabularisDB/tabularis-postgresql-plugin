@@ -416,7 +416,7 @@ impl TransactionEffect {
     /// Whether a transaction is open after a statement with this effect ran.
     pub fn in_transaction_after(self, succeeded: bool, before: bool) -> bool {
         match (self, succeeded) {
-            (TransactionEffect::Opens, true) => true,
+            (TransactionEffect::Opens | TransactionEffect::Chains, true) => true,
             // PostgreSQL ends the transaction even when COMMIT itself fails, e.g. on a deferred constraint.
             (TransactionEffect::Closes, _) | (TransactionEffect::Chains, false) => false,
             _ => before,
