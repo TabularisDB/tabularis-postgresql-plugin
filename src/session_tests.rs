@@ -51,3 +51,15 @@ async fn sweep_forgets_a_slot_nothing_uses() {
         .await
         .contains_key("session-tests-unused"));
 }
+
+#[tokio::test]
+async fn release_all_keeps_tracking_a_slot_a_run_holds() {
+    let held = lock("session-tests-busy-shutdown").await;
+    super::release_all().await;
+    // The run would otherwise pin into a slot nothing tracks, and it would never be rolled back.
+    assert!(super::sessions()
+        .lock()
+        .await
+        .contains_key("session-tests-busy-shutdown"));
+    drop(held);
+}

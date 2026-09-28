@@ -37,6 +37,16 @@ struct PinnedSession {
 #[derive(Default)]
 pub struct Slot(Option<PinnedSession>);
 
+/// A slot dropped while still holding a connection closes it rather than
+/// returning it to the pool, where the next borrower would inherit its transaction.
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(pinned) = self.0.take() {
+            drop(Client::take(pinned.client));
+        }
+    }
+}
+
 impl Slot {
     /// Take the pinned connection; the caller must [`Slot::pin`] it again or end its transaction.
     pub fn take(&mut self) -> Option<Client> {
@@ -136,11 +146,18 @@ pub async fn release(session_id: &str) {
 /// transaction open on the server. A session a run still holds is skipped
 /// rather than waited for; its connection closes with the process.
 pub async fn release_all() {
-    let slots: Vec<Arc<Mutex<Slot>>> = sessions().lock().await.drain().map(|(_, s)| s).collect();
-    let clients: Vec<Client> = slots
-        .iter()
-        .filter_map(|slot| slot.try_lock().ok().and_then(|mut s| s.take()))
-        .collect();
+    let mut clients: Vec<Client> = Vec::new();
+    // A busy slot stays in the map, so the run holding it can still pin into a tracked slot.
+    sessions()
+        .lock()
+        .await
+        .retain(|_, slot| match slot.try_lock() {
+            Ok(mut guard) => {
+                clients.extend(guard.take());
+                false
+            }
+            Err(_) => true,
+        });
 
     if clients.is_empty() {
         return;
