@@ -431,31 +431,89 @@ impl TransactionEffect {
 /// PL/pgSQL `BEGIN … END` body is not a concern: it arrives inside a `DO`
 /// or `CREATE FUNCTION` statement, whose leading keyword is neither.
 pub fn transaction_effect(query: &str) -> TransactionEffect {
-    let normalized = strip_leading_sql_comments(query);
-    // Five words cover the longest form, `COMMIT TRANSACTION AND NO CHAIN`.
-    let words: Vec<String> = normalized
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty())
-        .take(5)
-        .map(|w| w.to_uppercase())
-        .collect();
-    let second = words.get(1).map(String::as_str);
-    let chains = words.windows(2).any(|p| p[0] == "AND" && p[1] == "CHAIN");
+    // Six cover the longest form, `ROLLBACK TRANSACTION AND NO CHAIN`.
+    let mut words = leading_keywords(query, 6).into_iter();
+    let Some(first) = words.next() else {
+        return TransactionEffect::None;
+    };
+    let mut rest: Vec<String> = words.collect();
+    // `WORK` / `TRANSACTION` after a transaction-control verb is optional noise.
+    if matches!(first.as_str(), "COMMIT" | "END" | "ROLLBACK" | "ABORT")
+        && matches!(
+            rest.first().map(String::as_str),
+            Some("WORK" | "TRANSACTION")
+        )
+    {
+        rest.remove(0);
+    }
+    let second = rest.first().map(String::as_str);
+    let chains = rest.windows(2).any(|p| p[0] == "AND" && p[1] == "CHAIN");
 
-    match words.first().map(String::as_str) {
+    match first.as_str() {
         // `BEGIN` alone, `BEGIN TRANSACTION`, `BEGIN ISOLATION LEVEL …`.
-        Some("BEGIN") => TransactionEffect::Opens,
-        Some("START") if second == Some("TRANSACTION") => TransactionEffect::Opens,
+        "BEGIN" => TransactionEffect::Opens,
+        "START" if second == Some("TRANSACTION") => TransactionEffect::Opens,
         // Two-phase commit acts on a prepared transaction, not this session's.
-        Some("COMMIT" | "ROLLBACK") if second == Some("PREPARED") => TransactionEffect::None,
-        // `ROLLBACK TO [SAVEPOINT] x` unwinds to a savepoint and leaves the transaction open.
-        Some("ROLLBACK") if second == Some("TO") => TransactionEffect::None,
-        Some("COMMIT" | "END" | "ROLLBACK" | "ABORT") if chains => TransactionEffect::Chains,
-        Some("COMMIT" | "END" | "ROLLBACK" | "ABORT") => TransactionEffect::Closes,
+        "COMMIT" | "ROLLBACK" if second == Some("PREPARED") => TransactionEffect::None,
+        // `ROLLBACK [WORK] TO [SAVEPOINT] x` unwinds to a savepoint and leaves the transaction open.
+        "ROLLBACK" if second == Some("TO") => TransactionEffect::None,
+        "COMMIT" | "END" | "ROLLBACK" | "ABORT" if chains => TransactionEffect::Chains,
+        "COMMIT" | "END" | "ROLLBACK" | "ABORT" => TransactionEffect::Closes,
         // `PREPARE TRANSACTION` dissociates the transaction from the session.
-        Some("PREPARE") if second == Some("TRANSACTION") => TransactionEffect::Closes,
+        "PREPARE" if second == Some("TRANSACTION") => TransactionEffect::Closes,
         _ => TransactionEffect::None,
     }
+}
+
+/// The first `n` keywords of `query`, uppercased. Every `--` and (nested)
+/// `/* */` comment is skipped, wherever it appears, and reading stops at a
+/// string literal, dollar quote or `;`, so no data is read as a keyword.
+fn leading_keywords(query: &str, n: usize) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = query.chars().peekable();
+    let mut comment_depth = 0usize;
+    while let Some(c) = chars.next() {
+        if comment_depth > 0 {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                comment_depth -= 1;
+            } else if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                comment_depth += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c.to_ascii_uppercase());
+            continue;
+        }
+        if !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+            if words.len() == n {
+                return words;
+            }
+        }
+        match (c, chars.peek()) {
+            ('-', Some('-')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                comment_depth = 1;
+            }
+            ('\'' | '"' | '$' | ';', _) => return words,
+            _ => {}
+        }
+    }
+    if !word.is_empty() && words.len() < n {
+        words.push(word);
+    }
+    words
 }
 
 /// Strip leading SQL comments (`-- …` line comments and `/* … */` block

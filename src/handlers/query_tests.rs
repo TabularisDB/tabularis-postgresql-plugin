@@ -281,6 +281,35 @@ fn in_transaction_after_treats_a_failed_commit_as_closing() {
 }
 
 #[test]
+fn transaction_effect_reads_optional_noise_words_and_inner_comments() {
+    for (query, effect) in [
+        ("ROLLBACK WORK TO SAVEPOINT sp1", TransactionEffect::None),
+        (
+            "ROLLBACK TRANSACTION TO SAVEPOINT sp1",
+            TransactionEffect::None,
+        ),
+        ("COMMIT WORK", TransactionEffect::Closes),
+        (
+            "COMMIT -- and chain later if needed",
+            TransactionEffect::Closes,
+        ),
+        ("COMMIT /* and chain */", TransactionEffect::Closes),
+        ("START /* explicit */ TRANSACTION", TransactionEffect::Opens),
+        (
+            "COMMIT /* outer /* nested */ still comment */ AND CHAIN",
+            TransactionEffect::Chains,
+        ),
+        (
+            "ROLLBACK TRANSACTION AND NO CHAIN",
+            TransactionEffect::Closes,
+        ),
+        ("PREPARE TRANSACTION 'and chain'", TransactionEffect::Closes),
+    ] {
+        assert_eq!(transaction_effect(query), effect, "{query}");
+    }
+}
+
+#[test]
 fn transaction_effect_ignores_ordinary_statements() {
     for query in [
         "SELECT 1",
