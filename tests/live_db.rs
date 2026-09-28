@@ -1714,13 +1714,18 @@ fn commit_that_fails_on_a_deferred_constraint_releases_the_session() {
             "query": "INSERT INTO live_db_deferred_fk_scratch VALUES (1, 999)"
         }),
     );
-    let commit = plugin.call(
+    let commit = plugin.call_ok(
         "execute_query",
         json!({ "params": params, "session_id": session, "query": "COMMIT" }),
     );
     assert!(
-        commit.get("error").is_some(),
-        "COMMIT violating a deferred FK must error"
+        commit["error"].is_string(),
+        "COMMIT violating a deferred FK must report its error"
+    );
+    assert_eq!(
+        commit["in_transaction"],
+        json!(false),
+        "the failing COMMIT's own reply must say the transaction ended"
     );
 
     let after = plugin.call_ok(

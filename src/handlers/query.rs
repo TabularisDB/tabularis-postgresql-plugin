@@ -33,7 +33,11 @@ pub async fn execute_query(id: Value, params: &Value) -> Value {
             Ok((mut results, in_transaction)) => {
                 let statement = results.pop().unwrap_or(Value::Null);
                 match statement.get("error").and_then(Value::as_str) {
-                    Some(error) => error_response(id, -32603, error),
+                    // Still a reply, not an RPC error, so the host learns the state a failed COMMIT left.
+                    Some(error) => ok_response(
+                        id,
+                        json!({ "error": error, "in_transaction": in_transaction }),
+                    ),
                     None => {
                         let result = statement.get("result").cloned().unwrap_or(Value::Null);
                         ok_response(
