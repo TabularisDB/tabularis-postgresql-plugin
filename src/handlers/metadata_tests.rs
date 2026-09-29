@@ -257,18 +257,21 @@ fn column_default_value_drops_a_lowercase_null_default_to_match_builtin() {
     // `DEFAULT NULL`. The plugin's filter was case-sensitive (`== "NULL"`),
     // so it emitted a spurious `default_value: "null"` here. This is the
     // divergence the test proves before the fix.
+    //
+    // The second arg is the caller's already-computed `is_auto_increment`
+    // (false here — these aren't sequence/identity columns).
     assert_eq!(
-        column_default_value(Some("null"), "NO"),
+        column_default_value(Some("null"), false),
         None,
         "lowercase `null` default must be dropped, matching the builtin's case-insensitive filter"
     );
     assert_eq!(
-        column_default_value(Some("NULL"), "NO"),
+        column_default_value(Some("NULL"), false),
         None,
         "uppercase `NULL` default must be dropped (this case already worked)"
     );
     assert_eq!(
-        column_default_value(Some("Null"), "NO"),
+        column_default_value(Some("Null"), false),
         None,
         "mixed-case `Null` default must be dropped, matching the builtin's case-insensitive filter"
     );
@@ -280,22 +283,32 @@ fn column_default_value_drops_null_cast_prefixes() {
     // column with no real default; the builtin drops these too. The
     // `NULL::` prefix check stays case-sensitive in the builtin (only the
     // bare-null check is eq_ignore_ascii_case), so match that exactly.
-    assert_eq!(column_default_value(Some("NULL::text"), "NO"), None);
-    assert_eq!(column_default_value(Some("NULL::integer"), "NO"), None);
+    assert_eq!(column_default_value(Some("NULL::text"), false), None);
+    assert_eq!(column_default_value(Some("NULL::integer"), false), None);
 }
 
 #[test]
 fn column_default_value_surfaces_real_defaults_unchanged() {
     // Non-NULL defaults pass through verbatim — the value the host shows
-    // in the column's default cell.
-    assert_eq!(column_default_value(Some("0"), "NO"), Some("0".to_string()));
+    // in the column's default cell. (A string literal `'null'` is stored
+    // by PG as `'null'::text`, which doesn't match the bare-null check and
+    // so correctly survives as a real default.)
     assert_eq!(
-        column_default_value(Some("'neutral'"), "NO"),
+        column_default_value(Some("0"), false),
+        Some("0".to_string())
+    );
+    assert_eq!(
+        column_default_value(Some("'neutral'"), false),
         Some("'neutral'".to_string())
     );
     assert_eq!(
-        column_default_value(Some("now()"), "NO"),
+        column_default_value(Some("now()"), false),
         Some("now()".to_string())
+    );
+    assert_eq!(
+        column_default_value(Some("'null'::text"), false),
+        Some("'null'::text".to_string()),
+        "a string *literal* 'null' is a real default (PG stores it quoted+cast) and must survive, not be dropped as the bare keyword"
     );
 }
 
@@ -304,15 +317,22 @@ fn column_default_value_drops_auto_increment_defaults() {
     // SERIAL/IDENTITY columns carry a `nextval(...)` default or an
     // is_identity of YES; the host surfaces those as is_auto_increment,
     // not as default_value, so the raw default must not leak through.
+    // The caller computes is_auto_increment once (matching the builtin's
+    // single computation) and passes it in, so the helper just honors it.
     assert_eq!(
-        column_default_value(Some("nextval('users_id_seq'::regclass)"), "NO"),
+        column_default_value(Some("nextval('users_id_seq'::regclass)"), true),
         None,
-        "nextval default must be dropped (auto-increment)"
+        "a nextval default the caller flagged as auto-increment must be dropped"
     );
     assert_eq!(
-        column_default_value(Some("42"), "YES"),
+        column_default_value(Some("42"), true),
         None,
-        "is_identity=YES must drop the default regardless of its value"
+        "an is_identity=YES column (caller sets is_auto_increment=true) drops the default regardless of its value"
+    );
+    // Negative control: the same `42` default on a non-auto column survives.
+    assert_eq!(
+        column_default_value(Some("42"), false),
+        Some("42".to_string())
     );
 }
 
@@ -320,6 +340,10 @@ fn column_default_value_drops_auto_increment_defaults() {
 fn column_default_value_drops_empty_defaults() {
     // An empty string is not a meaningful default — drop it rather than
     // surfacing an empty default_value field.
-    assert_eq!(column_default_value(Some(""), "NO"), None);
-    assert_eq!(column_default_value(None, "NO"), None, "no default at all -> None");
+    assert_eq!(column_default_value(Some(""), false), None);
+    assert_eq!(
+        column_default_value(None, false),
+        None,
+        "no default at all -> None"
+    );
 }
