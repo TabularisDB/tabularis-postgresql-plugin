@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] - 2026-09-29
+
 ### Added
 
 - `get_table_ddl` RPC method, returning a reconstructed `CREATE TABLE`
@@ -33,6 +35,10 @@
   as-is. The pool recycles with `RecyclingMethod::Fast`, which resets
   nothing, so the next borrower inherited the open transaction and its
   locks. A connection is now always rolled back before it goes back.
+- `.tabularium` split its single `name` field into a stable `id` slug
+  (`postgresql`) and a human-readable `name` (`"PostgreSQL"`), per the
+  Tabularium 0.14.0+ identity/display-name split. Existing registry slug
+  and driver id are unchanged (#117).
 
 ## [1.0.0-rc.4] - 2026-09-17
 
