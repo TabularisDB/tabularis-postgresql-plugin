@@ -1807,3 +1807,183 @@ fn get_table_ddl_rejects_a_view_instead_of_fabricating_wrong_ddl() {
         "error should name the object and the kind mismatch, got: {error}"
     );
 }
+
+/// #121: `get_schema_snapshot` (and its batch building blocks
+/// `get_all_columns_batch`/`get_all_foreign_keys_batch`) return a
+/// schema's tables, columns, and foreign keys in one round trip instead
+/// of the O(tables) composition the host falls back to when these RPCs
+/// answer "method not found". Verifies the three RPCs against a live
+/// schema with a PK, an enum column, an FK, and a table with no FKs —
+/// the shapes the ER diagram window depends on.
+#[test]
+fn get_schema_snapshot_returns_tables_columns_and_foreign_keys() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained schema: a parent table with a PK + an enum column,
+    // a child table with an FK back to the parent, and an FK-free table
+    // to exercise the empty-foreign_keys fallback.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TABLE IF EXISTS live_db_snapshot_child",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TABLE IF EXISTS live_db_snapshot_parent",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TABLE IF EXISTS live_db_snapshot_lone",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP TYPE IF EXISTS live_db_snapshot_mood",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TYPE live_db_snapshot_mood AS ENUM ('happy', 'sad')",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_snapshot_parent \
+                       (id SERIAL PRIMARY KEY, mood live_db_snapshot_mood)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_snapshot_child \
+                       (id SERIAL PRIMARY KEY, parent_id INTEGER NOT NULL \
+                        REFERENCES live_db_snapshot_parent(id) ON DELETE CASCADE)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE live_db_snapshot_lone (id SERIAL PRIMARY KEY)",
+        }),
+    );
+
+    // get_all_columns_batch: object keyed by table name, each value an
+    // array of TableColumn-shaped objects (same shape as get_columns).
+    let columns_map = plugin.call_ok(
+        "get_all_columns_batch",
+        json!({ "params": params, "schema": "public" }),
+    );
+    let columns_map = columns_map
+        .as_object()
+        .expect("columns batch must be a JSON object keyed by table name");
+    let parent_cols = columns_map
+        .get("live_db_snapshot_parent")
+        .and_then(Value::as_array)
+        .expect("parent table must be in the columns batch");
+    let mood_col = parent_cols
+        .iter()
+        .find(|c| c["name"] == "mood")
+        .expect("mood column must be present");
+    assert_eq!(
+        mood_col["data_type"],
+        json!("enum('happy','sad')"),
+        "enum columns must decode to the enum(...) wire shape, same as get_columns"
+    );
+    let id_col = parent_cols
+        .iter()
+        .find(|c| c["name"] == "id")
+        .expect("id column must be present");
+    assert_eq!(
+        id_col["is_pk"],
+        json!(true),
+        "PK membership must surface in the batch"
+    );
+    assert_eq!(
+        id_col["is_auto_increment"],
+        json!(true),
+        "SERIAL must surface as auto-increment"
+    );
+
+    // get_all_foreign_keys_batch: object keyed by table name; the child
+    // has one FK, the parent and lone table have no entries (absent keys,
+    // matching the builtin's `unwrap_or_default` -> empty array).
+    let fks_map = plugin.call_ok(
+        "get_all_foreign_keys_batch",
+        json!({ "params": params, "schema": "public" }),
+    );
+    let fks_map = fks_map
+        .as_object()
+        .expect("FK batch must be a JSON object keyed by table name");
+    let child_fks = fks_map
+        .get("live_db_snapshot_child")
+        .and_then(Value::as_array)
+        .expect("child table must be in the FK batch");
+    assert_eq!(child_fks.len(), 1, "child has exactly one FK");
+    assert_eq!(
+        child_fks[0]["ref_table"],
+        json!("live_db_snapshot_parent"),
+        "FK ref_table must point at the parent"
+    );
+    assert_eq!(
+        child_fks[0]["on_delete"],
+        json!("CASCADE"),
+        "ON DELETE rule must surface in the batch"
+    );
+    assert!(
+        fks_map.get("live_db_snapshot_parent").is_none(),
+        "a table with no FKs must be absent from the FK batch, not present with an empty array"
+    );
+
+    // get_schema_snapshot: array of {name, columns, foreign_keys}, one
+    // entry per base table, in get_tables order.
+    let snapshot = plugin.call_ok(
+        "get_schema_snapshot",
+        json!({ "params": params, "schema": "public" }),
+    );
+    let snapshot = snapshot
+        .as_array()
+        .expect("schema snapshot must be a JSON array");
+    let find = |name: &str| -> &Value {
+        snapshot
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be in the snapshot: {snapshot:#?}"))
+    };
+    let parent = find("live_db_snapshot_parent");
+    assert!(
+        parent["columns"].is_array(),
+        "snapshot entry must carry a columns array"
+    );
+    assert!(
+        parent["foreign_keys"].is_array(),
+        "snapshot entry must carry a foreign_keys array"
+    );
+    let child = find("live_db_snapshot_child");
+    assert_eq!(
+        child["foreign_keys"].as_array().unwrap().len(),
+        1,
+        "child's snapshot entry must carry its FK"
+    );
+    let lone = find("live_db_snapshot_lone");
+    assert_eq!(
+        lone["foreign_keys"].as_array().unwrap().len(),
+        0,
+        "an FK-free table gets an empty foreign_keys array, not a missing one"
+    );
+}
