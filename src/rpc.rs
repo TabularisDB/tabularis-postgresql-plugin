@@ -32,6 +32,7 @@ pub async fn handle_line(line: &str) -> Value {
         "get_schemas" => handlers::metadata::get_schemas(id, &params).await,
         "get_tables" => handlers::metadata::get_tables(id, &params).await,
         "get_columns" => handlers::metadata::get_columns(id, &params).await,
+        "get_table_ddl" => handlers::metadata::get_table_ddl(id, &params).await,
         "get_foreign_keys" => handlers::metadata::get_foreign_keys(id, &params).await,
         "get_indexes" => handlers::metadata::get_indexes(id, &params).await,
         "get_views" => handlers::metadata::get_views(id, &params).await,

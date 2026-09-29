@@ -172,6 +172,7 @@ instead of reconnecting.
 | `get_schemas` | List schemas in the connected database |
 | `get_tables` | List tables in a schema |
 | `get_columns` / `get_view_columns` / `get_materialized_view_columns` | Column metadata for tables, views, and materialized views |
+| `get_table_ddl` | Reconstructed `CREATE TABLE` statement for an existing table, used by schema dumps |
 | `get_indexes` | Index metadata, including composite and unique indexes |
 | `get_foreign_keys` | Foreign key metadata, including cross-schema references |
 | `get_views` / `get_view_definition` / `create_view` / `alter_view` / `drop_view` | View lifecycle |
