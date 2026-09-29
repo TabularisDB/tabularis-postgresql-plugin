@@ -7,7 +7,7 @@
 //! (`.rules/rust.md` #4/#5) — loaded via
 //! `#[cfg(test)] #[path = "metadata_tests.rs"] mod metadata_tests;`.
 
-use super::{build_table_ddl, routine_query_for_version};
+use super::{build_table_ddl, column_default_value, routine_query_for_version};
 use serde_json::{json, Map, Value};
 
 #[test]
@@ -247,4 +247,79 @@ fn build_schema_snapshot_drops_table_comments_to_match_builtin_table_schema() {
         json!({"name": "with_comment", "columns": [], "foreign_keys": []}),
         "snapshot entry must be exactly the builtin's TableSchema shape (name/columns/foreign_keys), dropping comment"
     );
+}
+
+#[test]
+fn column_default_value_drops_a_lowercase_null_default_to_match_builtin() {
+    // #122: the builtin filters NULL defaults case-insensitively
+    // (eq_ignore_ascii_case("null")), so `DEFAULT null` (lowercase, which
+    // PostgreSQL accepts) must produce no default_value — same as
+    // `DEFAULT NULL`. The plugin's filter was case-sensitive (`== "NULL"`),
+    // so it emitted a spurious `default_value: "null"` here. This is the
+    // divergence the test proves before the fix.
+    assert_eq!(
+        column_default_value(Some("null"), "NO"),
+        None,
+        "lowercase `null` default must be dropped, matching the builtin's case-insensitive filter"
+    );
+    assert_eq!(
+        column_default_value(Some("NULL"), "NO"),
+        None,
+        "uppercase `NULL` default must be dropped (this case already worked)"
+    );
+    assert_eq!(
+        column_default_value(Some("Null"), "NO"),
+        None,
+        "mixed-case `Null` default must be dropped, matching the builtin's case-insensitive filter"
+    );
+}
+
+#[test]
+fn column_default_value_drops_null_cast_prefixes() {
+    // `NULL::<type>` casts are PostgreSQL's representation of a nullable
+    // column with no real default; the builtin drops these too. The
+    // `NULL::` prefix check stays case-sensitive in the builtin (only the
+    // bare-null check is eq_ignore_ascii_case), so match that exactly.
+    assert_eq!(column_default_value(Some("NULL::text"), "NO"), None);
+    assert_eq!(column_default_value(Some("NULL::integer"), "NO"), None);
+}
+
+#[test]
+fn column_default_value_surfaces_real_defaults_unchanged() {
+    // Non-NULL defaults pass through verbatim — the value the host shows
+    // in the column's default cell.
+    assert_eq!(column_default_value(Some("0"), "NO"), Some("0".to_string()));
+    assert_eq!(
+        column_default_value(Some("'neutral'"), "NO"),
+        Some("'neutral'".to_string())
+    );
+    assert_eq!(
+        column_default_value(Some("now()"), "NO"),
+        Some("now()".to_string())
+    );
+}
+
+#[test]
+fn column_default_value_drops_auto_increment_defaults() {
+    // SERIAL/IDENTITY columns carry a `nextval(...)` default or an
+    // is_identity of YES; the host surfaces those as is_auto_increment,
+    // not as default_value, so the raw default must not leak through.
+    assert_eq!(
+        column_default_value(Some("nextval('users_id_seq'::regclass)"), "NO"),
+        None,
+        "nextval default must be dropped (auto-increment)"
+    );
+    assert_eq!(
+        column_default_value(Some("42"), "YES"),
+        None,
+        "is_identity=YES must drop the default regardless of its value"
+    );
+}
+
+#[test]
+fn column_default_value_drops_empty_defaults() {
+    // An empty string is not a meaningful default — drop it rather than
+    // surfacing an empty default_value field.
+    assert_eq!(column_default_value(Some(""), "NO"), None);
+    assert_eq!(column_default_value(None, "NO"), None, "no default at all -> None");
 }
