@@ -51,6 +51,15 @@ pub async fn get_tables(id: Value, params: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("public");
 
+    match fetch_tables(&conn_params, schema).await {
+        Ok(tables) => ok_response(id, json!(tables)),
+        Err(e) => error_response(id, -32603, &e),
+    }
+}
+
+/// Shared by `get_tables` and `get_schema_snapshot` — both need the
+/// schema's base tables (name + optional comment).
+async fn fetch_tables(conn_params: &ConnectionParams, schema: &str) -> Result<Vec<Value>, String> {
     let query = r#"
         SELECT t.table_name::text AS name, d.description::text AS comment
         FROM information_schema.tables t
@@ -64,27 +73,22 @@ pub async fn get_tables(id: Value, params: &Value) -> Value {
         ORDER BY t.table_name ASC
     "#;
 
-    match client::query_rows(&conn_params, query, &[&schema]).await {
-        Ok(rows) => {
-            let tables: Vec<Value> = rows
-                .iter()
-                .map(|r| {
-                    let name: String = r.try_get("name").unwrap_or_default();
-                    let comment: Option<String> = r.try_get("comment").ok().flatten();
-                    let mut table = json!({"name": name});
-                    if let Some(c) = comment {
-                        table
-                            .as_object_mut()
-                            .unwrap()
-                            .insert("comment".to_string(), json!(c));
-                    }
-                    table
-                })
-                .collect();
-            ok_response(id, json!(tables))
-        }
-        Err(e) => error_response(id, -32603, &e),
-    }
+    let rows = client::query_rows(conn_params, query, &[&schema]).await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let name: String = r.try_get("name").unwrap_or_default();
+            let comment: Option<String> = r.try_get("comment").ok().flatten();
+            let mut table = json!({"name": name});
+            if let Some(c) = comment {
+                table
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("comment".to_string(), json!(c));
+            }
+            table
+        })
+        .collect())
 }
 
 pub async fn get_columns(id: Value, params: &Value) -> Value {
@@ -263,30 +267,32 @@ pub async fn get_foreign_keys(id: Value, params: &Value) -> Value {
 
     match client::query_rows(&conn_params, query, &[&schema, &table]).await {
         Ok(rows) => {
-            let fks: Vec<Value> = rows
-                .iter()
-                .map(|r| {
-                    let name: String = r.try_get("constraint_name").unwrap_or_default();
-                    let column_name: String = r.try_get("column_name").unwrap_or_default();
-                    let ref_table: String = r.try_get("foreign_table_name").unwrap_or_default();
-                    let ref_column: String = r.try_get("foreign_column_name").unwrap_or_default();
-                    let on_update: Option<String> = r.try_get("update_rule").ok().flatten();
-                    let on_delete: Option<String> = r.try_get("delete_rule").ok().flatten();
-
-                    json!({
-                        "name": name,
-                        "column_name": column_name,
-                        "ref_table": ref_table,
-                        "ref_column": ref_column,
-                        "on_delete": on_delete,
-                        "on_update": on_update,
-                    })
-                })
-                .collect();
+            let fks: Vec<Value> = rows.iter().map(row_to_foreign_key).collect();
             ok_response(id, json!(fks))
         }
         Err(e) => error_response(id, -32603, &e),
     }
+}
+
+/// Map one `pg_constraint`-shaped FK row to the host's `ForeignKey` JSON
+/// shape. Shared by `get_foreign_keys` and `get_all_foreign_keys_batch`,
+/// which select the same columns (the batch variant adds `table_name`).
+fn row_to_foreign_key(r: &tokio_postgres::Row) -> Value {
+    let name: String = r.try_get("constraint_name").unwrap_or_default();
+    let column_name: String = r.try_get("column_name").unwrap_or_default();
+    let ref_table: String = r.try_get("foreign_table_name").unwrap_or_default();
+    let ref_column: String = r.try_get("foreign_column_name").unwrap_or_default();
+    let on_update: Option<String> = r.try_get("update_rule").ok().flatten();
+    let on_delete: Option<String> = r.try_get("delete_rule").ok().flatten();
+
+    json!({
+        "name": name,
+        "column_name": column_name,
+        "ref_table": ref_table,
+        "ref_column": ref_column,
+        "on_delete": on_delete,
+        "on_update": on_update,
+    })
 }
 
 pub async fn get_indexes(id: Value, params: &Value) -> Value {
@@ -949,14 +955,238 @@ pub async fn drop_trigger(id: Value, params: &Value) -> Value {
     }
 }
 
-pub async fn get_schema_snapshot(id: Value, _params: &Value) -> Value {
-    not_implemented(id, "get_schema_snapshot")
+/// All columns for every base table in a schema, in one query — the batch
+/// analog of `get_columns`. Mirrors the built-in driver's
+/// `get_all_columns_batch` byte-for-byte: same SELECT (reusing
+/// `row_to_table_column`) minus the `c.table_name = $2` filter, with
+/// `c.table_name` projected out and results ordered by table then
+/// ordinal position, grouped by table name into the host's
+/// `HashMap<String, Vec<TableColumn>>` wire shape (a JSON object).
+pub async fn get_all_columns_batch(id: Value, params: &Value) -> Value {
+    let conn_params = ConnectionParams::from_value(inner_params(params));
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
+
+    match fetch_all_columns(&conn_params, schema).await {
+        Ok(map) => ok_response(id, Value::Object(map)),
+        Err(e) => error_response(id, -32603, &e),
+    }
 }
-pub async fn get_all_columns_batch(id: Value, _params: &Value) -> Value {
-    not_implemented(id, "get_all_columns_batch")
+
+/// All foreign keys for every base table in a schema, in one query — the
+/// batch analog of `get_foreign_keys`. Mirrors the built-in driver's
+/// `get_all_foreign_keys_batch` byte-for-byte: same SELECT (reusing
+/// `row_to_foreign_key`) minus the `src_cl.relname = $2` filter, with
+/// `src_cl.relname` projected out and results ordered by table then
+/// constraint then column, grouped by table name into the host's
+/// `HashMap<String, Vec<ForeignKey>>` wire shape (a JSON object).
+pub async fn get_all_foreign_keys_batch(id: Value, params: &Value) -> Value {
+    let conn_params = ConnectionParams::from_value(inner_params(params));
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
+
+    match fetch_all_foreign_keys(&conn_params, schema).await {
+        Ok(map) => ok_response(id, Value::Object(map)),
+        Err(e) => error_response(id, -32603, &e),
+    }
 }
-pub async fn get_all_foreign_keys_batch(id: Value, _params: &Value) -> Value {
-    not_implemented(id, "get_all_foreign_keys_batch")
+
+/// A schema's tables, each with its columns and foreign keys, in one
+/// round trip on the host side — what the ER diagram window calls to
+/// render a schema. Mirrors the built-in driver's `get_schema_snapshot`:
+/// the same `get_tables` + `get_all_columns_batch` + `get_all_foreign_keys_batch`
+/// composition the host already falls back to (tabularis#822) when this
+/// RPC returns "method not found", but without the O(number of tables)
+/// extra round trips. Returns the host's `Vec<TableSchema>` wire shape
+/// (`[{name, columns, foreign_keys}]`).
+pub async fn get_schema_snapshot(id: Value, params: &Value) -> Value {
+    let conn_params = ConnectionParams::from_value(inner_params(params));
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
+
+    let tables = match fetch_tables(&conn_params, schema).await {
+        Ok(t) => t,
+        Err(e) => return error_response(id, -32603, &e),
+    };
+    let columns_map = match fetch_all_columns(&conn_params, schema).await {
+        Ok(m) => m,
+        Err(e) => return error_response(id, -32603, &e),
+    };
+    let fks_map = match fetch_all_foreign_keys(&conn_params, schema).await {
+        Ok(m) => m,
+        Err(e) => return error_response(id, -32603, &e),
+    };
+
+    ok_response(
+        id,
+        json!(build_schema_snapshot(tables, columns_map, fks_map)),
+    )
+}
+
+/// Shared by `get_all_columns_batch` and `get_schema_snapshot` — the
+/// batch column query without the RPC response envelope.
+async fn fetch_all_columns(
+    conn_params: &ConnectionParams,
+    schema: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let query = r#"
+        SELECT
+            c.table_name::text,
+            c.column_name::text,
+            CASE
+                WHEN c.data_type = 'USER-DEFINED' THEN c.udt_name::text
+                ELSE c.data_type::text
+            END AS data_type,
+            c.is_nullable::text,
+            c.column_default::text,
+            c.is_identity::text,
+            c.character_maximum_length,
+            d.description::text AS comment,
+            (SELECT string_agg('''' || replace(e.enumlabel, '''', '''''') || '''', ',' ORDER BY e.enumsortorder)
+             FROM pg_enum e
+             JOIN pg_type t ON t.oid = e.enumtypid
+             JOIN pg_namespace tn ON tn.oid = t.typnamespace
+             WHERE t.typname = c.udt_name AND tn.nspname = c.udt_schema) AS enum_values,
+            EXISTS (
+                SELECT 1
+                FROM pg_constraint pk_con
+                JOIN pg_class pk_table ON pk_table.oid = pk_con.conrelid
+                JOIN pg_namespace pk_schema ON pk_schema.oid = pk_table.relnamespace
+                JOIN unnest(pk_con.conkey) AS pk_col(attnum) ON true
+                JOIN pg_attribute pk_att
+                    ON pk_att.attrelid = pk_table.oid
+                    AND pk_att.attnum = pk_col.attnum
+                    AND NOT pk_att.attisdropped
+                WHERE pk_con.contype = 'p'
+                    AND pk_schema.nspname = c.table_schema
+                    AND pk_table.relname = c.table_name
+                    AND pk_att.attname = c.column_name
+            ) AS is_pk
+        FROM information_schema.columns c
+        JOIN pg_namespace n ON n.nspname = c.table_schema
+        JOIN pg_class pc ON pc.relnamespace = n.oid AND pc.relname = c.table_name
+        JOIN pg_attribute a ON a.attrelid = pc.oid AND a.attname = c.column_name
+        LEFT JOIN pg_description d
+            ON d.objoid = pc.oid
+            AND d.classoid = 'pg_class'::regclass
+            AND d.objsubid = a.attnum
+        WHERE c.table_schema = $1
+        ORDER BY c.table_name, c.ordinal_position
+    "#;
+
+    let rows = client::query_rows(conn_params, query, &[&schema]).await?;
+    Ok(group_rows_by_table(rows, row_to_table_column))
+}
+
+/// Shared by `get_all_foreign_keys_batch` and `get_schema_snapshot` — the
+/// batch FK query without the RPC response envelope.
+async fn fetch_all_foreign_keys(
+    conn_params: &ConnectionParams,
+    schema: &str,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let query = r#"
+        SELECT
+            src_cl.relname::text AS table_name,
+            con.conname::text AS constraint_name,
+            src_att.attname::text AS column_name,
+            ref_nsp.nspname::text AS foreign_schema_name,
+            ref_cl.relname::text AS foreign_table_name,
+            ref_att.attname::text AS foreign_column_name,
+            CASE con.confupdtype
+                WHEN 'a' THEN 'NO ACTION'
+                WHEN 'r' THEN 'RESTRICT'
+                WHEN 'c' THEN 'CASCADE'
+                WHEN 'n' THEN 'SET NULL'
+                WHEN 'd' THEN 'SET DEFAULT'
+            END::text AS update_rule,
+            CASE con.confdeltype
+                WHEN 'a' THEN 'NO ACTION'
+                WHEN 'r' THEN 'RESTRICT'
+                WHEN 'c' THEN 'CASCADE'
+                WHEN 'n' THEN 'SET NULL'
+                WHEN 'd' THEN 'SET DEFAULT'
+            END::text AS delete_rule
+        FROM pg_constraint con
+        JOIN pg_class src_cl ON src_cl.oid = con.conrelid
+        JOIN pg_namespace src_nsp ON src_nsp.oid = src_cl.relnamespace
+        JOIN pg_class ref_cl ON ref_cl.oid = con.confrelid
+        JOIN pg_namespace ref_nsp ON ref_nsp.oid = ref_cl.relnamespace
+        JOIN unnest(con.conkey, con.confkey) AS cols(src_attnum, ref_attnum) ON true
+        JOIN pg_attribute src_att
+            ON src_att.attrelid = src_cl.oid
+            AND src_att.attnum = cols.src_attnum
+            AND NOT src_att.attisdropped
+        JOIN pg_attribute ref_att
+            ON ref_att.attrelid = ref_cl.oid
+            AND ref_att.attnum = cols.ref_attnum
+            AND NOT ref_att.attisdropped
+        WHERE con.contype = 'f'
+          AND con.conparentid = 0
+          AND src_nsp.nspname = $1
+        ORDER BY src_cl.relname, con.conname, cols.src_attnum
+    "#;
+
+    let rows = client::query_rows(conn_params, query, &[&schema]).await?;
+    Ok(group_rows_by_table(rows, row_to_foreign_key))
+}
+
+/// Group rows into a JSON object keyed by each row's `table_name`, with
+/// each row mapped through `row_fn`. This is the host's
+/// `HashMap<String, Vec<_>>` wire shape — a table→rows JSON object. The
+/// SQL for both batch queries already orders by `table_name` first, so
+/// rows for a table arrive contiguously and the array per table
+/// preserves column/constraint ordering as queried.
+fn group_rows_by_table<F>(
+    rows: Vec<tokio_postgres::Row>,
+    row_fn: F,
+) -> serde_json::Map<String, Value>
+where
+    F: Fn(&tokio_postgres::Row) -> Value,
+{
+    let mut map = serde_json::Map::new();
+    for row in rows {
+        let table_name: String = row.try_get("table_name").unwrap_or_default();
+        let value = row_fn(&row);
+        map.entry(table_name)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(value);
+    }
+    map
+}
+
+/// Pure composition of the three batch fetches into the host's
+/// `Vec<TableSchema>` wire shape, split out of `get_schema_snapshot` for
+/// unit testing without a live database. `tables` is the
+/// `fetch_tables`-shaped JSON (each with a `name`); `columns_map` and
+/// `fks_map` are the `group_rows_by_table`-shaped objects keyed by table
+/// name. A table with no columns in the map gets an empty array, and
+/// likewise for foreign keys — matching the builtin's `unwrap_or_default`.
+fn build_schema_snapshot(
+    tables: Vec<Value>,
+    columns_map: serde_json::Map<String, Value>,
+    fks_map: serde_json::Map<String, Value>,
+) -> Vec<Value> {
+    tables
+        .into_iter()
+        .map(|t| {
+            let name = t["name"].as_str().unwrap_or_default().to_string();
+            let columns = columns_map.get(&name).cloned().unwrap_or_else(|| json!([]));
+            let foreign_keys = fks_map.get(&name).cloned().unwrap_or_else(|| json!([]));
+            json!({
+                "name": name,
+                "columns": columns,
+                "foreign_keys": foreign_keys,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

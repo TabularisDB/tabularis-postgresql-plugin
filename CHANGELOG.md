@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `get_schema_snapshot` RPC method — now implemented instead of returning
+  "method not found", so the ER diagram window renders a schema's
+  tables/columns/foreign keys in one round trip rather than falling back
+  to the host's O(number of tables) composition of `get_tables` +
+  `get_columns` + `get_foreign_keys` (tabularis#822). Mirrors the built-in
+  driver's `get_schema_snapshot` byte-for-byte (#121).
+- `get_all_columns_batch` and `get_all_foreign_keys_batch` RPC methods —
+  the batch building blocks `get_schema_snapshot` composes, implemented
+  alongside it for consistency. Each returns all columns/FKs for every
+  base table in a schema in one query, grouped by table name (#121).
+
 ## [1.0.0-rc.4] - 2026-09-17
 
 ### Added
