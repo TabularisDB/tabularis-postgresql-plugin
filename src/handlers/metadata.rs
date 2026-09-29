@@ -99,6 +99,19 @@ pub async fn get_columns(id: Value, params: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("public");
 
+    match fetch_table_columns(&conn_params, table, schema).await {
+        Ok(columns) => ok_response(id, json!(columns)),
+        Err(e) => error_response(id, -32603, &e),
+    }
+}
+
+/// Shared by `get_columns` and `get_table_ddl` — both need the same
+/// per-column metadata (name, type, nullability, PK membership, ...).
+async fn fetch_table_columns(
+    conn_params: &ConnectionParams,
+    table: &str,
+    schema: &str,
+) -> Result<Vec<Value>, String> {
     let query = r#"
         SELECT
             c.column_name::text,
@@ -143,13 +156,104 @@ pub async fn get_columns(id: Value, params: &Value) -> Value {
         ORDER BY c.ordinal_position
     "#;
 
-    match client::query_rows(&conn_params, query, &[&schema, &table]).await {
-        Ok(rows) => {
-            let columns: Vec<Value> = rows.iter().map(row_to_table_column).collect();
-            ok_response(id, json!(columns))
-        }
+    let rows = client::query_rows(conn_params, query, &[&schema, &table]).await?;
+    Ok(rows.iter().map(row_to_table_column).collect())
+}
+
+/// DDL for an *existing* table, as used by the host's `dump_database` to
+/// write a schema-preserving dump. Mirrors the built-in driver's
+/// `get_table_ddl` byte-for-byte: name/type/`NOT NULL`/`PRIMARY KEY`
+/// reconstructed from column metadata — no defaults, indexes, or FKs.
+pub async fn get_table_ddl(id: Value, params: &Value) -> Value {
+    let conn_params = ConnectionParams::from_value(inner_params(params));
+    let table = params.get("table").and_then(Value::as_str).unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
+
+    if let Err(e) = ensure_base_table(&conn_params, table, schema).await {
+        return error_response(id, -32603, &e);
+    }
+
+    let columns = match fetch_table_columns(&conn_params, table, schema).await {
+        Ok(columns) => columns,
+        Err(e) => return error_response(id, -32603, &e),
+    };
+
+    match build_table_ddl(schema, table, &columns) {
+        Ok(ddl) => ok_response(id, json!(ddl)),
         Err(e) => error_response(id, -32603, &e),
     }
+}
+
+/// `dump_database` normally lists tables via `get_tables` (already
+/// restricted to `BASE TABLE`), but an explicit table selection bypasses
+/// that and can name a view — or a foreign/partitioned table — directly.
+/// Reject anything that isn't an ordinary table instead of silently
+/// reconstructing DDL that doesn't reflect what the object actually is.
+async fn ensure_base_table(
+    conn_params: &ConnectionParams,
+    table: &str,
+    schema: &str,
+) -> Result<(), String> {
+    let rows = client::query_rows(
+        conn_params,
+        "SELECT table_type::text FROM information_schema.tables \
+         WHERE table_schema = $1 AND table_name = $2",
+        &[&schema, &table],
+    )
+    .await?;
+
+    match rows
+        .first()
+        .and_then(|r| r.try_get::<_, String>("table_type").ok())
+    {
+        Some(t) if t == "BASE TABLE" => Ok(()),
+        Some(other) => Err(format!(
+            "{table} is a {other}, not a base table; get_table_ddl only supports base tables"
+        )),
+        None => Err(format!("Table {table} not found or empty")),
+    }
+}
+
+/// Pure DDL-text builder, split out of `get_table_ddl` for unit testing
+/// without a live database. `columns` is the `row_to_table_column`-shaped
+/// JSON produced by `fetch_table_columns`.
+fn build_table_ddl(schema: &str, table: &str, columns: &[Value]) -> Result<String, String> {
+    if columns.is_empty() {
+        return Err(format!("Table {table} not found or empty"));
+    }
+
+    let mut defs = Vec::new();
+    let mut pks = Vec::new();
+
+    for col in columns {
+        let name = col["name"].as_str().unwrap_or_default();
+        let data_type = col["data_type"].as_str().unwrap_or_default();
+        let is_nullable = col["is_nullable"].as_bool().unwrap_or(false);
+        let is_pk = col["is_pk"].as_bool().unwrap_or(false);
+
+        let quoted_name = crate::utils::identifiers::quote_identifier(name);
+        let mut def = format!("{quoted_name} {data_type}");
+        if !is_nullable {
+            def.push_str(" NOT NULL");
+        }
+        if is_pk {
+            pks.push(quoted_name);
+        }
+        defs.push(def);
+    }
+
+    if !pks.is_empty() {
+        defs.push(format!("PRIMARY KEY ({})", pks.join(", ")));
+    }
+
+    Ok(format!(
+        "CREATE TABLE {} (\n  {}\n);",
+        crate::utils::identifiers::qualified(schema, table),
+        defs.join(",\n  ")
+    ))
 }
 
 /// Map one `information_schema.columns`-shaped row (as queried by

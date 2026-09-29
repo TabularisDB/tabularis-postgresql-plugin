@@ -4,6 +4,10 @@
 
 ### Added
 
+- `get_table_ddl` RPC method, returning a reconstructed `CREATE TABLE`
+  statement for an existing table so the host's `dump_database` can write
+  a schema-preserving dump for plugin-registered PostgreSQL connections
+  instead of failing with "method not implemented" (#118).
 - `get_schema_snapshot` RPC method — now implemented instead of returning
   "method not found", so the ER diagram window renders a schema's
   tables/columns/foreign keys in one round trip rather than falling back
