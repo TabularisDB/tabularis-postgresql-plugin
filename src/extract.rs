@@ -2354,13 +2354,13 @@ impl From<TxidSnapshotOrPgSnapshot> for JsonValue {
 }
 
 /// A wire format that's just an opaque byte blob with no meaningful text
-/// representation — encoded the same way this plugin's existing `BYTEA`
-/// arm does (see `extract_simple_kind`'s `Type::BYTEA` arm): the full
-/// base64 payload with a hardcoded `application/octet-stream` MIME type,
-/// no truncation. Matches the builtin's `binary_wrapper!` macro
-/// (`extract/advanced_types.rs`), used for internal planner-statistics
-/// types too rarely queried directly to be worth a real text
-/// representation.
+/// representation — encoded via the same truncated-preview `encode_blob`
+/// this plugin's `Type::BYTEA` arm uses (see `crate::utils::blob`).
+/// Matches the builtin's `binary_wrapper!` macro (`extract/advanced_types.rs`),
+/// which calls the builtin's own `encode_blob` for the same reason: these
+/// are internal planner-statistics types too rarely queried directly to be
+/// worth a real text representation, but a large one should still be capped
+/// like any other BYTEA read.
 macro_rules! binary_blob_wrapper {
     ($name:ident, $pg_type:ident) => {
         pub(crate) struct $name(Vec<u8>);
@@ -2380,12 +2380,7 @@ macro_rules! binary_blob_wrapper {
 
         impl From<$name> for JsonValue {
             fn from(v: $name) -> Self {
-                let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &v.0);
-                JsonValue::String(format!(
-                    "BLOB:{}:application/octet-stream:{}",
-                    v.0.len(),
-                    b64
-                ))
+                JsonValue::String(crate::utils::blob::encode_blob(&v.0))
             }
         }
     };

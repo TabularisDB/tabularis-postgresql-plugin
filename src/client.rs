@@ -539,6 +539,28 @@ fn resolve_ssl_mode(ssl_mode: Option<&str>) -> Option<SslMode> {
     }
 }
 
+/// Install the process-wide default `CryptoProvider` exactly once, before
+/// any code path builds a `rustls::ClientConfig`. In rustls 0.23, enabling
+/// the `ring` feature does NOT auto-install a default provider — the first
+/// call to `ClientConfig::builder()` (or `WebPkiServerVerifier::builder()`,
+/// or `with_platform_verifier()`) panics with "no process-level
+/// CryptoProvider available" unless something installed one first.
+/// `NoCertVerifier::new()`/`VerifyCaCertVerifier::new()` below install it
+/// lazily as a side effect, but only on the `require`/`verify-ca` branches —
+/// the `verify-full` and fallthrough (`prefer`/`allow`/`disable`) branches
+/// build a `ClientConfig` without going through either constructor, so
+/// calling this unconditionally at the top of `build_tls_connector` makes
+/// provider installation independent of which branch runs first. Matches
+/// the builtin driver's `ensure_rustls_crypto_provider`
+/// (`src-tauri/src/pool_manager.rs`).
+fn ensure_rustls_crypto_provider() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Build a rustls ClientConfig. `verify-ca`/`verify-full` validate the
 /// server's certificate chain — against a caller-supplied CA bundle
 /// (`ssl_ca`) when present, or the platform trust store otherwise.
@@ -552,6 +574,7 @@ fn resolve_ssl_mode(ssl_mode: Option<&str>) -> Option<SslMode> {
 /// matches the builtin driver's `build_postgres_tls_connector` client-auth
 /// handling.
 fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig, String> {
+    ensure_rustls_crypto_provider();
     use rustls_platform_verifier::BuilderVerifierExt;
 
     let user_ca = params.ssl_ca.as_deref().filter(|s| !s.trim().is_empty());

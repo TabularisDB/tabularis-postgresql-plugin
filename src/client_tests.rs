@@ -672,6 +672,60 @@ fn build_tls_connector_require_builds_successfully_with_no_ssl_ca() {
         .expect("require mode must build a connector without needing ssl_ca set");
 }
 
+// Coverage for #90: `require`/`verify-ca` lazily install the rustls
+// CryptoProvider as a side effect of `NoCertVerifier::new()` /
+// `VerifyCaCertVerifier::new()`, but `verify-full` (both branches below)
+// and the prefer/allow/disable fallthrough build a `ClientConfig`/
+// `WebPkiServerVerifier` directly, with no such side effect. In rustls
+// 0.23 with only the `ring` feature enabled (no auto-install), the first
+// TLS operation in the *process* to reach `ClientConfig::builder()` (or
+// `WebPkiServerVerifier::builder()`, or `with_platform_verifier()`) panics
+// with "no process-level CryptoProvider available" unless something
+// installed a provider first. `build_tls_connector` now calls
+// `ensure_rustls_crypto_provider()` unconditionally at its top, so these
+// branches build successfully regardless of call order — these tests
+// don't (and structurally can't, since the shared test binary runs many
+// tests in one process and a `Once` is process-global) prove the panic
+// would occur without the fix; they lock in that all four
+// previously-under-verified branches still succeed with it.
+#[test]
+fn build_tls_connector_verify_full_with_ca_builds_successfully() {
+    let ca_path = write_temp_file(FIXTURE_CA_CERT_PEM);
+    let mut params = params_with_ssl("verify-full");
+    params.ssl_ca = Some(ca_path.to_str().unwrap().to_string());
+
+    let result = build_tls_connector(&params);
+    std::fs::remove_file(&ca_path).ok();
+
+    result.expect("verify-full with an explicit CA must build a connector without panicking");
+}
+
+#[test]
+fn build_tls_connector_verify_full_without_ca_builds_successfully() {
+    // No ssl_ca -> falls through to WebPkiServerVerifier is NOT used here;
+    // verify-full without a CA takes the platform-trust fallthrough path
+    // (needs_cert_validation is true but user_ca is None, so the `if let
+    // Some(ca_path) = user_ca` block is skipped entirely).
+    let params = params_with_ssl("verify-full");
+    build_tls_connector(&params)
+        .expect("verify-full without ssl_ca must build a connector without panicking");
+}
+
+#[test]
+fn build_tls_connector_prefer_mode_builds_successfully() {
+    // The plain fallthrough branch: ssl_mode outside
+    // require/verify-ca/verify-full goes straight to
+    // with_platform_verifier() with no verifier constructor run first.
+    let params = params_with_ssl("prefer");
+    build_tls_connector(&params).expect("prefer mode must build a connector without panicking");
+}
+
+#[test]
+fn build_tls_connector_disable_mode_builds_successfully() {
+    let params = params_with_ssl("disable");
+    build_tls_connector(&params).expect("disable mode must build a connector without panicking");
+}
+
 // Coverage for #46: verify-ca without an explicit ssl_ca silently fell
 // through to with_platform_verifier() instead of erroring — the builtin
 // driver's build_postgres_tls_connector errors instead ("verify-ca mode

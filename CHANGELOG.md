@@ -1,5 +1,105 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `get_table_ddl` RPC method, returning a reconstructed `CREATE TABLE`
+  statement for an existing table so the host's `dump_database` can write
+  a schema-preserving dump for plugin-registered PostgreSQL connections
+  instead of failing with "method not implemented" (#118).
+- `get_schema_snapshot` RPC method — now implemented instead of returning
+  "method not found", so the ER diagram window renders a schema's
+  tables/columns/foreign keys in one round trip rather than falling back
+  to the host's O(number of tables) composition of `get_tables` +
+  `get_columns` + `get_foreign_keys` (tabularis#822). Mirrors the built-in
+  driver's `get_schema_snapshot` byte-for-byte (#121).
+- `get_all_columns_batch` and `get_all_foreign_keys_batch` RPC methods —
+  the batch building blocks `get_schema_snapshot` composes, implemented
+  alongside it for consistency. Each returns all columns/FKs for every
+  base table in a schema in one query, grouped by table name (#121).
+- `execute_query` and `execute_query_batch` accept a `session_id` and keep
+  that session's connection when the statement or batch leaves an explicit
+  transaction open, so `BEGIN`, the changes, a verifying `SELECT` and
+  `COMMIT` can each be their own run instead of having to be one script.
+  With a `session_id` the replies carry `{ result, in_transaction }` and
+  `{ results, in_transaction }`; without one they stay the bare
+  `QueryResult` and array, so older hosts are unaffected.
+- `release_session` RPC method, called when the owning editor tab closes.
+
+### Fixed
+
+- A batch that left a transaction open returned its connection to the pool
+  as-is. The pool recycles with `RecyclingMethod::Fast`, which resets
+  nothing, so the next borrower inherited the open transaction and its
+  locks. A connection is now always rolled back before it goes back.
+
+## [1.0.0-rc.4] - 2026-09-17
+
+### Added
+
+- `routine_management` RPC methods — `build_routine_call_sql`,
+  `routine_create_template`, `drop_routine` — are now implemented instead
+  of falling back to generic, non-PostgreSQL SQL: invalid call syntax for
+  functions with `OUT` params, a template missing `LANGUAGE plpgsql`/`$$`
+  dollar-quoting, and a bare `DROP FUNCTION name` that can't disambiguate
+  overloads (#84).
+
+### Fixed
+
+- PK-binding cluster in `bind_pk_value`/`build_pk_map_predicate`: NULL
+  (#78), boolean (#79), and integer-shaped-string (#80) primary-key values
+  either hit an `"Unsupported PK type"` catch-all or, for the string case,
+  over-coerced a text column's value to `bigint` and tripped a type-mismatch
+  error server-side. An empty `pk_map` also built a malformed trailing
+  `WHERE` clause with no client-side error (#81). All four now match the
+  builtin driver's binding behavior exactly.
+- `extract.rs`'s type dispatch was restructured to the builtin's
+  `Kind`-first shape (`Simple`/`Enum`/`Array`/`Range`/`Multirange`/`Domain`/
+  `Composite`), closing out ~43 PostgreSQL types that previously decoded to
+  `null` (or, for `JSONPATH`, a corrupted string): `BIT`/`VARBIT`,
+  `MACADDR8`, `XID`/`CID`/`TID`/`XID8`, the eleven `REG*` object-reference
+  types, all seven geometric types (`POINT`/`LSEG`/`BOX`/`POLYGON`/`PATH`/
+  `LINE`/`CIRCLE`), full-text-search and introspection types
+  (`TSVECTOR`/`TSQUERY`/`JSONPATH`/`XML`/`PG_LSN`/etc.), pgvector
+  (`vector`/`halfvec`/`sparsevec`), `Kind::Multirange`, `Kind::Domain`,
+  `Kind::Composite`, and arrays of all of the above — including arrays of
+  the six built-in range types, found during the same pass (#82).
+- Write-side binding (`bind_pg_string`) had no branches for pgvector
+  literals, raw-SQL-function calls (e.g. `ST_GeomFromText(...)`), or bare
+  WKT geometry literals — the first bound incorrectly as an `ARRAY[...]`
+  constructor, the other two stored as literal text instead of executing
+  server-side (#83).
+- Startup scripts had no execution timeout — a script that blocks (an
+  advisory lock, `pg_sleep`, a stalled host) wedged pool creation, and
+  therefore every RPC needing that pool, indefinitely. Bounded to the
+  same 30-second timeout the builtin driver uses (#85).
+- Binding an empty JSON array (`[]`) produced the invalid SQL fragment
+  `ARRAY[]`, which PostgreSQL rejects for lack of an inferred element
+  type. Now binds as the canonical `'{}'` empty-array literal (#86).
+- The BYTEA read path base64-encoded the entire value with no size cap and
+  a hardcoded `application/octet-stream` MIME type — including a second,
+  independently-drifted untruncated copy reachable only via array elements
+  and composite fields. Both now cap at the same 10 KB preview size the
+  builtin driver uses and sniff MIME from magic bytes (#87), and the same
+  cap now applies to the internal planner-statistics blob types
+  (`pg_mcv_list`, `pg_dependencies`, etc.), whose macro had drifted onto
+  its own untruncated encoder discovered while fixing #87 (#106).
+- `get_routines` unconditionally queried `pg_proc.prokind` (PostgreSQL 11+
+  only), failing with `column "prokind" does not exist` against
+  PostgreSQL 9.x/10. Falls back to the legacy `proisagg`/`proiswindow`
+  columns below server version 110000, matching the builtin driver (#88).
+- `explain_query` returned the raw EXPLAIN JSON directly instead of the
+  `{ engine, format, payload, original_query }` shape the host's plugin
+  adapter requires to classify a response as `Raw` — so every EXPLAIN
+  result fell through to the generic parsed-plan renderer instead of the
+  builtin driver's raw-payload path (#89).
+- The rustls `CryptoProvider` was only installed as a side effect inside
+  the `require`/`verify-ca` TLS branches; `verify-full` and the
+  `prefer`/`allow`/`disable` fallthrough built their TLS config directly,
+  with no such side effect, making provider installation depend on branch
+  execution order rather than always running first (#90).
+
 ## [1.0.0-rc.3] - 2026-09-15
 
 ### Added
