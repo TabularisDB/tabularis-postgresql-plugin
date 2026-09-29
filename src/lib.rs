@@ -18,5 +18,6 @@ mod extract_tests;
 pub mod handlers;
 pub mod models;
 pub mod rpc;
+pub mod session;
 pub mod settings;
 pub mod utils;

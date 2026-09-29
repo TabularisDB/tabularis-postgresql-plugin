@@ -62,7 +62,10 @@ async fn run_pool_cleanup(mut shutdown_rx: watch::Receiver<bool>) {
     let mut timer = interval(POOL_CLEANUP_INTERVAL);
     loop {
         tokio::select! {
-            _ = timer.tick() => postgresql_plugin::client::cleanup_idle_pools(),
+            _ = timer.tick() => {
+                postgresql_plugin::client::cleanup_idle_pools();
+                postgresql_plugin::session::sweep_idle().await;
+            }
             _ = shutdown_rx.changed() => break,
         }
     }

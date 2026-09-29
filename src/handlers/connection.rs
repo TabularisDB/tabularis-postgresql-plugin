@@ -40,5 +40,9 @@ pub async fn test_connection(id: Value, params: &Value) -> Value {
 
 /// Graceful shutdown — drain pools and exit.
 pub async fn shutdown(id: Value, _params: &Value) -> Value {
+    // Any session still holding a connection has an open transaction. The
+    // pool recycles without resetting, so roll them back rather than let
+    // the server keep them open until it times the backend out.
+    crate::session::release_all().await;
     ok_response(id, Value::Null)
 }

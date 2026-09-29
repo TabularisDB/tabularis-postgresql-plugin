@@ -18,6 +18,21 @@
   the batch building blocks `get_schema_snapshot` composes, implemented
   alongside it for consistency. Each returns all columns/FKs for every
   base table in a schema in one query, grouped by table name (#121).
+- `execute_query` and `execute_query_batch` accept a `session_id` and keep
+  that session's connection when the statement or batch leaves an explicit
+  transaction open, so `BEGIN`, the changes, a verifying `SELECT` and
+  `COMMIT` can each be their own run instead of having to be one script.
+  With a `session_id` the replies carry `{ result, in_transaction }` and
+  `{ results, in_transaction }`; without one they stay the bare
+  `QueryResult` and array, so older hosts are unaffected.
+- `release_session` RPC method, called when the owning editor tab closes.
+
+### Fixed
+
+- A batch that left a transaction open returned its connection to the pool
+  as-is. The pool recycles with `RecyclingMethod::Fast`, which resets
+  nothing, so the next borrower inherited the open transaction and its
+  locks. A connection is now always rolled back before it goes back.
 
 ## [1.0.0-rc.4] - 2026-09-17
 

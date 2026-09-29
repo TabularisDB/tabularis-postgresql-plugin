@@ -1690,6 +1690,56 @@ fn execute_query_decodes_pgvector_types_correctly() {
 }
 
 #[test]
+fn commit_that_fails_on_a_deferred_constraint_releases_the_session() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    for query in [
+        "DROP TABLE IF EXISTS live_db_deferred_fk_scratch",
+        "CREATE TABLE live_db_deferred_fk_scratch (id INT PRIMARY KEY, other_id INT \
+         REFERENCES live_db_deferred_fk_scratch(id) DEFERRABLE INITIALLY DEFERRED)",
+    ] {
+        plugin.call_ok("execute_query", json!({ "params": params, "query": query }));
+    }
+
+    let session = json!("live-db-session-commit-fails");
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "session_id": session, "query": "BEGIN" }),
+    );
+    // The FK check is deferred, so the INSERT succeeds and only COMMIT fails.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params, "session_id": session,
+            "query": "INSERT INTO live_db_deferred_fk_scratch VALUES (1, 999)"
+        }),
+    );
+    let commit = plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "session_id": session, "query": "COMMIT" }),
+    );
+    assert!(
+        commit["error"].is_string(),
+        "COMMIT violating a deferred FK must report its error"
+    );
+    assert_eq!(
+        commit["in_transaction"],
+        json!(false),
+        "the failing COMMIT's own reply must say the transaction ended"
+    );
+
+    let after = plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "session_id": session, "query": "SELECT 1" }),
+    );
+    assert_eq!(
+        after["in_transaction"],
+        json!(false),
+        "a failed COMMIT already ended the transaction server-side"
+    );
+}
+
+#[test]
 fn get_table_ddl_reconstructs_create_table_from_a_live_table() {
     let mut plugin = Plugin::spawn();
     let params = conn_params();

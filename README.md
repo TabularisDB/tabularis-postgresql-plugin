@@ -179,7 +179,8 @@ instead of reconnecting.
 | `get_materialized_views` / `refresh_materialized_view` | Materialized view lifecycle |
 | `get_routines` / `get_routine_parameters` / `get_routine_definition` | Function/procedure metadata |
 | `get_triggers` / `get_trigger_definition` / `create_trigger` / `drop_trigger` | Trigger lifecycle |
-| `execute_query` / `execute_query_batch` / `explain_query` | Query execution, multi-statement batches, and query plans |
+| `execute_query` / `execute_query_batch` / `explain_query` | Query execution, multi-statement batches, and query plans. Both query methods accept an optional `session_id` that keeps the connection while an explicit transaction is open |
+| `release_session` | Rolls back and releases the connection a session pinned for an open transaction |
 | `insert_record` / `update_record` / `delete_record` | Row-level CRUD with type-aware value binding |
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
 | `save_blob_to_file` / `fetch_blob_as_data_url` | BLOB (`bytea`) export and preview |
