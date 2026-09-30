@@ -107,16 +107,22 @@ async fn run_worker(
         };
         let Some(line) = line else { break };
 
-        let response = postgresql_plugin::rpc::handle_line(&line).await;
-        let body = match serde_json::to_string(&response) {
-            Ok(s) => s,
-            Err(err) => format!(
-                "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32603,\"message\":\"serialization failed: {err}\"}},\"id\":null}}"
-            ),
-        };
+        // `handle_line` returns `None` for a JSON-RPC notification (a request
+        // with no top-level `id` field, e.g. the host's `cancel` notification
+        // on a plugin-call timeout, #126). A notification gets no response
+        // per JSON-RPC convention, and writing one would corrupt the protocol
+        // stream — so only forward a `Some` response to the writer.
+        if let Some(response) = postgresql_plugin::rpc::handle_line(&line).await {
+            let body = match serde_json::to_string(&response) {
+                Ok(s) => s,
+                Err(err) => format!(
+                    "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32603,\"message\":\"serialization failed: {err}\"}},\"id\":null}}"
+                ),
+            };
 
-        if resp_tx.send(body).is_err() {
-            break;
+            if resp_tx.send(body).is_err() {
+                break;
+            }
         }
     }
 }

@@ -10,6 +10,7 @@
 pub mod binding;
 #[cfg(test)]
 mod binding_tests;
+pub mod cancel;
 pub mod client;
 pub mod error;
 pub mod extract;

@@ -327,6 +327,28 @@ pub fn cleanup_idle_pools() {
     }
 }
 
+/// Build the same TLS `MakeTlsConnect` the pool uses, for a one-off
+/// connection that must match the original's TLS mode — specifically the
+/// cancel-token path (#126), which opens a fresh connection to send
+/// `CancelToken::cancel_query`. Reuses `build_tls_connector` so the
+/// verifier/client-auth/TLS-version logic is identical to the pool's.
+///
+/// Only builds the TLS connector — it does *not* decide whether TLS is
+/// needed at all. Callers must check [`needs_tls`] first and use the
+/// no-TLS `NoTls` connector directly when it's `false` (matching the
+/// pool's own two-branch `if needs_tls(params) { .. } else { .. }` shape in
+/// `build_pool` below); unlike `build_tls_connector`, which still returns a
+/// usable (if unwanted) platform-verifier `ClientConfig` for
+/// `prefer`/`allow`/`disable`/unset modes, wrapping that in a TLS connector
+/// here would make the cancel connection speak TLS to a server the pool
+/// itself connected to in plaintext.
+pub(crate) fn make_tls_connect(
+    params: &ConnectionParams,
+) -> Result<MakeRustlsConnect, String> {
+    let tls_config = build_tls_connector(params)?;
+    Ok(MakeRustlsConnect::new(tls_config))
+}
+
 /// Build a deadpool-postgres pool for the given connection parameters.
 ///
 /// When `connection_string` is set, it takes precedence over the discrete
@@ -514,8 +536,11 @@ where
     outcome.map_err(startup_script_error)
 }
 
-/// Determine whether TLS should be used based on ssl_mode.
-fn needs_tls(params: &ConnectionParams) -> bool {
+/// Determine whether TLS should be used based on ssl_mode. `pub(crate)` so
+/// `cancel::run_cancel` (#126) can pick the same `NoTls`-vs-TLS branch here
+/// as `build_pool` does, rather than assuming every cancel connection needs
+/// TLS.
+pub(crate) fn needs_tls(params: &ConnectionParams) -> bool {
     matches!(
         params.ssl_mode.as_deref(),
         Some("require" | "verify-ca" | "verify-full")

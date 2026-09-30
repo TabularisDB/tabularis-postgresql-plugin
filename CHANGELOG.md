@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- `cancel` JSON-RPC notification handler: on a host plugin-call timeout,
+  the host can send a fire-and-forget `cancel` notification (`{"method":
+  "cancel","params":{"id":<request-id>}}`) and the plugin cancels the
+  server-side statement via `pg_cancel_backend` instead of leaving the
+  orphaned backend running. Each in-flight `execute_query`/
+  `execute_query_batch`/`explain_query` registers a `CancelToken` keyed by
+  request id and deregisters it when the query resolves, so a late or
+  duplicate cancel for a reused id is a no-op. A true notification (no
+  top-level `id`) gets no response, per JSON-RPC convention. Dormant until
+  the host ships the notification (`tabularis#832`); until then this is a
+  safe no-op addition — no existing RPC's behavior or response shape
+  changes (#126).
+
 ## [1.0.0-rc.5] - 2026-09-29
 
 ### Added
