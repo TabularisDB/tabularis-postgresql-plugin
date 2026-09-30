@@ -88,17 +88,7 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     // same tab continues that transaction.
     let session_id = params.get("session_id").and_then(Value::as_str);
 
-    match run_batch_in_session(
-        &conn_params,
-        &queries,
-        limit,
-        page,
-        schema,
-        session_id,
-        &id,
-    )
-    .await
-    {
+    match run_batch_in_session(&conn_params, &queries, limit, page, schema, session_id, &id).await {
         // Only a session-aware call gets the richer shape; a host that did
         // not send a session_id still receives the bare array it expects.
         Ok((results, in_transaction)) => match session_id {
@@ -159,11 +149,8 @@ async fn run_batch_in_session(
     // for a reused id can't target a later one. The cancel only needs the
     // token (captured into the action) and the connection params, never the
     // borrowed client.
-    let _cancel_guard = cancel::CancelGuard::register(
-        request_id.as_u64(),
-        &pg_client,
-        conn_params.clone(),
-    );
+    let _cancel_guard =
+        cancel::CancelGuard::register(request_id.as_u64(), &pg_client, conn_params.clone());
 
     // Applying search_path to a reused connection would run inside the open
     // transaction and change what the rest of it sees.

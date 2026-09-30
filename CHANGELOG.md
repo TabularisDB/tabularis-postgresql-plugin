@@ -17,6 +17,16 @@
   safe no-op addition — no existing RPC's behavior or response shape
   changes (#126).
 
+### Fixed
+
+- `get_columns`/`get_all_columns_batch`/`get_schema_snapshot` filtered out
+  `NULL` column defaults case-sensitively (`d == "NULL"`), so a column
+  declared `DEFAULT null` (lowercase — legal PostgreSQL) surfaced a
+  spurious `default_value: "null"` where the built-in driver omits it.
+  Now filters case-insensitively (`eq_ignore_ascii_case("null")`),
+  matching the builtin exactly; the `NULL::<type>` cast prefix check
+  stays case-sensitive as in the builtin (#122).
+
 ## [1.0.0-rc.5] - 2026-09-29
 
 ### Added

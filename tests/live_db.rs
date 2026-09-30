@@ -2049,7 +2049,6 @@ fn get_schema_snapshot_returns_tables_columns_and_foreign_keys() {
 #[tokio::test]
 #[ignore = "requires a live database and a deliberate long sleep; run with --include-ignored"]
 async fn cancel_notification_stops_the_server_side_statement() {
-    use std::process::Command;
     let mut plugin = Plugin::spawn();
     let params = conn_params();
 
@@ -2159,12 +2158,18 @@ async fn psql_scalar(params: &Value, sql: &str) -> String {
     let db = params["database"].as_str().unwrap_or("testdb");
     let output = Command::new("psql")
         .args([
-            "-h", host,
-            "-p", &port.to_string(),
-            "-U", user,
-            "-d", db,
-            "-t", "-A",
-            "-c", sql,
+            "-h",
+            host,
+            "-p",
+            &port.to_string(),
+            "-U",
+            user,
+            "-d",
+            db,
+            "-t",
+            "-A",
+            "-c",
+            sql,
         ])
         .env("PGPASSWORD", password)
         .output()

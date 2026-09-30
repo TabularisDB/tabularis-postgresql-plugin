@@ -342,9 +342,7 @@ pub fn cleanup_idle_pools() {
 /// `prefer`/`allow`/`disable`/unset modes, wrapping that in a TLS connector
 /// here would make the cancel connection speak TLS to a server the pool
 /// itself connected to in plaintext.
-pub(crate) fn make_tls_connect(
-    params: &ConnectionParams,
-) -> Result<MakeRustlsConnect, String> {
+pub(crate) fn make_tls_connect(params: &ConnectionParams) -> Result<MakeRustlsConnect, String> {
     let tls_config = build_tls_connector(params)?;
     Ok(MakeRustlsConnect::new(tls_config))
 }

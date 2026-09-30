@@ -19,7 +19,13 @@ use crate::handlers;
 pub async fn handle_line(line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(err) => return Some(error_response(Value::Null, -32700, &format!("parse error: {err}"))),
+        Err(err) => {
+            return Some(error_response(
+                Value::Null,
+                -32700,
+                &format!("parse error: {err}"),
+            ))
+        }
     };
 
     // A request with no `id` field is a JSON-RPC notification: no response.

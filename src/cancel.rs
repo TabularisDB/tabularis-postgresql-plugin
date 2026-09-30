@@ -69,7 +69,11 @@ impl CancelGuard {
     /// connection params so `cancel()` never needs to touch the pool or
     /// rebuild connection state later — it only has to run the action
     /// that's already sitting in the map.
-    pub fn register(request_id: Option<u64>, pg_client: &PgClient, params: ConnectionParams) -> Self {
+    pub fn register(
+        request_id: Option<u64>,
+        pg_client: &PgClient,
+        params: ConnectionParams,
+    ) -> Self {
         if let Some(id) = request_id {
             let token = pg_client.cancel_token();
             insert_action(id, Box::new(move || Box::pin(run_cancel(token, params))));

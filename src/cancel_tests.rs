@@ -64,7 +64,9 @@ fn dropping_a_cancel_guard_deregisters_its_action_without_invoking_it() {
     insert_action(3, action);
     assert!(HANDLES.lock().unwrap().contains_key(&3));
 
-    let guard = CancelGuard { request_id: Some(3) };
+    let guard = CancelGuard {
+        request_id: Some(3),
+    };
     drop(guard);
 
     assert!(!HANDLES.lock().unwrap().contains_key(&3));

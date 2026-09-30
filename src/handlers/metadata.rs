@@ -284,13 +284,7 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
 
     let is_nullable = is_nullable_str == "YES";
 
-    let default_value = column_default.as_deref().and_then(|d| {
-        if is_auto_increment || d.is_empty() || d == "NULL" || d.starts_with("NULL::") {
-            None
-        } else {
-            Some(d.to_string())
-        }
-    });
+    let default_value = column_default_value(column_default.as_deref(), is_auto_increment);
 
     let mut col = json!({
         "name": name,
@@ -317,6 +311,35 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
     }
 
     col
+}
+
+/// Compute a column's `default_value` wire field from its raw
+/// `information_schema.columns.column_default` and the already-computed
+/// `is_auto_increment`, mirroring the built-in driver's filter exactly.
+/// Returns `None` (omit the field) for auto-increment columns, empty
+/// defaults, and `NULL` defaults of any case (`NULL`, `null`, `Null`, ...),
+/// and for `NULL::<type>` casts; everything else is surfaced verbatim.
+/// Split out of `row_to_table_column` for unit testing without a live
+/// `tokio_postgres::Row` (#122). `is_auto_increment` is computed once in
+/// the caller (matching the builtin's single computation) and passed in
+/// so the field and the filter can't drift apart.
+fn column_default_value(column_default: Option<&str>, is_auto_increment: bool) -> Option<String> {
+    let d = column_default?;
+    // Match the builtin's filter exactly: the bare-`null` check is
+    // case-insensitive (PostgreSQL accepts `DEFAULT null` in any case and
+    // normalizes it to NULL in information_schema.columns.column_default,
+    // so `null`/`Null`/`NULL` all mean "no default"), while the
+    // `NULL::<type>` cast prefix stays case-sensitive — the builtin keeps
+    // that one `starts_with("NULL::")`, not `eq_ignore_ascii_case`. #122.
+    if is_auto_increment
+        || d.is_empty()
+        || d.eq_ignore_ascii_case("null")
+        || d.starts_with("NULL::")
+    {
+        None
+    } else {
+        Some(d.to_string())
+    }
 }
 
 pub async fn get_foreign_keys(id: Value, params: &Value) -> Value {

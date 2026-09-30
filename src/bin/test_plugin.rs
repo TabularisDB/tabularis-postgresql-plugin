@@ -52,8 +52,8 @@ async fn main() {
         // returns `Some`. A `None` (a notification) can't happen from this
         // caller, but the type now allows it — print nothing for it.
         if let Some(response) = response {
-            let pretty = serde_json::to_string_pretty(&response)
-                .unwrap_or_else(|_| response.to_string());
+            let pretty =
+                serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
             writeln!(out, "{pretty}").ok();
         }
         out.flush().ok();
