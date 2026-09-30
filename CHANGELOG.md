@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] - 2026-09-30
+
 ### Added
 
 - `cancel` JSON-RPC notification handler: on a host plugin-call timeout,
