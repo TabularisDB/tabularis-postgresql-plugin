@@ -4,13 +4,35 @@ use serde_json::{json, Value};
 
 use crate::handlers;
 
-/// Parse one JSON-RPC line and return the response value. Never panics —
-/// parse errors and method failures are surfaced as JSON-RPC error responses.
-pub async fn handle_line(line: &str) -> Value {
+/// Parse one JSON-RPC line and return the response value, or `None` for a
+/// *notification* (a request with no top-level `id` field) that requires no
+/// response per JSON-RPC convention. Never panics — parse errors and method
+/// failures are surfaced as JSON-RPC error responses.
+///
+/// Notification-ness is decided by the **absence of the `id` field**, not by
+/// method: a `cancel` with an `id` present is treated as a normal request
+/// (defensive — the host shouldn't send one, but if it does the caller gets
+/// a response rather than a silent drop). Only an `id`-less `cancel` (the
+/// fire-and-forget form the host will send on timeout per #126) returns
+/// `None` so `main.rs`'s worker skips the stdout write entirely — a stray
+/// response line for a notification would corrupt the protocol stream.
+pub async fn handle_line(line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(err) => return error_response(Value::Null, -32700, &format!("parse error: {err}")),
+        Err(err) => {
+            return Some(error_response(
+                Value::Null,
+                -32700,
+                &format!("parse error: {err}"),
+            ))
+        }
     };
+
+    // A request with no `id` field is a JSON-RPC notification: no response.
+    // `id: null` is *not* a notification (it's a request whose id is null) —
+    // distinguish "field absent" from "field present and null" so a host
+    // that legitimately uses `id: null` still gets a response.
+    let is_notification = !request.as_object().is_some_and(|o| o.contains_key("id"));
 
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request
@@ -20,7 +42,7 @@ pub async fn handle_line(line: &str) -> Value {
         .to_string();
     let params = request.get("params").cloned().unwrap_or(Value::Null);
 
-    match method.as_str() {
+    let response = match method.as_str() {
         // Connection lifecycle
         "initialize" => handlers::connection::initialize(id, &params).await,
         "ping" => handlers::connection::ping(id, &params).await,
@@ -74,6 +96,12 @@ pub async fn handle_line(line: &str) -> Value {
         "execute_query_batch" => handlers::query::execute_query_batch(id, &params).await,
         "release_session" => handlers::query::release_session(id, &params).await,
         "explain_query" => handlers::query::explain_query(id, &params).await,
+        // Fire-and-forget notification: the host sends this when its plugin-call
+        // timeout fires so the plugin cancels the server-side statement (#126).
+        // A true notification carries no top-level `id`; `handle_line` detects
+        // that and skips the response write, so this handler's return value is
+        // only used if a caller (incorrectly) sends `cancel` as a request.
+        "cancel" => handlers::query::cancel(id, &params).await,
 
         // CRUD
         "insert_record" => handlers::crud::insert_record(id, &params).await,
@@ -96,6 +124,19 @@ pub async fn handle_line(line: &str) -> Value {
         "fetch_blob_as_data_url" => handlers::blob::fetch_blob_as_data_url(id, &params).await,
 
         other => not_implemented(id, other),
+    };
+
+    // A notification (no `id` field) gets no response — return None so the
+    // worker skips the stdout write. An `id`-less request that nonetheless
+    // produced an error response (e.g. a parse error on a notification) is
+    // also suppressed: the host isn't waiting for one, and writing it could
+    // corrupt the stream by responding to a message the host doesn't expect
+    // a reply to. This only affects `cancel` today; every other method is
+    // only ever sent as a request with an `id`.
+    if is_notification {
+        None
+    } else {
+        Some(response)
     }
 }
 
