@@ -96,10 +96,14 @@ async fn valid_request_with_id_returns_a_response() {
 }
 
 /// A notification (object with no `id` field) must return None — the fix
-/// must not break the cancel-notification path (#126).
+/// must not break the cancel-notification path (#126). Uses a high request
+/// id (999_999) that won't collide with `cancel_tests.rs`'s ids (1, 2) —
+/// `cancel` mutates the global `HANDLES` map, so sharing an id with another
+/// parallel test is a latent flaky-test hazard.
 #[tokio::test]
 async fn notification_without_id_returns_none() {
-    let response = handle_line(r#"{"jsonrpc":"2.0","method":"cancel","params":{"id":1}}"#).await;
+    let response =
+        handle_line(r#"{"jsonrpc":"2.0","method":"cancel","params":{"id":999999}}"#).await;
     assert!(
         response.is_none(),
         "a notification (object with no id) must return None so main.rs skips the stdout write"
