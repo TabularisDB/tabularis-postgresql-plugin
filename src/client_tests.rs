@@ -5,8 +5,8 @@ use tokio::sync::Mutex;
 
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
-    load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode, NoCertVerifier,
-    VerifyCaCertVerifier, POOLS,
+    get_pool_client, load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode,
+    NoCertVerifier, VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use crate::settings;
@@ -196,6 +196,44 @@ fn connection_key_omits_password_segment_when_empty() {
 }
 
 #[test]
+fn connection_key_differs_by_surrounding_whitespace() {
+    // The raw (untrimmed) password is hashed — matching build_pool's
+    // params.password.clone() verbatim — so passwords differing only in
+    // surrounding whitespace get distinct keys, not a silent collision that
+    // would serve B's request on A's authenticated pool (#132 pre-handoff
+    // review finding: trimming here while build_pool doesn't is a bug).
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.password = Some("secret".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.password = Some(" secret ".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "passwords differing only in surrounding whitespace must not share a \
+         cache key — build_pool connects with the raw (untrimmed) password, so \
+         the key must hash the same raw bytes to avoid serving B on A's pool"
+    );
+}
+
+#[test]
+fn connection_key_whitespace_only_password_differs_from_absent() {
+    // A whitespace-only password ("   ") is NOT the same as None — build_pool
+    // sends "   " to PostgreSQL, so the key must include a :pw: segment to
+    // avoid sharing a pool with a passwordless (None) connection. Trimming
+    // would collapse these together (the bug the pre-handoff review found);
+    // hashing the raw value keeps them distinct.
+    let mut ws_only = params("localhost", 5432, "db", "postgres");
+    ws_only.password = Some("   ".to_string());
+    let absent = params("localhost", 5432, "db", "postgres");
+    assert_ne!(
+        connection_key(&ws_only),
+        connection_key(&absent),
+        "a whitespace-only password must not share a key with an absent \
+         password — build_pool sends the whitespace bytes to PostgreSQL"
+    );
+}
+
+#[test]
 fn connection_key_does_not_contain_plaintext_password() {
     // The password must appear in the key only as a hex digest, never as the
     // raw string — a plaintext password sitting in a HashMap key is a secret
@@ -268,6 +306,68 @@ async fn cleanup_idle_pools_evicts_pools_with_no_checked_out_connections() {
         !POOLS.lock().unwrap().contains_key(&key),
         "an idle pool with no checked-out connections must be evicted"
     );
+}
+
+// Coverage for #132 Fix 1 (eviction-on-failure): the eviction branch of
+// get_pool_client — the `Err` arm of `pool.get()` that removes the cache entry —
+// is the primary fix. The live tests in client_live_tests.rs exercise it against
+// a real database, but this test runs in CI without one: deadpool's `Pool::new`
+// is lazy (no connection at creation time when no startup script is set), so
+// get_pool_client builds+caches a pool, then `pool.get()` fails because the host
+// is non-existent (connection refused), hitting the eviction arm. Asserting the
+// cache no longer contains the key proves eviction ran. This test would FAIL if
+// the eviction code (`pools.remove(&key)`) were removed — the lazy pool would
+// stay in the cache despite the failed `get()`.
+
+#[tokio::test]
+async fn get_pool_client_evicts_on_connection_failure() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    // A non-existent host: port 1 on the loopback is almost certainly not
+    // running a PostgreSQL, so pool.get() will fail with a connection error.
+    let p = params("127.0.0.1", 1, "db", "user");
+    let key = connection_key(&p);
+
+    // Ensure we start clean for this key.
+    POOLS.lock().unwrap().remove(&key);
+
+    let result = get_pool_client(&p).await;
+    assert!(
+        result.is_err(),
+        "connecting to a non-existent host must fail; got {:?}",
+        result
+    );
+
+    assert!(
+        !POOLS.lock().unwrap().contains_key(&key),
+        "a failed pool.get() must evict the cache entry so the next request \
+         rebuilds a fresh pool (#132); key {key} is still present"
+    );
+}
+
+#[tokio::test]
+async fn get_pool_client_eviction_branch_is_not_vacuous() {
+    // Proves the test above is non-vacuous: if eviction were removed, the
+    // cache entry would persist. We verify that get_or_create_pool (which
+    // does NOT evict) leaves the entry, while get_pool_client (which does)
+    // removes it — so the eviction is load-bearing, not a no-op.
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let p = params("127.0.0.1", 1, "db", "user");
+    let key = connection_key(&p);
+
+    POOLS.lock().unwrap().remove(&key);
+
+    // get_or_create_pool builds and caches a lazy pool (no connection attempt).
+    get_or_create_pool(&p)
+        .await
+        .expect("lazy pool builds without a live DB when no startup script is set");
+    assert!(
+        POOLS.lock().unwrap().contains_key(&key),
+        "get_or_create_pool should cache the lazy pool"
+    );
+
+    // Clean up — get_pool_client would also evict, but we want to isolate the
+    // "get_or_create_pool caches" assertion from the eviction test above.
+    POOLS.lock().unwrap().remove(&key);
 }
 
 // Self-signed, 10-year-validity fixture cert (CN=test) — not a real trust

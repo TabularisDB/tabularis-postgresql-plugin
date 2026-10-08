@@ -14,9 +14,10 @@
 //! silently swallowed by the caller and never retried, unlike a persistent
 //! pool where a single connection failure doesn't affect already-established
 //! connections. Caching by `host:port:database:user:startup_script` plus
-//! every TLS param (matches the builtin's `build_connection_key` pattern in
-//! `src-tauri/src/pool_manager.rs`, minus the per-connection_id refinement
-//! that plugin doesn't need yet) closes that gap.
+//! every TLS param and the password (matches the builtin's
+//! `build_connection_key` pattern in `src-tauri/src/pool_manager.rs`, minus
+//! the per-connection_id refinement that plugin doesn't need yet) closes that
+//! gap.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -250,8 +251,9 @@ fn quote_qualified_type(type_schema: &str, type_name: &str) -> String {
 }
 
 /// Get the cached pool for these connection params, creating and caching one
-/// on first use. Public for use by query handlers that need direct pool
-/// access (e.g. to acquire one client for a multi-statement batch).
+/// on first use. Public for tests that build a lazy pool without a live
+/// database; production callers use `get_pool_client` instead (it adds
+/// eviction-on-failure, see #132).
 pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
     get_or_create_pool(params).await
 }
@@ -270,6 +272,9 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 /// of sharing the stale one (#132). Mirrors how the builtin folds the startup
 /// script via `Sha256::digest` (`pool_manager.rs`). Absent or empty password →
 /// no digest segment, keeping keys stable for passwordless/trust connections.
+/// The raw (untrimmed) password is hashed — matching `build_pool`'s
+/// `params.password.clone()` verbatim — so two passwords differing only in
+/// surrounding whitespace get distinct keys, not a silent collision.
 ///
 /// Note: when `connection_string` is set, `build_pool` parses the password
 /// from the string (not `params.password`), so this digest sees `None` and the
@@ -291,12 +296,12 @@ fn connection_key(params: &ConnectionParams) -> String {
         params.ssl_cert.as_deref().unwrap_or(""),
         params.ssl_key.as_deref().unwrap_or(""),
     );
-    match params
-        .password
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    // Hash the raw password exactly as build_pool sends it (no trimming) —
+    // trimming here would collapse two distinct passwords that differ only in
+    // whitespace into one cache key while build_pool connects with different
+    // credentials, silently serving B's request on A's authenticated pool.
+    // Only an empty string is treated as "no password" (omits the segment).
+    match params.password.as_deref().filter(|s| !s.is_empty()) {
         Some(pw) => {
             let digest = Sha256::digest(pw.as_bytes());
             let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -345,14 +350,20 @@ async fn get_or_create_pool_with_key(params: &ConnectionParams, key: &str) -> Re
 /// and fails the same way — until the 600s idle sweep finally drops it (#132).
 ///
 /// This closes the gap: on a `pool.get()` failure we remove the cache entry,
-/// so the next request rebuilds a fresh pool. Eviction is always safe here:
-/// `get_or_create_pool` returns a clone of *the* cached pool for this key (via
-/// `entry().or_insert`), so the pool we hold when `get()` fails *is* the one in
-/// the cache — there's no risk of dropping a different, working pool a
-/// concurrent caller built. (If a racer's pool were working, we'd be holding
-/// its clone and `get()` would succeed, never reaching the eviction branch.)
-/// `Pool` has no `Eq`, so identity comparison isn't available — but the
-/// clone-of-the-cached-entry invariant makes it unnecessary.
+/// so the next request rebuilds a fresh pool.
+///
+/// Concurrency note: there is a narrow TOCTOU window between `pool.get()`
+/// resolving with `Err` and `POOLS.lock()` acquiring. A concurrent caller that
+/// evicts the failed pool and inserts a *different* working pool under the same
+/// key in that window would have its working pool removed by our `pools.remove`.
+/// `Pool` has no `Eq` and exposes no identity comparison (`inner` is private to
+/// deadpool), so we can't guard with `Arc::ptr_eq`. The impact is
+/// performance-only — the working pool is rebuilt on the next request; no data
+/// loss, no wrong connection served (existing checked-out `Object`s still work,
+/// they just can't return to the pool). The window contains no `await` points,
+/// so on an uncontended lock the eviction runs synchronously with no
+/// interleaving. This is strictly better than the pre-fix behavior (a poisoned
+/// pool lingering for 600s), so the benign race is accepted.
 pub(crate) async fn get_pool_client(
     params: &ConnectionParams,
 ) -> Result<deadpool_postgres::Object, String> {
@@ -363,6 +374,8 @@ pub(crate) async fn get_pool_client(
         Ok(client) => Ok(client),
         Err(e) => {
             // Evict the poisoned pool so the next request rebuilds a fresh one.
+            // See the concurrency note above: a narrow TOCTOU window exists but
+            // is performance-only in impact.
             if let Ok(mut pools) = POOLS.lock() {
                 pools.remove(&key);
             }

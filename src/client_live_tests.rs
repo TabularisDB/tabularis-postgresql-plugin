@@ -59,10 +59,12 @@ fn correct_password() -> String {
 
 /// The headline #132 regression: a failed connection attempt (wrong password)
 /// must not poison the pool cache for a subsequent attempt with the correct
-/// password. Before the fix the second `test_connection` reused the poisoned
-/// pool under the same key and failed identically; after the fix the poisoned
-/// pool is evicted (Fix 1) and the correct password gets a distinct key anyway
-/// (Fix 2), so the second call succeeds.
+/// password. This test exercises Fix 2 (password-keying) — the wrong and
+/// correct passwords produce distinct cache keys, so the correct-password call
+/// builds a fresh pool regardless of eviction. The eviction branch (Fix 1) is
+/// exercised by `failed_auth_leaves_no_cached_pool` below and by the
+/// CI-runnable `get_pool_client_evicts_on_connection_failure` in
+/// `client_tests.rs` (which doesn't need a live DB).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
 async fn failed_auth_then_correct_auth_succeeds() {
