@@ -132,6 +132,89 @@ fn connection_key_differs_by_ssl_key_alone() {
     );
 }
 
+// Coverage for #132: the pool cache key must distinguish connections that differ
+// only by password, so a failed connection built with a wrong password can't be
+// reused for a later request carrying the correct one (and a rotated password
+// gets its own pool instead of sharing the stale one). The password is folded in
+// as a SHA-256 hex digest — never as plaintext — mirroring how the builtin
+// folds the startup script (`pool_manager.rs`'s `Sha256::digest`) and how TLS
+// params were added in #36.
+
+#[test]
+fn connection_key_differs_by_password() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.password = Some("hunter2".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.password = Some("correct-horse-battery-staple".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different passwords must not share a cache key — otherwise a failed \
+         connection built with a wrong password poisons the pool for the \
+         correct one (#132)"
+    );
+}
+
+#[test]
+fn connection_key_is_stable_for_identical_passwords() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.password = Some("s3cret".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.password = Some("s3cret".to_string());
+    assert_eq!(
+        connection_key(&a),
+        connection_key(&b),
+        "identical passwords must produce identical keys (no salt/randomness)"
+    );
+}
+
+#[test]
+fn connection_key_omits_password_segment_when_absent() {
+    // A passwordless connection (None) must keep the legacy key shape with no
+    // password segment — guards stability for passwordless/trust connections
+    // and keeps the existing connection_key_* tests above unchanged.
+    let none_pw = params("localhost", 5432, "db", "postgres");
+    let key = connection_key(&none_pw);
+    assert!(
+        !key.contains(":pw:"),
+        "absent password must not add a pw segment to the key: {key}"
+    );
+}
+
+#[test]
+fn connection_key_omits_password_segment_when_empty() {
+    // An empty-string password is treated as absent (no segment) — matches
+    // build_pool, which sets cfg.password from params.password verbatim and
+    // would otherwise hash "" into the key for no benefit.
+    let mut empty_pw = params("localhost", 5432, "db", "postgres");
+    empty_pw.password = Some(String::new());
+    let key = connection_key(&empty_pw);
+    assert!(
+        !key.contains(":pw:"),
+        "empty password must not add a pw segment to the key: {key}"
+    );
+}
+
+#[test]
+fn connection_key_does_not_contain_plaintext_password() {
+    // The password must appear in the key only as a hex digest, never as the
+    // raw string — a plaintext password sitting in a HashMap key is a secret
+    // leak via any dump of the cache (#132's suggested fix explicitly calls
+    // for hashing).
+    let secret = "super-secret-do-not-leak";
+    let mut p = params("localhost", 5432, "db", "postgres");
+    p.password = Some(secret.to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.contains(secret),
+        "plaintext password must not appear in the cache key: {key}"
+    );
+    assert!(
+        key.contains(":pw:"),
+        "a present password must add a hashed pw segment: {key}"
+    );
+}
+
 #[tokio::test]
 async fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     // deadpool's Pool::new is lazy (no connection attempt at creation

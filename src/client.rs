@@ -24,6 +24,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime, SslMode};
+use sha2::{Digest, Sha256};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{NoTls, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -36,11 +37,16 @@ static POOLS: LazyLock<Mutex<HashMap<String, Pool>>> = LazyLock::new(|| Mutex::n
 /// server-side `DbError` (syntax errors, constraint violations, etc.) surface
 /// the real severity/message instead of the generic `Kind::Db` "db error"
 /// string that `tokio_postgres::Error`'s own `Display` impl produces.
+///
+/// Only the `severity: message` line is kept — not the full `Error { kind: Db,
+/// cause: Some(DbError { .. }) }` `Debug` dump, which Tabularis showed verbatim
+/// in its password prompt (#132). The first line is enough for a user to see
+/// what went wrong; the dump is noise for humans and a parity suite never
+/// compares error strings byte-for-byte (`parity.rs`: "error messages may
+/// differ between drivers").
 pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {
-        let brief = format!("{}: {}", db.severity(), db.message());
-        let detail = format!("{e:#?}");
-        format!("{brief}\n\n{detail}")
+        format!("{}: {}", db.severity(), db.message())
     } else {
         e.to_string()
     }
@@ -65,11 +71,7 @@ pub(crate) fn format_pool_error(e: &deadpool_postgres::PoolError) -> String {
 /// Build a connection pool from the given params and verify connectivity
 /// by acquiring one client and running `SELECT 1`.
 pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     client
         .query_one("SELECT 1", &[])
         .await
@@ -85,11 +87,7 @@ pub async fn query_strings(
     query_params: &[&(dyn ToSql + Sync)],
     column: &str,
 ) -> Result<Vec<String>, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     let rows = client
         .query(query, query_params)
         .await
@@ -108,11 +106,7 @@ pub async fn query_rows(
     query: &str,
     query_params: &[&(dyn ToSql + Sync)],
 ) -> Result<Vec<Row>, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     client
         .query(query, query_params)
         .await
@@ -128,11 +122,7 @@ pub async fn execute_typed(
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<u64, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
@@ -152,11 +142,7 @@ pub async fn query_typed(
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<Vec<Row>, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
@@ -277,8 +263,15 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 /// already-negotiated TLS setup. Matches the builtin's `build_connection_key`
 /// TLS-param keying in `src-tauri/src/pool_manager.rs`, minus the
 /// per-connection_id refinement that plugin doesn't need yet.
+///
+/// The password is folded in as a SHA-256 hex digest (never plaintext) so a
+/// connection built with a wrong password can't be reused for a later request
+/// carrying the correct one, and a rotated password gets its own pool instead
+/// of sharing the stale one (#132). Mirrors how the builtin folds the startup
+/// script via `Sha256::digest` (`pool_manager.rs`). Absent or empty password →
+/// no digest segment, keeping keys stable for passwordless/trust connections.
 fn connection_key(params: &ConnectionParams) -> String {
-    format!(
+    let base = format!(
         "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         params.host.as_deref().unwrap_or(""),
         params.port.unwrap_or(5432),
@@ -289,7 +282,20 @@ fn connection_key(params: &ConnectionParams) -> String {
         params.ssl_ca.as_deref().unwrap_or(""),
         params.ssl_cert.as_deref().unwrap_or(""),
         params.ssl_key.as_deref().unwrap_or(""),
-    )
+    );
+    match params
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(pw) => {
+            let digest = Sha256::digest(pw.as_bytes());
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{base}:pw:{hex}")
+        }
+        None => base,
+    }
 }
 
 /// Return the cached pool for this connection's identity, or build and cache
@@ -313,6 +319,42 @@ async fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
     // Another call may have raced us to create this pool between the read
     // above and this write — keep whichever is already cached.
     Ok(pools.entry(key).or_insert(pool).clone())
+}
+
+/// Acquire a pooled client, evicting the cache entry if the connection
+/// attempt fails.
+///
+/// deadpool-postgres connects lazily, so `get_or_create_pool` caches a `Pool`
+/// before any connection is actually established. If the credentials are wrong
+/// (or the host is unreachable), that cached pool is poisoned: it's keyed by
+/// everything *except* the live handshake result, so the next request finds it
+/// and fails the same way — until the 600s idle sweep finally drops it (#132).
+///
+/// This closes the gap: on a `pool.get()` failure we remove the cache entry,
+/// so the next request rebuilds a fresh pool. Eviction is always safe here:
+/// `get_or_create_pool` returns a clone of *the* cached pool for this key (via
+/// `entry().or_insert`), so the pool we hold when `get()` fails *is* the one in
+/// the cache — there's no risk of dropping a different, working pool a
+/// concurrent caller built. (If a racer's pool were working, we'd be holding
+/// its clone and `get()` would succeed, never reaching the eviction branch.)
+/// `Pool` has no `Eq`, so identity comparison isn't available — but the
+/// clone-of-the-cached-entry invariant makes it unnecessary.
+pub(crate) async fn get_pool_client(
+    params: &ConnectionParams,
+) -> Result<deadpool_postgres::Object, String> {
+    let key = connection_key(params);
+    let pool = get_or_create_pool(params).await?;
+
+    match pool.get().await {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            // Evict the poisoned pool so the next request rebuilds a fresh one.
+            if let Ok(mut pools) = POOLS.lock() {
+                pools.remove(&key);
+            }
+            Err(format!("Connection failed: {}", format_pool_error(&e)))
+        }
+    }
 }
 
 /// Drop pools that currently have no checked-out connections. Called
@@ -902,3 +944,7 @@ fn load_client_cert_from_pem(
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod client_tests;
+
+#[cfg(test)]
+#[path = "client_live_tests.rs"]
+mod client_live_tests;
