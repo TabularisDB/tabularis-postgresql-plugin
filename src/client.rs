@@ -270,6 +270,14 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 /// of sharing the stale one (#132). Mirrors how the builtin folds the startup
 /// script via `Sha256::digest` (`pool_manager.rs`). Absent or empty password →
 /// no digest segment, keeping keys stable for passwordless/trust connections.
+///
+/// Note: when `connection_string` is set, `build_pool` parses the password
+/// from the string (not `params.password`), so this digest sees `None` and the
+/// key is keyed only by the discrete fields — which the Tabularis host always
+/// populates alongside the URI, so the real-world path is covered. A standalone
+/// `connection_string`-only call (test_plugin / direct JSON-RPC) falls back to
+/// Fix 1's eviction-on-failure rather than Fix 2's distinct-keying; that path
+/// is a pre-existing latent gap, not introduced here.
 fn connection_key(params: &ConnectionParams) -> String {
     let base = format!(
         "{}:{}:{}:{}:{}:{}:{}:{}:{}",
