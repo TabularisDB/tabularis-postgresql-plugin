@@ -301,14 +301,14 @@ fn connection_key_omits_connection_string_segment_when_absent() {
 
 #[test]
 fn connection_key_omits_connection_string_segment_when_empty() {
-    // An empty/whitespace connection_string is treated as absent (no segment)
+    // An empty/whitespace connection_string is treated as absent (no cs: prefix)
     // — matches build_pool, which filters empty/whitespace strings.
     let mut p = params("localhost", 5432, "db", "postgres");
     p.connection_string = Some("   ".to_string());
     let key = connection_key(&p);
     assert!(
-        !key.contains(":cs:"),
-        "empty/whitespace connection_string must not add a cs segment: {key}"
+        !key.starts_with("cs:"),
+        "empty/whitespace connection_string must not produce a cs: key: {key}"
     );
 }
 
@@ -336,34 +336,76 @@ fn connection_key_does_not_contain_plaintext_connection_string() {
 
 #[test]
 fn connection_key_connection_string_takes_precedence_over_discrete_fields() {
-    // When connection_string is set, build_pool ignores the discrete fields
-    // entirely (parses everything from the string). The key mirrors that: same
-    // string → same key regardless of discrete fields; different string →
-    // different key. This prevents duplicate pools for the same connection
-    // string (#134, Option B — matches build_pool's precedence exactly).
+    // When connection_string is set, build_pool ignores the discrete
+    // host/port/db/user fields (parses them from the string). The key mirrors
+    // that: same string + same TLS/startup_script → same key regardless of
+    // host/port/db/user. But TLS params and startup_script are STILL in the
+    // key (build_pool reads them unconditionally), so different TLS or
+    // startup_script still produce distinct keys.
     let mut with_cs = params("localhost", 5432, "db", "postgres");
     with_cs.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
 
-    let same_cs_diff_discrete = {
+    let same_cs_diff_host_port_db_user = {
         let mut p = params("other-host", 9999, "other-db", "other-user");
         p.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
         p
     };
     assert_eq!(
         connection_key(&with_cs),
-        connection_key(&same_cs_diff_discrete),
-        "when connection_string is set, the discrete fields are irrelevant — \
-         same string must produce the same key regardless of discrete fields"
+        connection_key(&same_cs_diff_host_port_db_user),
+        "when connection_string is set, host/port/db/user are irrelevant — \
+         same string + same TLS/startup_script must produce the same key"
     );
 }
 
 #[test]
-fn connection_key_connection_string_key_has_no_discrete_fields() {
-    // When connection_string is set, the key is just "cs:{hash}" — the
-    // discrete fields (host, port, database, user, TLS params) must NOT
-    // appear in the key, since build_pool ignores them. Including them
-    // would create duplicate pools for the same string with different
-    // discrete fields (wasteful, and a confusion point).
+fn connection_key_connection_string_differs_by_ssl_mode() {
+    // build_pool reads ssl_mode from the discrete field even when
+    // connection_string is set, so the key must include it — otherwise
+    // a require-mode pool would be silently served to a disable-mode
+    // request (or vice versa). This is the critical fix for the pre-handoff
+    // review finding: TLS params must stay in the key.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_mode = Some("require".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_mode must not share a key — \
+         build_pool reads ssl_mode from the discrete field unconditionally"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_startup_script() {
+    // build_pool reads startup_script from the discrete field even when
+    // connection_string is set (applies it via post_create hook), so the
+    // key must include it — otherwise a pool with one search_path would be
+    // silently served to a request expecting a different one.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.startup_script = Some("SET search_path TO schema_b".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different startup_script must not share \
+         a key — build_pool reads startup_script from the discrete field"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_key_has_no_host_port_db_user() {
+    // When connection_string is set, the key starts with "cs:{hash}" and
+    // includes TLS params + startup_script, but NOT host/port/db/user (which
+    // build_pool ignores — it parses them from the string).
     let mut p = params("distinct-host-unique", 5432, "distinct-db", "distinct-user");
     p.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
     let key = connection_key(&p);
@@ -376,8 +418,12 @@ fn connection_key_connection_string_key_has_no_discrete_fields() {
         "discrete database must not appear in the key when connection_string is set: {key}"
     );
     assert!(
+        !key.contains("distinct-user"),
+        "discrete user must not appear in the key when connection_string is set: {key}"
+    );
+    assert!(
         key.starts_with("cs:"),
-        "key must be just 'cs:{{hash}}' when connection_string is set: {key}"
+        "key must start with 'cs:{{hash}}' when connection_string is set: {key}"
     );
 }
 
