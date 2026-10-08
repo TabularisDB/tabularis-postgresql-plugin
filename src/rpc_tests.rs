@@ -128,6 +128,9 @@ async fn parse_error_returns_32700() {
 /// not a Method Not Found (-32601) — per JSON-RPC 2.0, a Request object MUST
 /// contain a `method` member. The old code fell through to the `other` arm
 /// with an empty method string, producing a misleading -32601 (#137).
+/// Also asserts the response echoes the request's `id` (not `null`) — a
+/// regression to `Value::Null` would make the host fail to deserialize the
+/// response (it expects `id: u64`), causing the caller to hang.
 #[tokio::test]
 async fn object_with_id_but_no_method_returns_invalid_request() {
     let response = handle_line(r#"{"jsonrpc":"2.0","id":1}"#).await;
@@ -139,6 +142,12 @@ async fn object_with_id_but_no_method_returns_invalid_request() {
             .and_then(|c| c.as_i64()),
         Some(-32600),
         "an object with an id but no method is an Invalid Request, not a Method Not Found"
+    );
+    assert_eq!(
+        response.get("id").and_then(|v| v.as_u64()),
+        Some(1),
+        "the error response must echo the request's id, not null — the host \
+         deserializes id as u64 and a null id would cause a deserialization failure"
     );
 }
 

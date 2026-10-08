@@ -174,6 +174,15 @@ pub async fn handle_line(line: &str) -> Option<Value> {
     // corrupt the stream by responding to a message the host doesn't expect
     // a reply to. This only affects `cancel` today; every other method is
     // only ever sent as a request with an `id`.
+    //
+    // Note: the method-presence and is_object guards above return early with
+    // `Some(error_response(...))` for invalid objects/non-objects, bypassing
+    // this suppression. That's intentional — those inputs are Invalid Requests
+    // (-32600), not notifications, so they should get a response even if they
+    // lack an `id`. An `id`-less Invalid Request like `{}` produces an
+    // `id: null` response the host currently can't deserialize (tabularis#916);
+    // the host logs and drops it, which is still better than the pre-fix hang
+    // (the host sees *something* rather than nothing).
     if is_notification {
         None
     } else {
