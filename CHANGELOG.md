@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.7] - 2026-10-08
+
+### Fixed
+
+- A failed connection attempt (wrong password) no longer poisons the pool
+  cache: deadpool-postgres connects lazily, so a pool built with a wrong
+  password was cached before the handshake was tested, and the cache key
+  excluded the password, so the next request with the correct password
+  reused the poisoned pool and failed until the 600s idle sweep dropped
+  it. Three layered fixes: (1) `get_pool_client` evicts the cache entry
+  on `pool.get()` failure, (2) `connection_key` folds a SHA-256 hash of
+  the password so different passwords get distinct pools, (3)
+  `format_pg_error` returns just the `severity: message` line instead of
+  the full `tokio_postgres::Error` Debug dump that Tabularis showed
+  verbatim in its password prompt (#132).
+
+- When `connection_string` is set, the pool cache key now folds in a
+  SHA-256 hash of the connection string (which carries the password) so
+  two strings differing only by password get distinct pools, and TLS
+  params + startup_script remain in the key since `build_pool` reads
+  them unconditionally even when `connection_string` is set (#134).
+
+- Non-object JSON-RPC input (arrays, numbers, strings, bools, null) now
+  returns a `-32600 Invalid Request` response instead of being silently
+  swallowed as a notification, which caused the client to hang (#135).
+
+- Invalid JSON-RPC objects missing a string `method` field (e.g. `{}` or
+  `{"id":1}`) now return `-32600 Invalid Request` instead of being
+  silently swallowed as a notification (no `id`) or returning a
+  misleading `-32601 Method Not Found` (has `id`) (#137).
+
+### Changed
+
+- Bumped `rustls-platform-verifier` from 0.7.0 to 0.7.1 (Windows/Android
+  bugfixes) (#128).
+- Bumped `uuid` from 1.26.1 to 1.27.0 (case-insensitive URN parsing, V7
+  ordering fix) (#130).
+- Bumped `tokio` from 1.53.1 to 1.53.2 (bugfixes in fs/sync/rt/time) (#131).
+
 ## [1.0.0-rc.6] - 2026-09-30
 
 ### Added
