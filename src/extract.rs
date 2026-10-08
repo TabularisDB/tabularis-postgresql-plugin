@@ -13,6 +13,8 @@ use tokio_postgres::types::{FromSql, Kind, Type};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
+use crate::utils::values::float4_to_json;
+
 /// JavaScript's Number.MAX_SAFE_INTEGER (2^53 - 1).
 pub(crate) const JS_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
@@ -60,11 +62,7 @@ fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
         ref t if *t == Type::INT2 => try_extract::<i16>(row, index, JsonValue::from),
         ref t if *t == Type::INT4 => try_extract::<i32>(row, index, JsonValue::from),
         ref t if *t == Type::INT8 => try_extract::<i64>(row, index, i64_to_json),
-        ref t if *t == Type::FLOAT4 => try_extract::<f32>(row, index, |v| {
-            serde_json::Number::from_f64(v as f64)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }),
+        ref t if *t == Type::FLOAT4 => try_extract::<f32>(row, index, float4_to_json),
         ref t if *t == Type::FLOAT8 => try_extract::<f64>(row, index, |v| {
             serde_json::Number::from_f64(v)
                 .map(JsonValue::Number)
@@ -229,11 +227,7 @@ fn extract_array_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
         ref t if *t == Type::FLOAT4_ARRAY => try_extract::<Vec<Option<f32>>>(row, index, |v| {
             JsonValue::Array(
                 v.into_iter()
-                    .map(|e| {
-                        e.and_then(|f| serde_json::Number::from_f64(f as f64))
-                            .map(JsonValue::Number)
-                            .unwrap_or(JsonValue::Null)
-                    })
+                    .map(|e| e.map(float4_to_json).unwrap_or(JsonValue::Null))
                     .collect(),
             )
         }),
@@ -842,11 +836,7 @@ fn extract_simple_kind_from_bytes(ty: &Type, buf: &[u8]) -> JsonValue {
             .map(JsonValue::from)
             .unwrap_or(JsonValue::Null),
         _ if *ty == Type::FLOAT4 => f32::from_sql(ty, buf)
-            .map(|v| {
-                serde_json::Number::from_f64(v as f64)
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null)
-            })
+            .map(float4_to_json)
             .unwrap_or(JsonValue::Null),
         _ if *ty == Type::FLOAT8 => f64::from_sql(ty, buf)
             .map(|v| {

@@ -147,6 +147,85 @@ fn execute_query_returns_rows_from_live_database() {
     assert_eq!(rows[0][0], json!(1));
 }
 
+#[test]
+fn float4_values_use_short_decimals_in_scalars_arrays_and_composites() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_float4_values (price real, prices real[])",
+        }),
+    );
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT 89.9::real, 59.99::real, 29.5::real, -89.9::real, \
+                       1.2345678::real, NULL::real, 'NaN'::real, 'Infinity'::real, \
+                       ARRAY[89.9::real, NULL, 59.99::real], \
+                       ROW(89.9::real, ARRAY[59.99::real, NULL])::live_float4_values, \
+                       89.9000015258789::double precision",
+        }),
+    );
+    assert_eq!(
+        result["rows"],
+        json!([[89.9, 59.99, 29.5, -89.9, 1.2345678, null, null, null,
+            [89.9, null, 59.99], {"price": 89.9, "prices": [59.99, null]},
+            89.9000015258789]]),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "DROP TABLE live_float4_values"}),
+    );
+}
+
+#[test]
+fn real_row_identity_allows_update_and_delete_with_short_decimals() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_float4_identity (price real, label text)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "TRUNCATE live_float4_identity"}),
+    );
+    plugin.call_ok(
+        "insert_record",
+        json!({
+            "params": params, "table": "live_float4_identity", "schema": "public",
+            "data": {"price": 89.9, "label": "before"},
+        }),
+    );
+    let updated = plugin.call_ok(
+        "update_record",
+        json!({
+            "params": params, "table": "live_float4_identity", "schema": "public",
+            "pk_map": {"price": 89.9, "label": "before"},
+            "col_name": "label", "new_val": "after",
+        }),
+    );
+    assert_eq!(updated, json!(1), "short REAL value must identify the row");
+    let deleted = plugin.call_ok(
+        "delete_record",
+        json!({
+            "params": params, "table": "live_float4_identity", "schema": "public",
+            "pk_map": {"price": 89.9, "label": "after"},
+        }),
+    );
+    assert_eq!(deleted, json!(1));
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "DROP TABLE live_float4_identity"}),
+    );
+}
+
 // Coverage for #66: `tokio_postgres::Error`'s own `Display` impl prints the
 // generic "db error" string for any server-side error (its `Kind::Db` arm),
 // throwing away the real message in the wrapped `DbError`. `exec_query_on_client`

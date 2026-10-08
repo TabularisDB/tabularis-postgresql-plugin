@@ -589,6 +589,12 @@ pub fn bind_pk_value(
 
     match value {
         Value::Number(n) => {
+            // Short float4 decimals must compare at the column's precision.
+            if matches!(base_type.as_deref(), Some("REAL" | "FLOAT4")) {
+                let mut bound = bind_pg_number(n.clone(), placeholder_idx)?;
+                bound.sql = format!("CAST({} AS real)", bound.sql);
+                return Ok(bound);
+            }
             if let Some(i) = n.as_i64() {
                 Ok(BoundValue {
                     sql: format!("CAST(${} AS bigint)", placeholder_idx),
