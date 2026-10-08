@@ -124,12 +124,15 @@ async fn parse_error_returns_32700() {
     );
 }
 
-/// An empty object with an `id` but no method must still produce a response
-/// (not None) — it has an `id`, so it's not a notification (notification-ness
-/// is the absence of `id`, not object-ness), and it falls through to the
-/// `other => not_implemented` arm with -32601.
+/// An object with an `id` but no `method` is an Invalid Request (-32600),
+/// not a Method Not Found (-32601) — per JSON-RPC 2.0, a Request object MUST
+/// contain a `method` member. The old code fell through to the `other` arm
+/// with an empty method string, producing a misleading -32601 (#137).
+/// Also asserts the response echoes the request's `id` (not `null`) — a
+/// regression to `Value::Null` would make the host fail to deserialize the
+/// response (it expects `id: u64`), causing the caller to hang.
 #[tokio::test]
-async fn empty_object_with_no_method_returns_method_not_found() {
+async fn object_with_id_but_no_method_returns_invalid_request() {
     let response = handle_line(r#"{"jsonrpc":"2.0","id":1}"#).await;
     let response = response.expect("an object with an id must get a response");
     assert_eq!(
@@ -137,7 +140,67 @@ async fn empty_object_with_no_method_returns_method_not_found() {
             .get("error")
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_i64()),
-        Some(-32601),
-        "an object with an id but no method falls through to Method Not Found"
+        Some(-32600),
+        "an object with an id but no method is an Invalid Request, not a Method Not Found"
+    );
+    assert_eq!(
+        response.get("id").and_then(|v| v.as_u64()),
+        Some(1),
+        "the error response must echo the request's id, not null — the host \
+         deserializes id as u64 and a null id would cause a deserialization failure"
+    );
+}
+
+/// An empty object `{}` (no `id`, no `method`) is an Invalid Request, not a
+/// notification — per JSON-RPC 2.0, a notification must still be a valid
+/// Request (have a `method`). The old code treated it as a notification (no
+/// `id` → `is_notification = true`) and silently swallowed it → the client
+/// hung (#137, same bug class as #135 but for objects).
+#[tokio::test]
+async fn empty_object_returns_invalid_request_not_swallowed() {
+    let response = handle_line("{}").await;
+    let response =
+        response.expect("an empty object must get a response, not be swallowed as a notification");
+    assert_eq!(
+        response
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_i64()),
+        Some(-32600),
+        "an empty object is an Invalid Request, not a notification"
+    );
+}
+
+/// An object with no `id` and no `method` (just `jsonrpc` and `params`) is
+/// also an Invalid Request — it's not a notification because it has no
+/// `method`, and it's not a valid request either.
+#[tokio::test]
+async fn object_with_no_id_and_no_method_returns_invalid_request() {
+    let response = handle_line(r#"{"jsonrpc":"2.0","params":{"foo":"bar"}}"#).await;
+    let response = response.expect("an object with no method must get a response");
+    assert_eq!(
+        response
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_i64()),
+        Some(-32600),
+        "an object with no method is an Invalid Request, not a notification"
+    );
+}
+
+/// An object with a non-string `method` (e.g. a number) is an Invalid Request
+/// — the `method` member must be a string per JSON-RPC 2.0. The old code
+/// coerced it to `""` via `unwrap_or("")` and fell through to -32601.
+#[tokio::test]
+async fn object_with_non_string_method_returns_invalid_request() {
+    let response = handle_line(r#"{"jsonrpc":"2.0","id":1,"method":42}"#).await;
+    let response = response.expect("an object with a non-string method must get a response");
+    assert_eq!(
+        response
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_i64()),
+        Some(-32600),
+        "a non-string method is an Invalid Request, not a Method Not Found"
     );
 }
