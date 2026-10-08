@@ -5,9 +5,10 @@ use serde_json::{json, Value};
 use crate::handlers;
 
 /// Parse one JSON-RPC line and return the response value, or `None` for a
-/// *notification* (a request with no top-level `id` field) that requires no
-/// response per JSON-RPC convention. Never panics — parse errors and method
-/// failures are surfaced as JSON-RPC error responses.
+/// *notification* (a valid Request object — with a string `method` member —
+/// that has no top-level `id` field) that requires no response per JSON-RPC
+/// convention. Never panics — parse errors and method failures are surfaced
+/// as JSON-RPC error responses.
 ///
 /// Notification-ness is decided by the **absence of the `id` field**, not by
 /// method: a `cancel` with an `id` present is treated as a normal request
@@ -20,7 +21,9 @@ use crate::handlers;
 /// Only a JSON **object** can be a JSON-RPC request or notification. A
 /// non-object JSON value (array, number, string, bool, null) that parses
 /// successfully is an Invalid Request and gets a `-32600` response — not
-/// silently swallowed as a notification (#135).
+/// silently swallowed as a notification (#135). An object missing a string
+/// `method` member is likewise an Invalid Request, not a notification — a
+/// notification must be a valid Request (#137).
 pub async fn handle_line(line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
