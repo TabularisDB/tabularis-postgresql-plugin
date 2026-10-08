@@ -290,12 +290,12 @@ fn connection_key_is_stable_for_identical_connection_strings() {
 #[test]
 fn connection_key_omits_connection_string_segment_when_absent() {
     // A connection without a connection_string must keep the legacy key shape
-    // with no :cs: segment — guards stability for discrete-field connections.
+    // with no cs: prefix — guards stability for discrete-field connections.
     let p = params("localhost", 5432, "db", "postgres");
     let key = connection_key(&p);
     assert!(
-        !key.contains(":cs:"),
-        "absent connection_string must not add a cs segment: {key}"
+        !key.starts_with("cs:"),
+        "absent connection_string must not produce a cs: key: {key}"
     );
 }
 
@@ -398,6 +398,64 @@ fn connection_key_connection_string_differs_by_startup_script() {
         connection_key(&b),
         "same connection_string but different startup_script must not share \
          a key — build_pool reads startup_script from the discrete field"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_ssl_ca() {
+    // build_pool reads ssl_ca from the discrete field (via build_tls_connector)
+    // even when connection_string is set, so the key must include it.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_ca = Some("/path/to/ca-b.pem".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_ca must not share a key"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_ssl_cert() {
+    // build_pool reads ssl_cert from the discrete field (via build_tls_connector)
+    // even when connection_string is set, so the key must include it.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_cert = Some("/path/to/client-cert.pem".to_string());
+    b.ssl_key = Some("/path/to/client-key.pem".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_cert/ssl_key must not share a key"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_ssl_key() {
+    // build_pool reads ssl_key from the discrete field (via build_tls_connector)
+    // even when connection_string is set, so the key must include it.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    a.ssl_cert = Some("/path/to/client-cert.pem".to_string());
+    a.ssl_key = Some("/path/to/client-key-a.pem".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_cert = Some("/path/to/client-cert.pem".to_string());
+    b.ssl_key = Some("/path/to/client-key-b.pem".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_key must not share a key"
     );
 }
 

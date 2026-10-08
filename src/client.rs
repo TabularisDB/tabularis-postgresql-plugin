@@ -258,6 +258,13 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
     get_or_create_pool(params).await
 }
 
+/// SHA-256 hash of `bytes` as a lowercase hex string. Used for the password
+/// and connection_string cache-key segments — never stores plaintext.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Identifies a connection target for pool-cache purposes.
 /// Matches on host:port:database:user:startup_script, plus every TLS param
 /// (ssl_mode/ssl_ca/ssl_cert/ssl_key) — otherwise two connections differing
@@ -292,10 +299,17 @@ fn connection_key(params: &ConnectionParams) -> String {
     // reads them from the discrete fields unconditionally, even when
     // connection_string is set (it only ignores the discrete host/port/db/
     // user/password). Folding them here once avoids duplicating them in both
-    // branches below.
+    // branches below. The startup_script is trimmed to match build_pool's own
+    // `.map(str::trim)` at line 507 — so two scripts differing only in
+    // surrounding whitespace produce the same key (matching build_pool's
+    // identical pool behavior), not duplicate pools.
     let tls_and_script = format!(
         "{}:{}:{}:{}:{}",
-        params.startup_script.as_deref().unwrap_or(""),
+        params
+            .startup_script
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(""),
         params.ssl_mode.as_deref().unwrap_or(""),
         params.ssl_ca.as_deref().unwrap_or(""),
         params.ssl_cert.as_deref().unwrap_or(""),
@@ -316,8 +330,7 @@ fn connection_key(params: &ConnectionParams) -> String {
         .as_deref()
         .filter(|s| !s.trim().is_empty())
     {
-        let digest = Sha256::digest(cs.as_bytes());
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = sha256_hex(cs.as_bytes());
         return format!("cs:{hex}:{tls_and_script}");
     }
 
@@ -338,8 +351,7 @@ fn connection_key(params: &ConnectionParams) -> String {
     // Only an empty string is treated as "no password" (omits the segment).
     match params.password.as_deref().filter(|s| !s.is_empty()) {
         Some(pw) => {
-            let digest = Sha256::digest(pw.as_bytes());
-            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            let hex = sha256_hex(pw.as_bytes());
             format!("{base}:pw:{hex}")
         }
         None => base,
