@@ -135,12 +135,7 @@ async fn run_batch_in_session(
     // Acquire ONE connection for the entire batch (session state must survive)
     let pg_client = match pinned {
         Some(client) => client,
-        None => {
-            let pool = client::build_pool_pub(conn_params).await?;
-            pool.get()
-                .await
-                .map_err(|e| format!("Connection failed: {}", client::format_pool_error(&e)))?
-        }
+        None => client::get_pool_client(conn_params).await?,
     };
 
     // Register a cancel handle for this in-flight batch, keyed by the request
@@ -290,11 +285,7 @@ async fn exec_query(
     schema: Option<&str>,
     request_id: &Value,
 ) -> Result<Value, String> {
-    let pool = client::build_pool_pub(conn_params).await?;
-    let pg_client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", client::format_pool_error(&e)))?;
+    let pg_client = client::get_pool_client(conn_params).await?;
 
     // Register a cancel handle for this in-flight query (#126). The guard
     // deregisters on drop — at every return path below, Ok or Err — so a

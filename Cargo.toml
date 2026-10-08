@@ -30,6 +30,7 @@ async-trait = "0.1"
 log = "0.4"
 base64 = "0.23.1"
 infer = "0.22"
+sha2 = "0.11"
 
 [profile.release]
 lto = true
