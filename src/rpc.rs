@@ -47,6 +47,25 @@ pub async fn handle_line(line: &str) -> Option<Value> {
         ));
     }
 
+    // Per JSON-RPC 2.0, a Request object MUST contain a `method` member that
+    // is a string. An object missing `method` (or with a non-string `method`)
+    // is an Invalid Request (-32600), not a notification — a notification is a
+    // valid Request (with `method`) that happens to lack an `id`. This check
+    // must run before the notification check below: otherwise an object like
+    // `{}` (no `id`, no `method`) would be treated as a notification and
+    // silently swallowed → the client hangs (#137, same bug class as #135 but
+    // for objects).
+    if !request
+        .as_object()
+        .is_some_and(|o| o.get("method").is_some_and(Value::is_string))
+    {
+        return Some(error_response(
+            request.get("id").cloned().unwrap_or(Value::Null),
+            -32600,
+            "Invalid Request: JSON-RPC request must contain a string 'method' member",
+        ));
+    }
+
     // A request with no `id` field is a JSON-RPC notification: no response.
     // `id: null` is *not* a notification (it's a request whose id is null) —
     // distinguish "field absent" from "field present and null" so a host
