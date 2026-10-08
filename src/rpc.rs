@@ -16,6 +16,11 @@ use crate::handlers;
 /// fire-and-forget form the host will send on timeout per #126) returns
 /// `None` so `main.rs`'s worker skips the stdout write entirely — a stray
 /// response line for a notification would corrupt the protocol stream.
+///
+/// Only a JSON **object** can be a JSON-RPC request or notification. A
+/// non-object JSON value (array, number, string, bool, null) that parses
+/// successfully is an Invalid Request and gets a `-32600` response — not
+/// silently swallowed as a notification (#135).
 pub async fn handle_line(line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -27,6 +32,20 @@ pub async fn handle_line(line: &str) -> Option<Value> {
             ))
         }
     };
+
+    // A non-object JSON value (array, number, string, bool, null) is not a
+    // valid JSON-RPC request — only objects carry method/id/params. Return
+    // -32600 Invalid Request so the client gets a response instead of
+    // hanging (#135). Must happen before the notification check below: the
+    // old `!request.as_object().is_some_and(..)` predicate treated any
+    // non-object as a notification and silently dropped it.
+    if !request.is_object() {
+        return Some(error_response(
+            Value::Null,
+            -32600,
+            "Invalid Request: JSON-RPC request must be a JSON object",
+        ));
+    }
 
     // A request with no `id` field is a JSON-RPC notification: no response.
     // `id: null` is *not* a notification (it's a request whose id is null) —
@@ -163,3 +182,7 @@ pub fn not_implemented(id: Value, method: &str) -> Value {
         &format!("Method not found (-32601): '{method}' is not implemented"),
     )
 }
+
+#[cfg(test)]
+#[path = "rpc_tests.rs"]
+mod rpc_tests;
