@@ -5,9 +5,10 @@ use serde_json::{json, Value};
 use crate::handlers;
 
 /// Parse one JSON-RPC line and return the response value, or `None` for a
-/// *notification* (a request with no top-level `id` field) that requires no
-/// response per JSON-RPC convention. Never panics — parse errors and method
-/// failures are surfaced as JSON-RPC error responses.
+/// *notification* (a valid Request object — with a string `method` member —
+/// that has no top-level `id` field) that requires no response per JSON-RPC
+/// convention. Never panics — parse errors and method failures are surfaced
+/// as JSON-RPC error responses.
 ///
 /// Notification-ness is decided by the **absence of the `id` field**, not by
 /// method: a `cancel` with an `id` present is treated as a normal request
@@ -16,6 +17,13 @@ use crate::handlers;
 /// fire-and-forget form the host will send on timeout per #126) returns
 /// `None` so `main.rs`'s worker skips the stdout write entirely — a stray
 /// response line for a notification would corrupt the protocol stream.
+///
+/// Only a JSON **object** can be a JSON-RPC request or notification. A
+/// non-object JSON value (array, number, string, bool, null) that parses
+/// successfully is an Invalid Request and gets a `-32600` response — not
+/// silently swallowed as a notification (#135). An object missing a string
+/// `method` member is likewise an Invalid Request, not a notification — a
+/// notification must be a valid Request (#137).
 pub async fn handle_line(line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -27,6 +35,39 @@ pub async fn handle_line(line: &str) -> Option<Value> {
             ))
         }
     };
+
+    // A non-object JSON value (array, number, string, bool, null) is not a
+    // valid JSON-RPC request — only objects carry method/id/params. Return
+    // -32600 Invalid Request so the client gets a response instead of
+    // hanging (#135). Must happen before the notification check below: the
+    // old `!request.as_object().is_some_and(..)` predicate treated any
+    // non-object as a notification and silently dropped it.
+    if !request.is_object() {
+        return Some(error_response(
+            Value::Null,
+            -32600,
+            "Invalid Request: JSON-RPC request must be a JSON object",
+        ));
+    }
+
+    // Per JSON-RPC 2.0, a Request object MUST contain a `method` member that
+    // is a string. An object missing `method` (or with a non-string `method`)
+    // is an Invalid Request (-32600), not a notification — a notification is a
+    // valid Request (with `method`) that happens to lack an `id`. This check
+    // must run before the notification check below: otherwise an object like
+    // `{}` (no `id`, no `method`) would be treated as a notification and
+    // silently swallowed → the client hangs (#137, same bug class as #135 but
+    // for objects).
+    if !request
+        .as_object()
+        .is_some_and(|o| o.get("method").is_some_and(Value::is_string))
+    {
+        return Some(error_response(
+            request.get("id").cloned().unwrap_or(Value::Null),
+            -32600,
+            "Invalid Request: JSON-RPC request must contain a string 'method' member",
+        ));
+    }
 
     // A request with no `id` field is a JSON-RPC notification: no response.
     // `id: null` is *not* a notification (it's a request whose id is null) —
@@ -133,6 +174,15 @@ pub async fn handle_line(line: &str) -> Option<Value> {
     // corrupt the stream by responding to a message the host doesn't expect
     // a reply to. This only affects `cancel` today; every other method is
     // only ever sent as a request with an `id`.
+    //
+    // Note: the method-presence and is_object guards above return early with
+    // `Some(error_response(...))` for invalid objects/non-objects, bypassing
+    // this suppression. That's intentional — those inputs are Invalid Requests
+    // (-32600), not notifications, so they should get a response even if they
+    // lack an `id`. An `id`-less Invalid Request like `{}` produces an
+    // `id: null` response the host currently can't deserialize (tabularis#916);
+    // the host logs and drops it, which is still better than the pre-fix hang
+    // (the host sees *something* rather than nothing).
     if is_notification {
         None
     } else {
@@ -163,3 +213,7 @@ pub fn not_implemented(id: Value, method: &str) -> Value {
         &format!("Method not found (-32601): '{method}' is not implemented"),
     )
 }
+
+#[cfg(test)]
+#[path = "rpc_tests.rs"]
+mod rpc_tests;

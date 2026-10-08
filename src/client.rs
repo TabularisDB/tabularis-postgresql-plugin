@@ -258,6 +258,13 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
     get_or_create_pool(params).await
 }
 
+/// SHA-256 hash of `bytes` as a lowercase hex string. Used for the password
+/// and connection_string cache-key segments — never stores plaintext.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Identifies a connection target for pool-cache purposes.
 /// Matches on host:port:database:user:startup_script, plus every TLS param
 /// (ssl_mode/ssl_ca/ssl_cert/ssl_key) — otherwise two connections differing
@@ -276,25 +283,66 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 /// `params.password.clone()` verbatim — so two passwords differing only in
 /// surrounding whitespace get distinct keys, not a silent collision.
 ///
-/// Note: when `connection_string` is set, `build_pool` parses the password
-/// from the string (not `params.password`), so this digest sees `None` and the
-/// key is keyed only by the discrete fields — which the Tabularis host always
-/// populates alongside the URI, so the real-world path is covered. A standalone
-/// `connection_string`-only call (test_plugin / direct JSON-RPC) falls back to
-/// Fix 1's eviction-on-failure rather than Fix 2's distinct-keying; that path
-/// is a pre-existing latent gap, not introduced here.
+/// When `connection_string` is set, `build_pool` parses host/port/db/user/
+/// password from the string (ignoring the discrete host/port/db/user/password
+/// fields) but **still reads** `ssl_mode`/`ssl_ca`/`ssl_cert`/`ssl_key` and
+/// `startup_script` from the discrete fields unconditionally (these are used
+/// outside the connection_string match block, at the TLS/startup-script
+/// config that runs for every pool). The key mirrors that: the connection
+/// string hash **replaces** the host/port/db/user base, but the TLS params
+/// and startup_script remain in the key so two calls with the same string but
+/// different TLS or startup-script settings get distinct pools (#134). Absent
+/// or empty/whitespace connection_string → falls back to the full
+/// discrete-field + password key.
 fn connection_key(params: &ConnectionParams) -> String {
-    let base = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        params.host.as_deref().unwrap_or(""),
-        params.port.unwrap_or(5432),
-        params.database.as_deref().unwrap_or(""),
-        params.username.as_deref().unwrap_or(""),
-        params.startup_script.as_deref().unwrap_or(""),
+    // The TLS params and startup_script are always part of the key — build_pool
+    // reads them from the discrete fields unconditionally, even when
+    // connection_string is set (it only ignores the discrete host/port/db/
+    // user/password). Folding them here once avoids duplicating them in both
+    // branches below. The startup_script is trimmed to match build_pool's own
+    // `.map(str::trim)` at line 507 — so two scripts differing only in
+    // surrounding whitespace produce the same key (matching build_pool's
+    // identical pool behavior), not duplicate pools.
+    let tls_and_script = format!(
+        "{}:{}:{}:{}:{}",
+        params
+            .startup_script
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(""),
         params.ssl_mode.as_deref().unwrap_or(""),
         params.ssl_ca.as_deref().unwrap_or(""),
         params.ssl_cert.as_deref().unwrap_or(""),
         params.ssl_key.as_deref().unwrap_or(""),
+    );
+
+    // When connection_string is set, build_pool parses host/port/db/user/
+    // password from the string and ignores those discrete fields — but still
+    // reads TLS params and startup_script from the discrete fields. The key
+    // mirrors that: the connection string hash replaces the host/port/db/user
+    // base, TLS params and startup_script remain. The raw (untrimmed) string
+    // is hashed — matching build_pool's `from_str` input verbatim — so two
+    // strings differing only in surrounding whitespace get distinct keys
+    // (same pattern as the password fix in #132). Empty/whitespace strings are
+    // treated as absent (matching build_pool's own filter).
+    if let Some(cs) = params
+        .connection_string
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let hex = sha256_hex(cs.as_bytes());
+        return format!("cs:{hex}:{tls_and_script}");
+    }
+
+    // No connection_string — key on the discrete host/port/db/user fields,
+    // plus the TLS params and startup_script (already in tls_and_script).
+    let base = format!(
+        "{}:{}:{}:{}:{}",
+        params.host.as_deref().unwrap_or(""),
+        params.port.unwrap_or(5432),
+        params.database.as_deref().unwrap_or(""),
+        params.username.as_deref().unwrap_or(""),
+        tls_and_script,
     );
     // Hash the raw password exactly as build_pool sends it (no trimming) —
     // trimming here would collapse two distinct passwords that differ only in
@@ -303,8 +351,7 @@ fn connection_key(params: &ConnectionParams) -> String {
     // Only an empty string is treated as "no password" (omits the segment).
     match params.password.as_deref().filter(|s| !s.is_empty()) {
         Some(pw) => {
-            let digest = Sha256::digest(pw.as_bytes());
-            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            let hex = sha256_hex(pw.as_bytes());
             format!("{base}:pw:{hex}")
         }
         None => base,
