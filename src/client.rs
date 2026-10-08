@@ -14,9 +14,10 @@
 //! silently swallowed by the caller and never retried, unlike a persistent
 //! pool where a single connection failure doesn't affect already-established
 //! connections. Caching by `host:port:database:user:startup_script` plus
-//! every TLS param (matches the builtin's `build_connection_key` pattern in
-//! `src-tauri/src/pool_manager.rs`, minus the per-connection_id refinement
-//! that plugin doesn't need yet) closes that gap.
+//! every TLS param and the password (matches the builtin's
+//! `build_connection_key` pattern in `src-tauri/src/pool_manager.rs`, minus
+//! the per-connection_id refinement that plugin doesn't need yet) closes that
+//! gap.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -24,6 +25,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime, SslMode};
+use sha2::{Digest, Sha256};
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{NoTls, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -36,11 +38,16 @@ static POOLS: LazyLock<Mutex<HashMap<String, Pool>>> = LazyLock::new(|| Mutex::n
 /// server-side `DbError` (syntax errors, constraint violations, etc.) surface
 /// the real severity/message instead of the generic `Kind::Db` "db error"
 /// string that `tokio_postgres::Error`'s own `Display` impl produces.
+///
+/// Only the `severity: message` line is kept — not the full `Error { kind: Db,
+/// cause: Some(DbError { .. }) }` `Debug` dump, which Tabularis showed verbatim
+/// in its password prompt (#132). The first line is enough for a user to see
+/// what went wrong; the dump is noise for humans and a parity suite never
+/// compares error strings byte-for-byte (`parity.rs`: "error messages may
+/// differ between drivers").
 pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {
-        let brief = format!("{}: {}", db.severity(), db.message());
-        let detail = format!("{e:#?}");
-        format!("{brief}\n\n{detail}")
+        format!("{}: {}", db.severity(), db.message())
     } else {
         e.to_string()
     }
@@ -65,11 +72,7 @@ pub(crate) fn format_pool_error(e: &deadpool_postgres::PoolError) -> String {
 /// Build a connection pool from the given params and verify connectivity
 /// by acquiring one client and running `SELECT 1`.
 pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     client
         .query_one("SELECT 1", &[])
         .await
@@ -85,11 +88,7 @@ pub async fn query_strings(
     query_params: &[&(dyn ToSql + Sync)],
     column: &str,
 ) -> Result<Vec<String>, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     let rows = client
         .query(query, query_params)
         .await
@@ -108,11 +107,7 @@ pub async fn query_rows(
     query: &str,
     query_params: &[&(dyn ToSql + Sync)],
 ) -> Result<Vec<Row>, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     client
         .query(query, query_params)
         .await
@@ -128,11 +123,7 @@ pub async fn execute_typed(
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<u64, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
@@ -152,11 +143,7 @@ pub async fn query_typed(
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<Vec<Row>, String> {
-    let pool = get_or_create_pool(params).await?;
-    let client = pool
-        .get()
-        .await
-        .map_err(|e| format!("Connection failed: {}", format_pool_error(&e)))?;
+    let client = get_pool_client(params).await?;
     let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
     let stmt = client
         .prepare_typed(query, &types)
@@ -264,10 +251,18 @@ fn quote_qualified_type(type_schema: &str, type_name: &str) -> String {
 }
 
 /// Get the cached pool for these connection params, creating and caching one
-/// on first use. Public for use by query handlers that need direct pool
-/// access (e.g. to acquire one client for a multi-statement batch).
+/// on first use. Public for tests that build a lazy pool without a live
+/// database; production callers use `get_pool_client` instead (it adds
+/// eviction-on-failure, see #132).
 pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
     get_or_create_pool(params).await
+}
+
+/// SHA-256 hash of `bytes` as a lowercase hex string. Used for the password
+/// and connection_string cache-key segments — never stores plaintext.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Identifies a connection target for pool-cache purposes.
@@ -277,31 +272,108 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 /// already-negotiated TLS setup. Matches the builtin's `build_connection_key`
 /// TLS-param keying in `src-tauri/src/pool_manager.rs`, minus the
 /// per-connection_id refinement that plugin doesn't need yet.
+///
+/// The password is folded in as a SHA-256 hex digest (never plaintext) so a
+/// connection built with a wrong password can't be reused for a later request
+/// carrying the correct one, and a rotated password gets its own pool instead
+/// of sharing the stale one (#132). Mirrors how the builtin folds the startup
+/// script via `Sha256::digest` (`pool_manager.rs`). Absent or empty password →
+/// no digest segment, keeping keys stable for passwordless/trust connections.
+/// The raw (untrimmed) password is hashed — matching `build_pool`'s
+/// `params.password.clone()` verbatim — so two passwords differing only in
+/// surrounding whitespace get distinct keys, not a silent collision.
+///
+/// When `connection_string` is set, `build_pool` parses host/port/db/user/
+/// password from the string (ignoring the discrete host/port/db/user/password
+/// fields) but **still reads** `ssl_mode`/`ssl_ca`/`ssl_cert`/`ssl_key` and
+/// `startup_script` from the discrete fields unconditionally (these are used
+/// outside the connection_string match block, at the TLS/startup-script
+/// config that runs for every pool). The key mirrors that: the connection
+/// string hash **replaces** the host/port/db/user base, but the TLS params
+/// and startup_script remain in the key so two calls with the same string but
+/// different TLS or startup-script settings get distinct pools (#134). Absent
+/// or empty/whitespace connection_string → falls back to the full
+/// discrete-field + password key.
 fn connection_key(params: &ConnectionParams) -> String {
-    format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
-        params.host.as_deref().unwrap_or(""),
-        params.port.unwrap_or(5432),
-        params.database.as_deref().unwrap_or(""),
-        params.username.as_deref().unwrap_or(""),
-        params.startup_script.as_deref().unwrap_or(""),
+    // The TLS params and startup_script are always part of the key — build_pool
+    // reads them from the discrete fields unconditionally, even when
+    // connection_string is set (it only ignores the discrete host/port/db/
+    // user/password). Folding them here once avoids duplicating them in both
+    // branches below. The startup_script is trimmed to match build_pool's own
+    // `.map(str::trim)` at line 507 — so two scripts differing only in
+    // surrounding whitespace produce the same key (matching build_pool's
+    // identical pool behavior), not duplicate pools.
+    let tls_and_script = format!(
+        "{}:{}:{}:{}:{}",
+        params
+            .startup_script
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(""),
         params.ssl_mode.as_deref().unwrap_or(""),
         params.ssl_ca.as_deref().unwrap_or(""),
         params.ssl_cert.as_deref().unwrap_or(""),
         params.ssl_key.as_deref().unwrap_or(""),
-    )
+    );
+
+    // When connection_string is set, build_pool parses host/port/db/user/
+    // password from the string and ignores those discrete fields — but still
+    // reads TLS params and startup_script from the discrete fields. The key
+    // mirrors that: the connection string hash replaces the host/port/db/user
+    // base, TLS params and startup_script remain. The raw (untrimmed) string
+    // is hashed — matching build_pool's `from_str` input verbatim — so two
+    // strings differing only in surrounding whitespace get distinct keys
+    // (same pattern as the password fix in #132). Empty/whitespace strings are
+    // treated as absent (matching build_pool's own filter).
+    if let Some(cs) = params
+        .connection_string
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let hex = sha256_hex(cs.as_bytes());
+        return format!("cs:{hex}:{tls_and_script}");
+    }
+
+    // No connection_string — key on the discrete host/port/db/user fields,
+    // plus the TLS params and startup_script (already in tls_and_script).
+    let base = format!(
+        "{}:{}:{}:{}:{}",
+        params.host.as_deref().unwrap_or(""),
+        params.port.unwrap_or(5432),
+        params.database.as_deref().unwrap_or(""),
+        params.username.as_deref().unwrap_or(""),
+        tls_and_script,
+    );
+    // Hash the raw password exactly as build_pool sends it (no trimming) —
+    // trimming here would collapse two distinct passwords that differ only in
+    // whitespace into one cache key while build_pool connects with different
+    // credentials, silently serving B's request on A's authenticated pool.
+    // Only an empty string is treated as "no password" (omits the segment).
+    match params.password.as_deref().filter(|s| !s.is_empty()) {
+        Some(pw) => {
+            let hex = sha256_hex(pw.as_bytes());
+            format!("{base}:pw:{hex}")
+        }
+        None => base,
+    }
 }
 
 /// Return the cached pool for this connection's identity, or build and cache
 /// a new one if this is the first request for that identity.
 async fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
     let key = connection_key(params);
+    get_or_create_pool_with_key(params, &key).await
+}
 
+/// Same as `get_or_create_pool` but accepts a precomputed cache key, so
+/// `get_pool_client` (which already computes the key for eviction) doesn't
+/// pay for a second `connection_key` call on the hot path.
+async fn get_or_create_pool_with_key(params: &ConnectionParams, key: &str) -> Result<Pool, String> {
     {
         let pools = POOLS
             .lock()
             .map_err(|_| "pool cache lock poisoned".to_string())?;
-        if let Some(pool) = pools.get(&key) {
+        if let Some(pool) = pools.get(key) {
             return Ok(pool.clone());
         }
     }
@@ -312,7 +384,51 @@ async fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
         .map_err(|_| "pool cache lock poisoned".to_string())?;
     // Another call may have raced us to create this pool between the read
     // above and this write — keep whichever is already cached.
-    Ok(pools.entry(key).or_insert(pool).clone())
+    Ok(pools.entry(key.to_string()).or_insert(pool).clone())
+}
+
+/// Acquire a pooled client, evicting the cache entry if the connection
+/// attempt fails.
+///
+/// deadpool-postgres connects lazily, so `get_or_create_pool` caches a `Pool`
+/// before any connection is actually established. If the credentials are wrong
+/// (or the host is unreachable), that cached pool is poisoned: it's keyed by
+/// everything *except* the live handshake result, so the next request finds it
+/// and fails the same way — until the 600s idle sweep finally drops it (#132).
+///
+/// This closes the gap: on a `pool.get()` failure we remove the cache entry,
+/// so the next request rebuilds a fresh pool.
+///
+/// Concurrency note: there is a narrow TOCTOU window between `pool.get()`
+/// resolving with `Err` and `POOLS.lock()` acquiring. A concurrent caller that
+/// evicts the failed pool and inserts a *different* working pool under the same
+/// key in that window would have its working pool removed by our `pools.remove`.
+/// `Pool` has no `Eq` and exposes no identity comparison (`inner` is private to
+/// deadpool), so we can't guard with `Arc::ptr_eq`. The impact is
+/// performance-only — the working pool is rebuilt on the next request; no data
+/// loss, no wrong connection served (existing checked-out `Object`s still work,
+/// they just can't return to the pool). The window contains no `await` points,
+/// so on an uncontended lock the eviction runs synchronously with no
+/// interleaving. This is strictly better than the pre-fix behavior (a poisoned
+/// pool lingering for 600s), so the benign race is accepted.
+pub(crate) async fn get_pool_client(
+    params: &ConnectionParams,
+) -> Result<deadpool_postgres::Object, String> {
+    let key = connection_key(params);
+    let pool = get_or_create_pool_with_key(params, &key).await?;
+
+    match pool.get().await {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            // Evict the poisoned pool so the next request rebuilds a fresh one.
+            // See the concurrency note above: a narrow TOCTOU window exists but
+            // is performance-only in impact.
+            if let Ok(mut pools) = POOLS.lock() {
+                pools.remove(&key);
+            }
+            Err(format!("Connection failed: {}", format_pool_error(&e)))
+        }
+    }
 }
 
 /// Drop pools that currently have no checked-out connections. Called
@@ -902,3 +1018,7 @@ fn load_client_cert_from_pem(
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod client_tests;
+
+#[cfg(test)]
+#[path = "client_live_tests.rs"]
+mod client_live_tests;

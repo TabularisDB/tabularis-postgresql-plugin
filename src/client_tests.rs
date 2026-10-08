@@ -5,8 +5,8 @@ use tokio::sync::Mutex;
 
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
-    load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode, NoCertVerifier,
-    VerifyCaCertVerifier, POOLS,
+    get_pool_client, load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode,
+    NoCertVerifier, VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use crate::settings;
@@ -132,6 +132,379 @@ fn connection_key_differs_by_ssl_key_alone() {
     );
 }
 
+// Coverage for #132: the pool cache key must distinguish connections that differ
+// only by password, so a failed connection built with a wrong password can't be
+// reused for a later request carrying the correct one (and a rotated password
+// gets its own pool instead of sharing the stale one). The password is folded in
+// as a SHA-256 hex digest — never as plaintext — mirroring how the builtin
+// folds the startup script (`pool_manager.rs`'s `Sha256::digest`) and how TLS
+// params were added in #36.
+
+#[test]
+fn connection_key_differs_by_password() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.password = Some("hunter2".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.password = Some("correct-horse-battery-staple".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different passwords must not share a cache key — otherwise a failed \
+         connection built with a wrong password poisons the pool for the \
+         correct one (#132)"
+    );
+}
+
+#[test]
+fn connection_key_is_stable_for_identical_passwords() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.password = Some("s3cret".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.password = Some("s3cret".to_string());
+    assert_eq!(
+        connection_key(&a),
+        connection_key(&b),
+        "identical passwords must produce identical keys (no salt/randomness)"
+    );
+}
+
+#[test]
+fn connection_key_omits_password_segment_when_absent() {
+    // A passwordless connection (None) must keep the legacy key shape with no
+    // password segment — guards stability for passwordless/trust connections
+    // and keeps the existing connection_key_* tests above unchanged.
+    let none_pw = params("localhost", 5432, "db", "postgres");
+    let key = connection_key(&none_pw);
+    assert!(
+        !key.contains(":pw:"),
+        "absent password must not add a pw segment to the key: {key}"
+    );
+}
+
+#[test]
+fn connection_key_omits_password_segment_when_empty() {
+    // An empty-string password is treated as absent (no segment) — matches
+    // build_pool, which sets cfg.password from params.password verbatim and
+    // would otherwise hash "" into the key for no benefit.
+    let mut empty_pw = params("localhost", 5432, "db", "postgres");
+    empty_pw.password = Some(String::new());
+    let key = connection_key(&empty_pw);
+    assert!(
+        !key.contains(":pw:"),
+        "empty password must not add a pw segment to the key: {key}"
+    );
+}
+
+#[test]
+fn connection_key_differs_by_surrounding_whitespace() {
+    // The raw (untrimmed) password is hashed — matching build_pool's
+    // params.password.clone() verbatim — so passwords differing only in
+    // surrounding whitespace get distinct keys, not a silent collision that
+    // would serve B's request on A's authenticated pool (#132 pre-handoff
+    // review finding: trimming here while build_pool doesn't is a bug).
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.password = Some("secret".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.password = Some(" secret ".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "passwords differing only in surrounding whitespace must not share a \
+         cache key — build_pool connects with the raw (untrimmed) password, so \
+         the key must hash the same raw bytes to avoid serving B on A's pool"
+    );
+}
+
+#[test]
+fn connection_key_whitespace_only_password_differs_from_absent() {
+    // A whitespace-only password ("   ") is NOT the same as None — build_pool
+    // sends "   " to PostgreSQL, so the key must include a :pw: segment to
+    // avoid sharing a pool with a passwordless (None) connection. Trimming
+    // would collapse these together (the bug the pre-handoff review found);
+    // hashing the raw value keeps them distinct.
+    let mut ws_only = params("localhost", 5432, "db", "postgres");
+    ws_only.password = Some("   ".to_string());
+    let absent = params("localhost", 5432, "db", "postgres");
+    assert_ne!(
+        connection_key(&ws_only),
+        connection_key(&absent),
+        "a whitespace-only password must not share a key with an absent \
+         password — build_pool sends the whitespace bytes to PostgreSQL"
+    );
+}
+
+// Coverage for #134: when connection_string is set, build_pool parses the
+// password (and everything else) from the string, not from the discrete
+// fields. The cache key must fold in the connection string (hashed) so two
+// strings differing only by password — or by any other field — get distinct
+// pools, not a silent collision that serves B's request on A's authenticated
+// pool. Mirrors how the password is folded (#132) and how the builtin folds
+// the startup script (pool_manager.rs's Sha256::digest).
+
+#[test]
+fn connection_key_differs_by_connection_string() {
+    // Two connection strings that differ only by password must not share a
+    // cache key — build_pool parses the password from the string, so a
+    // collision would let the wrong-password pool serve the correct-password
+    // request (#134, same bug class as #132).
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string =
+        Some("postgresql://postgres:wrongpass@127.0.0.1:54320/testdb".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string =
+        Some("postgresql://postgres:correctpass@127.0.0.1:54320/testdb".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "connection strings differing only by password must not share a cache key"
+    );
+}
+
+#[test]
+fn connection_key_differs_by_connection_string_host() {
+    // Two connection strings differing by host must not share a key.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@host-a:5432/db".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@host-b:5432/db".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "connection strings differing by host must not share a cache key"
+    );
+}
+
+#[test]
+fn connection_key_is_stable_for_identical_connection_strings() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    assert_eq!(
+        connection_key(&a),
+        connection_key(&b),
+        "identical connection strings must produce identical keys"
+    );
+}
+
+#[test]
+fn connection_key_omits_connection_string_segment_when_absent() {
+    // A connection without a connection_string must keep the legacy key shape
+    // with no cs: prefix — guards stability for discrete-field connections.
+    let p = params("localhost", 5432, "db", "postgres");
+    let key = connection_key(&p);
+    assert!(
+        !key.starts_with("cs:"),
+        "absent connection_string must not produce a cs: key: {key}"
+    );
+}
+
+#[test]
+fn connection_key_omits_connection_string_segment_when_empty() {
+    // An empty/whitespace connection_string is treated as absent (no cs: prefix)
+    // — matches build_pool, which filters empty/whitespace strings.
+    let mut p = params("localhost", 5432, "db", "postgres");
+    p.connection_string = Some("   ".to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.starts_with("cs:"),
+        "empty/whitespace connection_string must not produce a cs: key: {key}"
+    );
+}
+
+#[test]
+fn connection_key_does_not_contain_plaintext_connection_string() {
+    // The connection string contains the password in plaintext — it must
+    // appear in the key only as a hex digest, never as the raw string.
+    let secret = "postgresql://postgres:super-secret-do-not-leak@127.0.0.1:54320/db";
+    let mut p = params("localhost", 5432, "db", "postgres");
+    p.connection_string = Some(secret.to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.contains(secret),
+        "plaintext connection string must not appear in the cache key: {key}"
+    );
+    assert!(
+        !key.contains("super-secret-do-not-leak"),
+        "the password embedded in the connection string must not appear in the key: {key}"
+    );
+    assert!(
+        key.starts_with("cs:"),
+        "a present connection_string must produce a key starting with 'cs:': {key}"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_takes_precedence_over_discrete_fields() {
+    // When connection_string is set, build_pool ignores the discrete
+    // host/port/db/user fields (parses them from the string). The key mirrors
+    // that: same string + same TLS/startup_script → same key regardless of
+    // host/port/db/user. But TLS params and startup_script are STILL in the
+    // key (build_pool reads them unconditionally), so different TLS or
+    // startup_script still produce distinct keys.
+    let mut with_cs = params("localhost", 5432, "db", "postgres");
+    with_cs.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let same_cs_diff_host_port_db_user = {
+        let mut p = params("other-host", 9999, "other-db", "other-user");
+        p.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+        p
+    };
+    assert_eq!(
+        connection_key(&with_cs),
+        connection_key(&same_cs_diff_host_port_db_user),
+        "when connection_string is set, host/port/db/user are irrelevant — \
+         same string + same TLS/startup_script must produce the same key"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_ssl_mode() {
+    // build_pool reads ssl_mode from the discrete field even when
+    // connection_string is set, so the key must include it — otherwise
+    // a require-mode pool would be silently served to a disable-mode
+    // request (or vice versa). This is the critical fix for the pre-handoff
+    // review finding: TLS params must stay in the key.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_mode = Some("require".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_mode must not share a key — \
+         build_pool reads ssl_mode from the discrete field unconditionally"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_startup_script() {
+    // build_pool reads startup_script from the discrete field even when
+    // connection_string is set (applies it via post_create hook), so the
+    // key must include it — otherwise a pool with one search_path would be
+    // silently served to a request expecting a different one.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.startup_script = Some("SET search_path TO schema_b".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different startup_script must not share \
+         a key — build_pool reads startup_script from the discrete field"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_ssl_ca() {
+    // build_pool reads ssl_ca from the discrete field (via build_tls_connector)
+    // even when connection_string is set, so the key must include it.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_ca = Some("/path/to/ca-b.pem".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_ca must not share a key"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_ssl_cert() {
+    // build_pool reads ssl_cert from the discrete field (via build_tls_connector)
+    // even when connection_string is set, so the key must include it.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_cert = Some("/path/to/client-cert.pem".to_string());
+    b.ssl_key = Some("/path/to/client-key.pem".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_cert/ssl_key must not share a key"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_differs_by_ssl_key() {
+    // build_pool reads ssl_key from the discrete field (via build_tls_connector)
+    // even when connection_string is set, so the key must include it.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    a.ssl_cert = Some("/path/to/client-cert.pem".to_string());
+    a.ssl_key = Some("/path/to/client-key-a.pem".to_string());
+
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    b.ssl_cert = Some("/path/to/client-cert.pem".to_string());
+    b.ssl_key = Some("/path/to/client-key-b.pem".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "same connection_string but different ssl_key must not share a key"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_key_has_no_host_port_db_user() {
+    // When connection_string is set, the key starts with "cs:{hash}" and
+    // includes TLS params + startup_script, but NOT host/port/db/user (which
+    // build_pool ignores — it parses them from the string).
+    let mut p = params("distinct-host-unique", 5432, "distinct-db", "distinct-user");
+    p.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.contains("distinct-host-unique"),
+        "discrete host must not appear in the key when connection_string is set: {key}"
+    );
+    assert!(
+        !key.contains("distinct-db"),
+        "discrete database must not appear in the key when connection_string is set: {key}"
+    );
+    assert!(
+        !key.contains("distinct-user"),
+        "discrete user must not appear in the key when connection_string is set: {key}"
+    );
+    assert!(
+        key.starts_with("cs:"),
+        "key must start with 'cs:{{hash}}' when connection_string is set: {key}"
+    );
+}
+
+#[test]
+fn connection_key_does_not_contain_plaintext_password() {
+    // The password must appear in the key only as a hex digest, never as the
+    // raw string — a plaintext password sitting in a HashMap key is a secret
+    // leak via any dump of the cache (#132's suggested fix explicitly calls
+    // for hashing).
+    let secret = "super-secret-do-not-leak";
+    let mut p = params("localhost", 5432, "db", "postgres");
+    p.password = Some(secret.to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.contains(secret),
+        "plaintext password must not appear in the cache key: {key}"
+    );
+    assert!(
+        key.contains(":pw:"),
+        "a present password must add a hashed pw segment: {key}"
+    );
+}
+
 #[tokio::test]
 async fn get_or_create_pool_reuses_cached_entry_for_identical_params() {
     // deadpool's Pool::new is lazy (no connection attempt at creation
@@ -185,6 +558,68 @@ async fn cleanup_idle_pools_evicts_pools_with_no_checked_out_connections() {
         !POOLS.lock().unwrap().contains_key(&key),
         "an idle pool with no checked-out connections must be evicted"
     );
+}
+
+// Coverage for #132 Fix 1 (eviction-on-failure): the eviction branch of
+// get_pool_client — the `Err` arm of `pool.get()` that removes the cache entry —
+// is the primary fix. The live tests in client_live_tests.rs exercise it against
+// a real database, but this test runs in CI without one: deadpool's `Pool::new`
+// is lazy (no connection at creation time when no startup script is set), so
+// get_pool_client builds+caches a pool, then `pool.get()` fails because the host
+// is non-existent (connection refused), hitting the eviction arm. Asserting the
+// cache no longer contains the key proves eviction ran. This test would FAIL if
+// the eviction code (`pools.remove(&key)`) were removed — the lazy pool would
+// stay in the cache despite the failed `get()`.
+
+#[tokio::test]
+async fn get_pool_client_evicts_on_connection_failure() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    // A non-existent host: port 1 on the loopback is almost certainly not
+    // running a PostgreSQL, so pool.get() will fail with a connection error.
+    let p = params("127.0.0.1", 1, "db", "user");
+    let key = connection_key(&p);
+
+    // Ensure we start clean for this key.
+    POOLS.lock().unwrap().remove(&key);
+
+    let result = get_pool_client(&p).await;
+    assert!(
+        result.is_err(),
+        "connecting to a non-existent host must fail; got {:?}",
+        result
+    );
+
+    assert!(
+        !POOLS.lock().unwrap().contains_key(&key),
+        "a failed pool.get() must evict the cache entry so the next request \
+         rebuilds a fresh pool (#132); key {key} is still present"
+    );
+}
+
+#[tokio::test]
+async fn get_pool_client_eviction_branch_is_not_vacuous() {
+    // Proves the test above is non-vacuous: if eviction were removed, the
+    // cache entry would persist. We verify that get_or_create_pool (which
+    // does NOT evict) leaves the entry, while get_pool_client (which does)
+    // removes it — so the eviction is load-bearing, not a no-op.
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let p = params("127.0.0.1", 1, "db", "user");
+    let key = connection_key(&p);
+
+    POOLS.lock().unwrap().remove(&key);
+
+    // get_or_create_pool builds and caches a lazy pool (no connection attempt).
+    get_or_create_pool(&p)
+        .await
+        .expect("lazy pool builds without a live DB when no startup script is set");
+    assert!(
+        POOLS.lock().unwrap().contains_key(&key),
+        "get_or_create_pool should cache the lazy pool"
+    );
+
+    // Clean up — get_pool_client would also evict, but we want to isolate the
+    // "get_or_create_pool caches" assertion from the eviction test above.
+    POOLS.lock().unwrap().remove(&key);
 }
 
 // Self-signed, 10-year-validity fixture cert (CN=test) — not a real trust
