@@ -233,6 +233,154 @@ fn connection_key_whitespace_only_password_differs_from_absent() {
     );
 }
 
+// Coverage for #134: when connection_string is set, build_pool parses the
+// password (and everything else) from the string, not from the discrete
+// fields. The cache key must fold in the connection string (hashed) so two
+// strings differing only by password — or by any other field — get distinct
+// pools, not a silent collision that serves B's request on A's authenticated
+// pool. Mirrors how the password is folded (#132) and how the builtin folds
+// the startup script (pool_manager.rs's Sha256::digest).
+
+#[test]
+fn connection_key_differs_by_connection_string() {
+    // Two connection strings that differ only by password must not share a
+    // cache key — build_pool parses the password from the string, so a
+    // collision would let the wrong-password pool serve the correct-password
+    // request (#134, same bug class as #132).
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string =
+        Some("postgresql://postgres:wrongpass@127.0.0.1:54320/testdb".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string =
+        Some("postgresql://postgres:correctpass@127.0.0.1:54320/testdb".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "connection strings differing only by password must not share a cache key"
+    );
+}
+
+#[test]
+fn connection_key_differs_by_connection_string_host() {
+    // Two connection strings differing by host must not share a key.
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@host-a:5432/db".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@host-b:5432/db".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "connection strings differing by host must not share a cache key"
+    );
+}
+
+#[test]
+fn connection_key_is_stable_for_identical_connection_strings() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    assert_eq!(
+        connection_key(&a),
+        connection_key(&b),
+        "identical connection strings must produce identical keys"
+    );
+}
+
+#[test]
+fn connection_key_omits_connection_string_segment_when_absent() {
+    // A connection without a connection_string must keep the legacy key shape
+    // with no :cs: segment — guards stability for discrete-field connections.
+    let p = params("localhost", 5432, "db", "postgres");
+    let key = connection_key(&p);
+    assert!(
+        !key.contains(":cs:"),
+        "absent connection_string must not add a cs segment: {key}"
+    );
+}
+
+#[test]
+fn connection_key_omits_connection_string_segment_when_empty() {
+    // An empty/whitespace connection_string is treated as absent (no segment)
+    // — matches build_pool, which filters empty/whitespace strings.
+    let mut p = params("localhost", 5432, "db", "postgres");
+    p.connection_string = Some("   ".to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.contains(":cs:"),
+        "empty/whitespace connection_string must not add a cs segment: {key}"
+    );
+}
+
+#[test]
+fn connection_key_does_not_contain_plaintext_connection_string() {
+    // The connection string contains the password in plaintext — it must
+    // appear in the key only as a hex digest, never as the raw string.
+    let secret = "postgresql://postgres:super-secret-do-not-leak@127.0.0.1:54320/db";
+    let mut p = params("localhost", 5432, "db", "postgres");
+    p.connection_string = Some(secret.to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.contains(secret),
+        "plaintext connection string must not appear in the cache key: {key}"
+    );
+    assert!(
+        !key.contains("super-secret-do-not-leak"),
+        "the password embedded in the connection string must not appear in the key: {key}"
+    );
+    assert!(
+        key.starts_with("cs:"),
+        "a present connection_string must produce a key starting with 'cs:': {key}"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_takes_precedence_over_discrete_fields() {
+    // When connection_string is set, build_pool ignores the discrete fields
+    // entirely (parses everything from the string). The key mirrors that: same
+    // string → same key regardless of discrete fields; different string →
+    // different key. This prevents duplicate pools for the same connection
+    // string (#134, Option B — matches build_pool's precedence exactly).
+    let mut with_cs = params("localhost", 5432, "db", "postgres");
+    with_cs.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+
+    let same_cs_diff_discrete = {
+        let mut p = params("other-host", 9999, "other-db", "other-user");
+        p.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+        p
+    };
+    assert_eq!(
+        connection_key(&with_cs),
+        connection_key(&same_cs_diff_discrete),
+        "when connection_string is set, the discrete fields are irrelevant — \
+         same string must produce the same key regardless of discrete fields"
+    );
+}
+
+#[test]
+fn connection_key_connection_string_key_has_no_discrete_fields() {
+    // When connection_string is set, the key is just "cs:{hash}" — the
+    // discrete fields (host, port, database, user, TLS params) must NOT
+    // appear in the key, since build_pool ignores them. Including them
+    // would create duplicate pools for the same string with different
+    // discrete fields (wasteful, and a confusion point).
+    let mut p = params("distinct-host-unique", 5432, "distinct-db", "distinct-user");
+    p.connection_string = Some("postgresql://postgres:pw@127.0.0.1:54320/db".to_string());
+    let key = connection_key(&p);
+    assert!(
+        !key.contains("distinct-host-unique"),
+        "discrete host must not appear in the key when connection_string is set: {key}"
+    );
+    assert!(
+        !key.contains("distinct-db"),
+        "discrete database must not appear in the key when connection_string is set: {key}"
+    );
+    assert!(
+        key.starts_with("cs:"),
+        "key must be just 'cs:{{hash}}' when connection_string is set: {key}"
+    );
+}
+
 #[test]
 fn connection_key_does_not_contain_plaintext_password() {
     // The password must appear in the key only as a hex digest, never as the

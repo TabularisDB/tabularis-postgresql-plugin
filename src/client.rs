@@ -276,14 +276,34 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 /// `params.password.clone()` verbatim — so two passwords differing only in
 /// surrounding whitespace get distinct keys, not a silent collision.
 ///
-/// Note: when `connection_string` is set, `build_pool` parses the password
-/// from the string (not `params.password`), so this digest sees `None` and the
-/// key is keyed only by the discrete fields — which the Tabularis host always
-/// populates alongside the URI, so the real-world path is covered. A standalone
-/// `connection_string`-only call (test_plugin / direct JSON-RPC) falls back to
-/// Fix 1's eviction-on-failure rather than Fix 2's distinct-keying; that path
-/// is a pre-existing latent gap, not introduced here.
+/// When `connection_string` is set, `build_pool` parses everything (host,
+/// port, db, user, password) from the string and **ignores the discrete
+/// fields entirely**. The key mirrors that precedence: the connection string
+/// (SHA-256 hex digest, never plaintext — it carries the password) **replaces**
+/// the discrete-field base, so two calls with the same string but different
+/// discrete fields share one pool (matching `build_pool`'s behavior) and two
+/// strings differing only by password get distinct pools (#134). Absent or
+/// empty/whitespace → falls back to the discrete-field base, keeping keys
+/// stable for discrete-field connections.
 fn connection_key(params: &ConnectionParams) -> String {
+    // When connection_string is set, build_pool parses everything from the
+    // string and ignores the discrete fields entirely (line 434-448). Mirror
+    // that precedence: the key is just the connection string's hash — the
+    // discrete fields are irrelevant and including them would create duplicate
+    // pools for the same string. Empty/whitespace strings are treated as
+    // absent (matching build_pool's own filter at line 437).
+    if let Some(cs) = params
+        .connection_string
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let digest = Sha256::digest(cs.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        return format!("cs:{hex}");
+    }
+
+    // No connection_string — key on the discrete fields, plus the password.
     let base = format!(
         "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         params.host.as_deref().unwrap_or(""),
