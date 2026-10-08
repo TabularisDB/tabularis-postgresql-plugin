@@ -310,12 +310,18 @@ fn connection_key(params: &ConnectionParams) -> String {
 /// a new one if this is the first request for that identity.
 async fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
     let key = connection_key(params);
+    get_or_create_pool_with_key(params, &key).await
+}
 
+/// Same as `get_or_create_pool` but accepts a precomputed cache key, so
+/// `get_pool_client` (which already computes the key for eviction) doesn't
+/// pay for a second `connection_key` call on the hot path.
+async fn get_or_create_pool_with_key(params: &ConnectionParams, key: &str) -> Result<Pool, String> {
     {
         let pools = POOLS
             .lock()
             .map_err(|_| "pool cache lock poisoned".to_string())?;
-        if let Some(pool) = pools.get(&key) {
+        if let Some(pool) = pools.get(key) {
             return Ok(pool.clone());
         }
     }
@@ -326,7 +332,7 @@ async fn get_or_create_pool(params: &ConnectionParams) -> Result<Pool, String> {
         .map_err(|_| "pool cache lock poisoned".to_string())?;
     // Another call may have raced us to create this pool between the read
     // above and this write — keep whichever is already cached.
-    Ok(pools.entry(key).or_insert(pool).clone())
+    Ok(pools.entry(key.to_string()).or_insert(pool).clone())
 }
 
 /// Acquire a pooled client, evicting the cache entry if the connection
@@ -351,7 +357,7 @@ pub(crate) async fn get_pool_client(
     params: &ConnectionParams,
 ) -> Result<deadpool_postgres::Object, String> {
     let key = connection_key(params);
-    let pool = get_or_create_pool(params).await?;
+    let pool = get_or_create_pool_with_key(params, &key).await?;
 
     match pool.get().await {
         Ok(client) => Ok(client),
