@@ -7,6 +7,8 @@ fn finite_float4_extremes_round_trip_without_losing_precision() {
         f32::MIN,
         f32::MIN_POSITIVE,
         f32::from_bits(1),
+        f32::from_bits(0x15ae43fd),
+        -f32::from_bits(0x15ae43fd),
         -0.0,
     ] {
         let json = float4_to_json(value);

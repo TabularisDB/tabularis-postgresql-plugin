@@ -185,45 +185,67 @@ fn float4_values_use_short_decimals_in_scalars_arrays_and_composites() {
 fn real_row_identity_allows_update_and_delete_with_short_decimals() {
     let mut plugin = Plugin::spawn();
     let params = conn_params();
-    plugin.call_ok(
-        "execute_query",
-        json!({
-            "params": params,
-            "query": "CREATE TABLE IF NOT EXISTS live_float4_identity (price real, label text)",
-        }),
-    );
-    plugin.call_ok(
-        "execute_query",
-        json!({"params": params, "query": "TRUNCATE live_float4_identity"}),
-    );
-    plugin.call_ok(
-        "insert_record",
-        json!({
-            "params": params, "table": "live_float4_identity", "schema": "public",
-            "data": {"price": 89.9, "label": "before"},
-        }),
-    );
-    let updated = plugin.call_ok(
-        "update_record",
-        json!({
-            "params": params, "table": "live_float4_identity", "schema": "public",
-            "pk_map": {"price": 89.9, "label": "before"},
-            "col_name": "label", "new_val": "after",
-        }),
-    );
-    assert_eq!(updated, json!(1), "short REAL value must identify the row");
-    let deleted = plugin.call_ok(
-        "delete_record",
-        json!({
-            "params": params, "table": "live_float4_identity", "schema": "public",
-            "pk_map": {"price": 89.9, "label": "after"},
-        }),
-    );
-    assert_eq!(deleted, json!(1));
-    plugin.call_ok(
-        "execute_query",
-        json!({"params": params, "query": "DROP TABLE live_float4_identity"}),
-    );
+    for primary_key in ["", ", PRIMARY KEY (price)", ", PRIMARY KEY (price, id)"] {
+        plugin.call_ok(
+            "execute_query",
+            json!({
+                "params": params,
+                "query": format!("CREATE TABLE live_float4_identity \
+                    (price real, id integer, label text{primary_key})"),
+            }),
+        );
+        for value in [
+            89.9f32,
+            f32::from_bits(0x15ae43fd),
+            -f32::from_bits(0x15ae43fd),
+        ] {
+            plugin.call_ok(
+                "insert_record",
+                json!({
+                    "params": params, "table": "live_float4_identity", "schema": "public",
+                    "data": {"price": value, "id": 1, "label": "before"},
+                }),
+            );
+            let row = plugin.call_ok(
+                "execute_query",
+                json!({"params": params, "query": "SELECT price FROM live_float4_identity"}),
+            );
+            let price = &row["rows"][0][0];
+            assert_eq!((price.as_f64().unwrap() as f32).to_bits(), value.to_bits());
+            let mut pk_map = match primary_key {
+                "" => json!({"price": price, "id": 1, "label": "before"}),
+                ", PRIMARY KEY (price)" => json!({"price": price}),
+                _ => json!({"price": price, "id": 1}),
+            };
+            let updated = plugin.call_ok(
+                "update_record",
+                json!({
+                    "params": params, "table": "live_float4_identity", "schema": "public",
+                    "pk_map": pk_map, "col_name": "label", "new_val": "after",
+                }),
+            );
+            assert_eq!(
+                updated,
+                json!(1),
+                "REAL value must identify the row: {value}"
+            );
+            if primary_key.is_empty() {
+                pk_map["label"] = json!("after");
+            }
+            let deleted = plugin.call_ok(
+                "delete_record",
+                json!({
+                    "params": params, "table": "live_float4_identity", "schema": "public",
+                    "pk_map": pk_map,
+                }),
+            );
+            assert_eq!(deleted, json!(1));
+        }
+        plugin.call_ok(
+            "execute_query",
+            json!({"params": params, "query": "DROP TABLE live_float4_identity"}),
+        );
+    }
 }
 
 // Coverage for #66: `tokio_postgres::Error`'s own `Display` impl prints the
