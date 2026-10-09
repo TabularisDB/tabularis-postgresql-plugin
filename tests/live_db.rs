@@ -188,6 +188,10 @@ fn real_row_identity_allows_update_and_delete_with_short_decimals() {
     for primary_key in ["", ", PRIMARY KEY (price)", ", PRIMARY KEY (price, id)"] {
         plugin.call_ok(
             "execute_query",
+            json!({"params": params, "query": "DROP TABLE IF EXISTS live_float4_identity"}),
+        );
+        plugin.call_ok(
+            "execute_query",
             json!({
                 "params": params,
                 "query": format!("CREATE TABLE live_float4_identity \
