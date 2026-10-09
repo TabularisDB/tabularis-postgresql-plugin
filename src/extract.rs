@@ -54,8 +54,7 @@ pub fn extract_value(row: &Row, index: usize) -> JsonValue {
 }
 
 /// `Kind::Simple` bucket: scalar types with no element/subtype (everything
-/// except enum/array/range/composite/domain/multirange). Every arm here is
-/// unchanged from the pre-restructure flat match.
+/// except enum/array/range/composite/domain/multirange).
 fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
     match *col_type {
         ref t if *t == Type::BOOL => try_extract::<bool>(row, index, JsonValue::Bool),
@@ -189,9 +188,8 @@ fn extract_simple_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
 }
 
 /// `Kind::Array(_)` bucket: the eight hardcoded fast-paths (checked against
-/// the outer array `Type::` constant, unchanged from the pre-restructure
-/// flat match), falling back to the generic per-element decoder for any
-/// other array element type (e.g. `enum[]`, `hstore[]`).
+/// the outer array `Type::` constant), falling back to the generic per-element
+/// decoder for any other array element type (e.g. `enum[]`, `hstore[]`).
 fn extract_array_kind(col_type: &Type, row: &Row, index: usize) -> JsonValue {
     match *col_type {
         ref t if *t == Type::INT2_ARRAY => try_extract::<Vec<Option<i16>>>(row, index, |v| {

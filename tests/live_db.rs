@@ -252,6 +252,48 @@ fn real_row_identity_allows_update_and_delete_with_short_decimals() {
     }
 }
 
+#[test]
+fn keyless_real_two_column_update_accepts_string_identity() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    for query in [
+        "DROP TABLE IF EXISTS live_float4_keyless_edit",
+        "CREATE TABLE live_float4_keyless_edit (price real, label text)",
+        "INSERT INTO live_float4_keyless_edit VALUES (89.9, 'a')",
+    ] {
+        plugin.call_ok("execute_query", json!({"params": params, "query": query}));
+    }
+    let mut identity = json!({"price": 89.9, "label": "a"});
+    let edited_price = json!("59.99");
+    let first = plugin.call_ok(
+        "update_record",
+        json!({
+            "params": params, "table": "live_float4_keyless_edit", "schema": "public",
+            "pk_map": identity, "col_name": "price", "new_val": edited_price,
+        }),
+    );
+    assert_eq!(first, json!(1), "price update");
+    // The next keyless step carries the editor's string without re-reading the row.
+    identity["price"] = edited_price;
+    let second = plugin.call_ok(
+        "update_record",
+        json!({
+            "params": params, "table": "live_float4_keyless_edit", "schema": "public",
+            "pk_map": identity, "col_name": "label", "new_val": "b",
+        }),
+    );
+    assert_eq!(second, json!(1), "label update with string REAL identity");
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "SELECT price, label FROM live_float4_keyless_edit"}),
+    );
+    assert_eq!(result["rows"], json!([[59.99, "b"]]));
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "DROP TABLE live_float4_keyless_edit"}),
+    );
+}
+
 // Coverage for #66: `tokio_postgres::Error`'s own `Display` impl prints the
 // generic "db error" string for any server-side error (its `Kind::Db` arm),
 // throwing away the real message in the wrapped `DbError`. `exec_query_on_client`

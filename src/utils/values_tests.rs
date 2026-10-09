@@ -1,6 +1,17 @@
 use super::values::float4_to_json;
 
 #[test]
+fn float4_preserves_short_decimal_values() {
+    for (value, expected) in [(89.9f32, 89.9f64), (59.99, 59.99), (-89.9, -89.9)] {
+        assert_eq!(
+            float4_to_json(value),
+            serde_json::json!(expected),
+            "input: {value}"
+        );
+    }
+}
+
+#[test]
 fn finite_float4_extremes_round_trip_without_losing_precision() {
     for value in [
         f32::MAX,
