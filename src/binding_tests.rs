@@ -513,6 +513,22 @@ mod bind_pk_value_tests {
     use super::*;
 
     #[test]
+    fn real_aliases_cast_integer_and_fractional_row_identities_to_real() {
+        for column_type in ["real", "FLOAT4", " REAL "] {
+            for (value, cast) in [
+                (json!(1), "bigint"),
+                (json!(89.9), "double precision"),
+                (json!("89.9"), "double precision"),
+            ] {
+                let bound = bind_pk_value(&value, 2, Some(column_type)).unwrap();
+                assert_eq!(bound.sql, format!("CAST(CAST($2 AS {cast}) AS real)"));
+            }
+        }
+        let bound = bind_pk_value(&json!("89.9"), 2, Some("double precision")).unwrap();
+        assert_eq!(bound.sql, "CAST($2 AS double precision)");
+    }
+
+    #[test]
     fn integer_pk_binds_as_bigint_cast() {
         let bound = bind_pk_value(&json!(42), 1, None).unwrap();
         assert_eq!(bound.sql, "CAST($1 AS bigint)");
