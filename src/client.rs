@@ -625,12 +625,21 @@ fn base_search_path_hook() -> deadpool_postgres::Hook {
                 "SELECT set_config('{}', current_setting('search_path'), false)",
                 BASE_SEARCH_PATH_GUC
             );
-            client.batch_execute(&sql).await.map_err(|e| {
-                deadpool_postgres::HookError::message(format!(
-                    "Failed to snapshot base search_path: {}",
+            // A snapshot failure is non-fatal: returning Err here would make
+            // deadpool reject the connection entirely (PoolError::PostCreateHook),
+            // which would exhaust the pool on a persistent failure (e.g. a
+            // managed Postgres restricting custom GUCs). Instead, log to stderr
+            // (never stdout — that corrupts the JSON-RPC stream) and let the
+            // connection enter the pool with the GUC unset. apply_search_path
+            // then falls back to the live current_setting('search_path'), so
+            // the connection works, just without accumulation protection.
+            if let Err(e) = client.batch_execute(&sql).await {
+                eprintln!(
+                    "warning: failed to snapshot base search_path, falling back to live \
+                     current_setting per-query: {}",
                     format_pg_error(&e)
-                ))
-            })?;
+                );
+            }
             Ok(())
         })
     })
