@@ -2587,3 +2587,48 @@ fn get_materialized_view_definition_reports_an_error_for_a_missing_view() {
         error
     );
 }
+
+/// A regular view name passed to `get_materialized_view_definition` must
+/// return a "not found" error, not the regular view's DDL wrapped as
+/// `CREATE MATERIALIZED VIEW` (the `relkind = 'm'` filter prevents this).
+#[test]
+fn get_materialized_view_definition_rejects_a_regular_view() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Create a regular view with a known name.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE OR REPLACE VIEW public.live_db_regular_v AS SELECT 1 AS x",
+        }),
+    );
+
+    let response = plugin.call(
+        "get_materialized_view_definition",
+        json!({
+            "params": params,
+            "view_name": "live_db_regular_v",
+            "schema": "public",
+        }),
+    );
+    let error = response
+        .get("error")
+        .expect("a regular view should not be treated as a materialized view");
+    assert_eq!(
+        error.get("code").and_then(Value::as_i64),
+        Some(-32603),
+        "regular view should get -32603 'not found', got: {:?}",
+        error
+    );
+
+    // Clean up.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP VIEW IF EXISTS public.live_db_regular_v",
+        }),
+    );
+}

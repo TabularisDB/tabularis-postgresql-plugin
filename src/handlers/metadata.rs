@@ -802,10 +802,20 @@ pub async fn get_materialized_view_definition(id: Value, params: &Value) -> Valu
 
     let qualified = crate::utils::identifiers::qualified(schema, view_name);
 
+    // Filter by relkind = 'm' so a regular view or table with the same name
+    // doesn't silently return wrong DDL wrapped as CREATE MATERIALIZED VIEW
+    // (#32). The sibling get_materialized_view_columns applies the same
+    // relkind filter via its pg_class join. The builtin's mat-view handler
+    // lacks this filter (see tabularis#1060), so this is a divergence in the
+    // plugin's favor — a non-matview name gets a clean "not found" error
+    // instead of malformed DDL.
     match client::query_rows(
         &conn_params,
-        "SELECT pg_get_viewdef(($1::text)::regclass, true) as definition",
-        &[&qualified],
+        "SELECT pg_get_viewdef(c.oid, true) AS definition \
+         FROM pg_class c \
+         JOIN pg_namespace n ON c.relnamespace = n.oid \
+         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'm'",
+        &[&schema, &view_name],
     )
     .await
     {

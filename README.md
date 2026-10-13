@@ -175,7 +175,7 @@ instead of reconnecting.
 | `get_indexes` | Index metadata, including composite and unique indexes |
 | `get_foreign_keys` | Foreign key metadata, including cross-schema references |
 | `get_views` / `get_view_definition` / `create_view` / `alter_view` / `drop_view` | View lifecycle |
-| `get_materialized_views` / `refresh_materialized_view` | Materialized view lifecycle |
+| `get_materialized_views` / `get_materialized_view_definition` / `refresh_materialized_view` | Materialized view lifecycle |
 | `get_routines` / `get_routine_parameters` / `get_routine_definition` | Function/procedure metadata |
 | `get_triggers` / `get_trigger_definition` / `create_trigger` / `drop_trigger` | Trigger lifecycle |
 | `execute_query` / `execute_query_batch` / `explain_query` | Query execution, multi-statement batches, and query plans. Both query methods accept an optional `session_id` that keeps the connection while an explicit transaction is open |
