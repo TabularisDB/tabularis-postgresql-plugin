@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use crate::client;
 use crate::models::{inner_params, ConnectionParams};
-use crate::rpc::{error_response, not_implemented, ok_response};
+use crate::rpc::{error_response, ok_response};
 
 pub async fn get_databases(id: Value, params: &Value) -> Value {
     let mut conn_params = ConnectionParams::from_value(inner_params(params));
@@ -789,8 +789,37 @@ pub async fn get_materialized_view_columns(id: Value, params: &Value) -> Value {
     }
 }
 
-pub async fn get_materialized_view_definition(id: Value, _params: &Value) -> Value {
-    not_implemented(id, "get_materialized_view_definition")
+pub async fn get_materialized_view_definition(id: Value, params: &Value) -> Value {
+    let conn_params = ConnectionParams::from_value(inner_params(params));
+    let view_name = params
+        .get("view_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let schema = params
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public");
+
+    let qualified = crate::utils::identifiers::qualified(schema, view_name);
+
+    match client::query_rows(
+        &conn_params,
+        "SELECT pg_get_viewdef(($1::text)::regclass, true) as definition",
+        &[&qualified],
+    )
+    .await
+    {
+        Ok(rows) => {
+            if let Some(row) = rows.first() {
+                let definition: String = row.try_get("definition").unwrap_or_default();
+                let full = format!("CREATE MATERIALIZED VIEW {} AS\n{}", qualified, definition);
+                ok_response(id, json!(full))
+            } else {
+                error_response(id, -32603, "Materialized view not found")
+            }
+        }
+        Err(e) => error_response(id, -32603, &e),
+    }
 }
 
 pub async fn refresh_materialized_view(id: Value, params: &Value) -> Value {

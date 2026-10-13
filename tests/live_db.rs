@@ -2489,3 +2489,71 @@ fn selecting_a_schema_prepends_onto_search_path_not_overwrites() {
         }),
     );
 }
+
+/// `get_materialized_view_definition` was a `not_implemented` stub (#32),
+/// returning a `-32601` error while the host actively called it. Now returns
+/// the view's DDL via `pg_get_viewdef`, matching the regular
+/// `get_view_definition` handler. The builtin driver has a known bug
+/// (`$1::regclass` fails with "error serializing parameter 0" on PG 16);
+/// the plugin uses the working `($1::text)::regclass` pattern — the same one
+/// the builtin's own regular-view handler uses — so the plugin succeeds where
+/// the builtin fails. A tabularis companion PR should fix the builtin's mat
+/// view handler to match.
+#[test]
+fn get_materialized_view_definition_returns_ddl_not_not_implemented() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Self-contained: create a schema and materialized view, idempotent.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE SCHEMA IF NOT EXISTS live_db_matview_def_test",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP MATERIALIZED VIEW IF EXISTS live_db_matview_def_test.mv_sample",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE MATERIALIZED VIEW live_db_matview_def_test.mv_sample AS SELECT 1 AS id, 'hello' AS label",
+        }),
+    );
+
+    let result = plugin.call_ok(
+        "get_materialized_view_definition",
+        json!({
+            "params": params,
+            "view_name": "mv_sample",
+            "schema": "live_db_matview_def_test",
+        }),
+    );
+    let definition = result
+        .as_str()
+        .expect("materialized view definition is a string");
+    assert!(
+        definition
+            .starts_with("CREATE MATERIALIZED VIEW \"live_db_matview_def_test\".\"mv_sample\" AS"),
+        "definition should start with the CREATE MATERIALIZED VIEW prefix, got: {definition}"
+    );
+    assert!(
+        definition.contains("SELECT 1 AS id"),
+        "definition should contain the view's SELECT body, got: {definition}"
+    );
+
+    // Clean up.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP SCHEMA IF EXISTS live_db_matview_def_test CASCADE",
+        }),
+    );
+}
