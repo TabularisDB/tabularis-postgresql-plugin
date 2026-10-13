@@ -123,6 +123,8 @@ async fn fetch_table_columns(
             c.column_default::text,
             c.is_identity::text,
             c.character_maximum_length,
+            c.numeric_precision,
+            c.numeric_scale,
             d.description::text AS comment,
             (SELECT string_agg('''' || replace(e.enumlabel, '''', '''''') || '''', ',' ORDER BY e.enumsortorder)
              FROM pg_enum e
@@ -269,6 +271,11 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
         .try_get::<_, Option<i64>>("character_maximum_length")
         .ok()
         .flatten();
+    let numeric_precision: Option<i32> = r
+        .try_get::<_, Option<i32>>("numeric_precision")
+        .ok()
+        .flatten();
+    let numeric_scale: Option<i32> = r.try_get::<_, Option<i32>>("numeric_scale").ok().flatten();
     let is_pk: bool = r.try_get("is_pk").unwrap_or(false);
     let comment: Option<String> = r.try_get("comment").ok().flatten();
 
@@ -303,6 +310,16 @@ fn row_to_table_column(r: &tokio_postgres::Row) -> Value {
         col.as_object_mut()
             .unwrap()
             .insert("character_maximum_length".to_string(), json!(len));
+    }
+    if let Some(p) = numeric_precision {
+        col.as_object_mut()
+            .unwrap()
+            .insert("numeric_precision".to_string(), json!(p));
+    }
+    if let Some(s) = numeric_scale {
+        col.as_object_mut()
+            .unwrap()
+            .insert("numeric_scale".to_string(), json!(s));
     }
     if let Some(c) = comment {
         col.as_object_mut()
@@ -370,13 +387,14 @@ pub async fn get_foreign_keys(id: Value, params: &Value) -> Value {
                 WHEN 'c' THEN 'CASCADE'
                 WHEN 'n' THEN 'SET NULL'
                 WHEN 'd' THEN 'SET DEFAULT'
-            END::text AS delete_rule
+            END::text AS delete_rule,
+            cols.key_seq
         FROM pg_constraint con
         JOIN pg_class src_cl ON src_cl.oid = con.conrelid
         JOIN pg_namespace src_nsp ON src_nsp.oid = src_cl.relnamespace
         JOIN pg_class ref_cl ON ref_cl.oid = con.confrelid
         JOIN pg_namespace ref_nsp ON ref_nsp.oid = ref_cl.relnamespace
-        JOIN unnest(con.conkey, con.confkey) AS cols(src_attnum, ref_attnum) ON true
+        JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(src_attnum, ref_attnum, key_seq) ON true
         JOIN pg_attribute src_att
             ON src_att.attrelid = src_cl.oid
             AND src_att.attnum = cols.src_attnum
@@ -389,7 +407,7 @@ pub async fn get_foreign_keys(id: Value, params: &Value) -> Value {
           AND con.conparentid = 0
           AND src_nsp.nspname = $1
           AND src_cl.relname = $2
-        ORDER BY con.conname, cols.src_attnum
+        ORDER BY con.conname, cols.key_seq
     "#;
 
     match client::query_rows(&conn_params, query, &[&schema, &table]).await {
@@ -411,15 +429,33 @@ fn row_to_foreign_key(r: &tokio_postgres::Row) -> Value {
     let ref_column: String = r.try_get("foreign_column_name").unwrap_or_default();
     let on_update: Option<String> = r.try_get("update_rule").ok().flatten();
     let on_delete: Option<String> = r.try_get("delete_rule").ok().flatten();
+    // WITH ORDINALITY yields the position within conkey/confkey — the true
+    // composite-key column order, independent of raw attnum (#840/#142).
+    // The ordinal column is a Postgres bigint (i64); narrow to i32 for the
+    // wire field. A composite key's position is always small, so the cast is
+    // lossless.
+    let seq_in_fk: Option<i32> = r
+        .try_get::<_, Option<i64>>("key_seq")
+        .ok()
+        .flatten()
+        .and_then(|v| i32::try_from(v).ok());
 
-    json!({
+    let mut fk = json!({
         "name": name,
         "column_name": column_name,
         "ref_table": ref_table,
         "ref_column": ref_column,
         "on_delete": on_delete,
         "on_update": on_update,
-    })
+    });
+
+    if let Some(seq) = seq_in_fk {
+        fk.as_object_mut()
+            .unwrap()
+            .insert("seq_in_fk".to_string(), json!(seq));
+    }
+
+    fk
 }
 
 pub async fn get_indexes(id: Value, params: &Value) -> Value {
@@ -569,6 +605,8 @@ pub async fn get_view_columns(id: Value, params: &Value) -> Value {
             c.column_default::text,
             c.is_identity::text,
             c.character_maximum_length,
+            c.numeric_precision,
+            c.numeric_scale,
             (SELECT string_agg('''' || replace(e.enumlabel, '''', '''''') || '''', ',' ORDER BY e.enumsortorder)
              FROM pg_enum e
              JOIN pg_type t ON t.oid = e.enumtypid
@@ -1174,6 +1212,8 @@ async fn fetch_all_columns(
             c.column_default::text,
             c.is_identity::text,
             c.character_maximum_length,
+            c.numeric_precision,
+            c.numeric_scale,
             d.description::text AS comment,
             (SELECT string_agg('''' || replace(e.enumlabel, '''', '''''') || '''', ',' ORDER BY e.enumsortorder)
              FROM pg_enum e
@@ -1238,13 +1278,14 @@ async fn fetch_all_foreign_keys(
                 WHEN 'c' THEN 'CASCADE'
                 WHEN 'n' THEN 'SET NULL'
                 WHEN 'd' THEN 'SET DEFAULT'
-            END::text AS delete_rule
+            END::text AS delete_rule,
+            cols.key_seq
         FROM pg_constraint con
         JOIN pg_class src_cl ON src_cl.oid = con.conrelid
         JOIN pg_namespace src_nsp ON src_nsp.oid = src_cl.relnamespace
         JOIN pg_class ref_cl ON ref_cl.oid = con.confrelid
         JOIN pg_namespace ref_nsp ON ref_nsp.oid = ref_cl.relnamespace
-        JOIN unnest(con.conkey, con.confkey) AS cols(src_attnum, ref_attnum) ON true
+        JOIN unnest(con.conkey, con.confkey) WITH ORDINALITY AS cols(src_attnum, ref_attnum, key_seq) ON true
         JOIN pg_attribute src_att
             ON src_att.attrelid = src_cl.oid
             AND src_att.attnum = cols.src_attnum
@@ -1256,7 +1297,7 @@ async fn fetch_all_foreign_keys(
         WHERE con.contype = 'f'
           AND con.conparentid = 0
           AND src_nsp.nspname = $1
-        ORDER BY src_cl.relname, con.conname, cols.src_attnum
+        ORDER BY src_cl.relname, con.conname, cols.key_seq
     "#;
 
     let rows = client::query_rows(conn_params, query, &[&schema]).await?;
