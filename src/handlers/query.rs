@@ -10,6 +10,7 @@ use crate::extract::extract_value;
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{error_response, ok_response};
 use crate::session;
+use crate::utils::identifiers::quote_identifier;
 
 pub async fn execute_query(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
@@ -150,11 +151,7 @@ async fn run_batch_in_session(
     // Applying search_path to a reused connection would run inside the open
     // transaction and change what the rest of it sees.
     if let Some(s) = schema.filter(|_| !reused) {
-        let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
-        pg_client
-            .batch_execute(&set_path)
-            .await
-            .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))?;
+        apply_search_path(&pg_client, s).await?;
     }
 
     let mut results: Vec<Value> = Vec::new();
@@ -295,14 +292,82 @@ async fn exec_query(
 
     // Set search_path if schema is specified
     if let Some(s) = schema {
-        let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
-        pg_client
-            .batch_execute(&set_path)
-            .await
-            .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))?;
+        apply_search_path(&pg_client, s).await?;
     }
 
     exec_query_on_client(&pg_client, query, limit, page).await
+}
+
+/// Build a `SET search_path TO` statement that prepends `schema` onto the
+/// connection's existing `search_path` rather than replacing it (#51), so
+/// queries against objects in a different schema still resolve. `current`
+/// is the verbatim value of `current_setting('search_path')`, emitted
+/// unchanged — PostgreSQL accepts its own display form back as the right-hand
+/// side of `SET search_path TO`, including the `"$user"` placeholder (probed
+/// against a live database: `"$user"` set back verbatim still resolves to the
+/// user's schema; unquoting it is a syntax error).
+fn build_search_path_sql(schema: &str, current: &str) -> String {
+    if current.trim().is_empty() {
+        format!("SET search_path TO {}", quote_identifier(schema))
+    } else {
+        format!(
+            "SET search_path TO {}, {}",
+            quote_identifier(schema),
+            current
+        )
+    }
+}
+
+/// Read the connection's *base* `search_path` and prepend `schema` onto it
+/// (#51). The base is the value captured at connection creation by the
+/// `post_create` hook in `client.rs` (after any startup script) — stored in
+/// the custom GUC `app.tabularis_base_search_path`. Reading the base rather
+/// than the live `current_setting('search_path')` is what makes the prepend
+/// idempotent across recycled pooled connections (`RecyclingMethod::Fast`
+/// resets nothing): without it, a recycled connection would report an
+/// already-prepended path and each call would stack another schema, leaking
+/// a previous selection into object resolution.
+///
+/// If the snapshot GUC is unset (e.g. the connection predates the snapshot
+/// hook, or the hook failed at creation), fall back to the live
+/// `current_setting('search_path')` — degrading to the pre-fix behavior
+/// rather than erroring, so an older pool isn't broken by the new code.
+async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), String> {
+    // current_setting(name, true) returns NULL when the GUC is unset
+    // (missing_ok), so the snapshot's absence is a clean fallback, not an
+    // error.
+    let read = pg_client
+        .query_one(
+            "SELECT current_setting($1, true), current_setting('search_path')",
+            &[&client::BASE_SEARCH_PATH_GUC],
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to read search_path: {}",
+                client::format_pg_error(&e)
+            )
+        })?;
+    let snapshot: Option<String> = read.try_get(0).map_err(|e| {
+        format!(
+            "Failed to read search_path: {}",
+            client::format_pg_error(&e)
+        )
+    })?;
+    let live: String = read.try_get(1).map_err(|e| {
+        format!(
+            "Failed to read search_path: {}",
+            client::format_pg_error(&e)
+        )
+    })?;
+    // Prefer the stable base snapshot; fall back to the live value if it's
+    // unset so an older pool (no snapshot hook) keeps working.
+    let current = snapshot.unwrap_or(live);
+    let set_path = build_search_path_sql(schema, &current);
+    pg_client
+        .batch_execute(&set_path)
+        .await
+        .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))
 }
 
 /// Execute a query on an existing client (used by both single and batch execution).

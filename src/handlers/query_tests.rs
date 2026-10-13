@@ -11,7 +11,7 @@
 //! pagination is applied to a statement.
 
 use super::{
-    raw_explain_output, returns_result_set, strip_leading_sql_comments,
+    build_search_path_sql, raw_explain_output, returns_result_set, strip_leading_sql_comments,
     supports_trailing_limit_clause, transaction_effect, TransactionEffect,
 };
 
@@ -357,5 +357,53 @@ fn transaction_effect_does_not_match_plpgsql_block_bodies() {
     assert_eq!(
         transaction_effect("DO $$ BEGIN RAISE NOTICE 'hi'; END $$"),
         TransactionEffect::None
+    );
+}
+
+#[test]
+fn build_search_path_sql_prepends_onto_existing_path() {
+    // The selected schema resolves first; the connection's real path is kept
+    // as fallback so queries against other schemas still resolve (#51).
+    assert_eq!(
+        build_search_path_sql("analyst", "\"$user\", public"),
+        "SET search_path TO \"analyst\", \"$user\", public"
+    );
+}
+
+#[test]
+fn build_search_path_sql_emits_only_schema_when_current_is_empty() {
+    assert_eq!(
+        build_search_path_sql("analyst", ""),
+        "SET search_path TO \"analyst\""
+    );
+}
+
+#[test]
+fn build_search_path_sql_emits_only_schema_when_current_is_whitespace() {
+    assert_eq!(
+        build_search_path_sql("analyst", "   "),
+        "SET search_path TO \"analyst\""
+    );
+}
+
+#[test]
+fn build_search_path_sql_preserves_user_placeholder_verbatim() {
+    // `current_setting('search_path')` returns `"$user"` double-quoted, and
+    // PostgreSQL accepts that form back as the placeholder (probed against a
+    // live database). The helper must not unquote it — unquoted `$user` is a
+    // syntax error in `SET search_path TO`.
+    assert_eq!(
+        build_search_path_sql("analyst", "\"$user\", public"),
+        "SET search_path TO \"analyst\", \"$user\", public"
+    );
+}
+
+#[test]
+fn build_search_path_sql_quotes_schema_with_special_characters() {
+    // A schema name needing quoting is escaped via `quote_identifier`, not
+    // emitted raw.
+    assert_eq!(
+        build_search_path_sql("a\"b", "public"),
+        "SET search_path TO \"a\"\"b\", public"
     );
 }
