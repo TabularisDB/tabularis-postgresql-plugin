@@ -533,6 +533,11 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
         if let Some(script) = script {
             builder = builder.post_create(startup_script_hook(script));
         }
+        // Snapshot the base search_path AFTER any startup script so the
+        // prepend in `apply_search_path` has a stable base to build on (#51).
+        // Always installed — even with no startup script the role/database
+        // default must be captured, not the live (possibly modified) value.
+        builder = builder.post_create(base_search_path_hook());
         builder
             .build()
             .map_err(|e| format!("Pool creation failed (TLS): {e}"))
@@ -548,6 +553,9 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
         if let Some(script) = script {
             builder = builder.post_create(startup_script_hook(script));
         }
+        // See the TLS branch: snapshot the base search_path after any startup
+        // script so `apply_search_path` prepends onto a stable base (#51).
+        builder = builder.post_create(base_search_path_hook());
         builder
             .build()
             .map_err(|e| format!("Pool creation failed: {e}"))
@@ -586,7 +594,48 @@ fn startup_script_hook(script: &str) -> deadpool_postgres::Hook {
     })
 }
 
-/// Validate the startup script on a throwaway connection so a broken script
+/// Name of the custom GUC that stores each connection's *base* `search_path`
+/// — the value as configured at session start (default, `ALTER ROLE`/`ALTER
+/// DATABASE`, or the `startup_script`). Captured once per connection by
+/// [`base_search_path_hook`] so [`apply_search_path`](crate::handlers::query)
+/// can prepend the selected schema onto a stable base instead of the live
+/// (possibly already-modified) `current_setting('search_path')`, which would
+/// accumulate across recycled pooled connections (#51).
+///
+/// The `app.*` namespace is free-form in PostgreSQL 9.2+ — no registration
+/// needed. The value is a verbatim `current_setting('search_path')` string,
+/// which is itself valid as the right-hand side of `SET search_path TO`.
+pub(crate) const BASE_SEARCH_PATH_GUC: &str = "app.tabularis_base_search_path";
+
+/// Build the `post_create` hook that snapshots the connection's base
+/// `search_path` into [`BASE_SEARCH_PATH_GUC`]. Runs after any
+/// [`startup_script_hook`] (deadpool executes `post_create` hooks in
+/// insertion order), so the snapshot captures whatever the startup script
+/// left behind — the connection's configured environment. With no startup
+/// script, the snapshot captures the role/database default.
+///
+/// A failure to snapshot is non-fatal: the hook logs and continues, and
+/// [`apply_search_path`](crate::handlers::query) falls back to the live
+/// `current_setting('search_path')` when the GUC is unset.
+fn base_search_path_hook() -> deadpool_postgres::Hook {
+    deadpool_postgres::Hook::async_fn(move |client, _metrics| {
+        Box::pin(async move {
+            // set_config(name, value, is_local=false) persists for the session.
+            let sql = format!(
+                "SELECT set_config('{}', current_setting('search_path'), false)",
+                BASE_SEARCH_PATH_GUC
+            );
+            client.batch_execute(&sql).await.map_err(|e| {
+                deadpool_postgres::HookError::message(format!(
+                    "Failed to snapshot base search_path: {}",
+                    format_pg_error(&e)
+                ))
+            })?;
+            Ok(())
+        })
+    })
+}
+
 /// fails fast with a clearly attributed error, **without** applying its side
 /// effects (the script runs inside a transaction that is rolled back). This
 /// preflight exists only for early, well-labelled failures — the per-pool

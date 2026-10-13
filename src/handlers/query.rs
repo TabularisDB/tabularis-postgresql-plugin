@@ -318,13 +318,29 @@ fn build_search_path_sql(schema: &str, current: &str) -> String {
     }
 }
 
-/// Read the connection's current `search_path` and prepend `schema` onto it
-/// (#51). Reads on the same `pg_client` that the subsequent query runs on, so
-/// the value reflects this connection's session state — a fresh pooled
-/// connection would report a different path.
+/// Read the connection's *base* `search_path` and prepend `schema` onto it
+/// (#51). The base is the value captured at connection creation by the
+/// `post_create` hook in `client.rs` (after any startup script) — stored in
+/// the custom GUC `app.tabularis_base_search_path`. Reading the base rather
+/// than the live `current_setting('search_path')` is what makes the prepend
+/// idempotent across recycled pooled connections (`RecyclingMethod::Fast`
+/// resets nothing): without it, a recycled connection would report an
+/// already-prepended path and each call would stack another schema, leaking
+/// a previous selection into object resolution.
+///
+/// If the snapshot GUC is unset (e.g. the connection predates the snapshot
+/// hook, or the hook failed at creation), fall back to the live
+/// `current_setting('search_path')` — degrading to the pre-fix behavior
+/// rather than erroring, so an older pool isn't broken by the new code.
 async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), String> {
+    // current_setting(name, true) returns NULL when the GUC is unset
+    // (missing_ok), so the snapshot's absence is a clean fallback, not an
+    // error.
     let read = pg_client
-        .query_one("SELECT current_setting('search_path')", &[])
+        .query_one(
+            "SELECT current_setting($1, true), current_setting('search_path')",
+            &[&client::BASE_SEARCH_PATH_GUC],
+        )
         .await
         .map_err(|e| {
             format!(
@@ -332,12 +348,21 @@ async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), Str
                 client::format_pg_error(&e)
             )
         })?;
-    let current: String = read.try_get(0).map_err(|e| {
+    let snapshot: Option<String> = read.try_get(0).map_err(|e| {
         format!(
             "Failed to read search_path: {}",
             client::format_pg_error(&e)
         )
     })?;
+    let live: String = read.try_get(1).map_err(|e| {
+        format!(
+            "Failed to read search_path: {}",
+            client::format_pg_error(&e)
+        )
+    })?;
+    // Prefer the stable base snapshot; fall back to the live value if it's
+    // unset so an older pool (no snapshot hook) keeps working.
+    let current = snapshot.unwrap_or(live);
     let set_path = build_search_path_sql(schema, &current);
     pg_client
         .batch_execute(&set_path)
