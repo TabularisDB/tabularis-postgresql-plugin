@@ -10,6 +10,7 @@ use crate::extract::extract_value;
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{error_response, ok_response};
 use crate::session;
+use crate::utils::identifiers::quote_identifier;
 
 pub async fn execute_query(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
@@ -150,11 +151,7 @@ async fn run_batch_in_session(
     // Applying search_path to a reused connection would run inside the open
     // transaction and change what the rest of it sees.
     if let Some(s) = schema.filter(|_| !reused) {
-        let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
-        pg_client
-            .batch_execute(&set_path)
-            .await
-            .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))?;
+        apply_search_path(&pg_client, s).await?;
     }
 
     let mut results: Vec<Value> = Vec::new();
@@ -295,14 +292,57 @@ async fn exec_query(
 
     // Set search_path if schema is specified
     if let Some(s) = schema {
-        let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
-        pg_client
-            .batch_execute(&set_path)
-            .await
-            .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))?;
+        apply_search_path(&pg_client, s).await?;
     }
 
     exec_query_on_client(&pg_client, query, limit, page).await
+}
+
+/// Build a `SET search_path TO` statement that prepends `schema` onto the
+/// connection's existing `search_path` rather than replacing it (#51), so
+/// queries against objects in a different schema still resolve. `current`
+/// is the verbatim value of `current_setting('search_path')`, emitted
+/// unchanged — PostgreSQL accepts its own display form back as the right-hand
+/// side of `SET search_path TO`, including the `"$user"` placeholder (probed
+/// against a live database: `"$user"` set back verbatim still resolves to the
+/// user's schema; unquoting it is a syntax error).
+fn build_search_path_sql(schema: &str, current: &str) -> String {
+    if current.trim().is_empty() {
+        format!("SET search_path TO {}", quote_identifier(schema))
+    } else {
+        format!(
+            "SET search_path TO {}, {}",
+            quote_identifier(schema),
+            current
+        )
+    }
+}
+
+/// Read the connection's current `search_path` and prepend `schema` onto it
+/// (#51). Reads on the same `pg_client` that the subsequent query runs on, so
+/// the value reflects this connection's session state — a fresh pooled
+/// connection would report a different path.
+async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), String> {
+    let read = pg_client
+        .query_one("SELECT current_setting('search_path')", &[])
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to read search_path: {}",
+                client::format_pg_error(&e)
+            )
+        })?;
+    let current: String = read.try_get(0).map_err(|e| {
+        format!(
+            "Failed to read search_path: {}",
+            client::format_pg_error(&e)
+        )
+    })?;
+    let set_path = build_search_path_sql(schema, &current);
+    pg_client
+        .batch_execute(&set_path)
+        .await
+        .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))
 }
 
 /// Execute a query on an existing client (used by both single and batch execution).

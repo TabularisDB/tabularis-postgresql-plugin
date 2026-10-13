@@ -2323,3 +2323,137 @@ async fn psql_scalar(params: &Value, sql: &str) -> String {
         .expect("failed to run psql");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
+
+/// Selecting a schema in the UI must prepend it onto the connection's real
+/// `search_path` rather than overwriting it (#51), so an unqualified query
+/// against an object in a *different* schema still resolves. The old
+/// `SET search_path TO "<schema>"` behavior dropped the rest of the path and
+/// broke those queries.
+#[test]
+fn selecting_a_schema_prepends_onto_search_path_not_overwrites() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    // Two schemas, each with its own table. Idempotent so a failed run does
+    // not break the next one (matches the float4 live-test convention).
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE SCHEMA IF NOT EXISTS live_db_path_a",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE SCHEMA IF NOT EXISTS live_db_path_b",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_db_path_b.b_table (id int)",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "INSERT INTO live_db_path_b.b_table VALUES (1) ON CONFLICT DO NOTHING",
+        }),
+    );
+
+    // Establish that the connection's real search_path includes schema b
+    // (simulating a user's configured environment), then select schema a via
+    // the `schema` param — the path the grid sends. The prepend means b stays
+    // available as a fallback; the old overwrite would drop it.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SET search_path TO live_db_path_b",
+        }),
+    );
+
+    // Now select schema a. With the fix, the plugin prepends a onto the
+    // existing path (live_db_path_b), so the unqualified b_table reference in
+    // the SAME batch still resolves. (Batch path: a one-statement batch with
+    // a session_id routes through run_batch_in_session; the no-session
+    // execute_query path also applies search_path. Use execute_query_batch so
+    // the selected-schema SET and the probe query share one connection.)
+    let result = plugin.call_ok(
+        "execute_query_batch",
+        json!({
+            "params": params,
+            "queries": [
+                "SELECT id FROM b_table",
+                "SELECT current_setting('search_path') AS current_path",
+            ],
+            "schema": "live_db_path_a",
+        }),
+    );
+    let results = result
+        .as_array()
+        .expect("execute_query_batch returns an array of per-statement results");
+
+    // First statement: unqualified b_table must resolve via the preserved
+    // fallback schema. The old overwrite behavior made this error with
+    // "relation \"b_table\" does not exist".
+    let probe = &results[0];
+    assert!(
+        probe.get("error").map(Value::is_null).unwrap_or(false),
+        "unqualified b_table should resolve through the preserved search_path, \
+        got error: {:?}",
+        probe.get("error")
+    );
+    let probe_rows = probe
+        .pointer("/result/rows")
+        .and_then(Value::as_array)
+        .expect("probe rows");
+    assert_eq!(probe_rows.len(), 1, "b_table has one row");
+    assert_eq!(probe_rows[0][0], json!(1));
+
+    // Second statement: the selected schema is prepended onto the original
+    // path, not replacing it. The connection's real path (live_db_path_b) is
+    // still present.
+    let path_result = &results[1];
+    assert!(
+        path_result
+            .get("error")
+            .map(Value::is_null)
+            .unwrap_or(false),
+        "current_setting('search_path') should succeed, got: {:?}",
+        path_result.get("error")
+    );
+    let path_rows = path_result
+        .pointer("/result/rows")
+        .and_then(Value::as_array)
+        .expect("path rows");
+    let current_path = path_rows[0][0].as_str().expect("search_path is a string");
+    assert!(
+        current_path.starts_with("live_db_path_a"),
+        "selected schema should be prepended first, got: {current_path}"
+    );
+    assert!(
+        current_path.contains("live_db_path_b"),
+        "connection's real search_path should be preserved as fallback, got: {current_path}"
+    );
+
+    // Clean up the schemas so repeated runs stay tidy.
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP SCHEMA IF EXISTS live_db_path_a CASCADE",
+        }),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "DROP SCHEMA IF EXISTS live_db_path_b CASCADE",
+        }),
+    );
+}
