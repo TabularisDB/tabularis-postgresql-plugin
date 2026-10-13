@@ -2497,8 +2497,10 @@ fn selecting_a_schema_prepends_onto_search_path_not_overwrites() {
 /// (`$1::regclass` fails with "error serializing parameter 0" on PG 16);
 /// the plugin uses the working `($1::text)::regclass` pattern — the same one
 /// the builtin's own regular-view handler uses — so the plugin succeeds where
-/// the builtin fails. A tabularis companion PR should fix the builtin's mat
-/// view handler to match.
+/// the builtin fails. A tabularis companion issue
+/// (https://github.com/TabularisDB/tabularis/issues/1060) tracks fixing the
+/// builtin's `$1::regclass` → `($1::text)::regclass` and flipping the
+/// `#[ignore]` parity test to expect success.
 #[test]
 fn get_materialized_view_definition_returns_ddl_not_not_implemented() {
     let mut plugin = Plugin::spawn();
@@ -2555,5 +2557,33 @@ fn get_materialized_view_definition_returns_ddl_not_not_implemented() {
             "params": params,
             "query": "DROP SCHEMA IF EXISTS live_db_matview_def_test CASCADE",
         }),
+    );
+}
+
+/// A nonexistent materialized view surfaces a clean error, not a silent
+/// success or a crash — the `($1::text)::regclass` cast raises a PostgreSQL
+/// error that maps to a -32603 response. Mirrors the existing
+/// `get_table_ddl_reports_an_error_for_a_missing_table` pattern.
+#[test]
+fn get_materialized_view_definition_reports_an_error_for_a_missing_view() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    let response = plugin.call(
+        "get_materialized_view_definition",
+        json!({
+            "params": params,
+            "view_name": "this_view_does_not_exist",
+            "schema": "public",
+        }),
+    );
+    let error = response
+        .get("error")
+        .expect("missing mat view should return an error, not a result");
+    assert_eq!(
+        error.get("code").and_then(Value::as_i64),
+        Some(-32603),
+        "error code should be -32603, got: {:?}",
+        error
     );
 }
