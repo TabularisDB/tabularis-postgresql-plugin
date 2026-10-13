@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.8] - 2026-10-13
+
+### Fixed
+
+- `real`/`float4` values no longer show float noise in the grid (`89.9`
+  instead of `89.9000015258789`). The shortest f32 decimal is used for
+  display, with the two f32 midpoint values (`±7.038531e-26`) using the
+  exact widened value so the JSON number round-trips to the stored f32.
+  CRUD, BLOB, and foreign-key row matching cast the WHERE value to `real`
+  when the column type is REAL/FLOAT4, so the shorter value still finds the
+  row after the grid sends it back (#144).
+
+- Selecting a schema prepends it onto the connection's base `search_path`
+  instead of overwriting it, so queries against objects in a different
+  schema still resolve. The base is captured once per connection at pool
+  creation (after any startup script) into a custom GUC, making the
+  prepend idempotent across recycled pooled connections — without it, a
+  recycled connection would stack prior selections and leak a previous
+  schema into object resolution (#51, #145).
+
+- `numeric`/`decimal` columns generate with their precision and scale
+  (`numeric(10,2)` instead of bare `numeric`) in CREATE TABLE DDL, and
+  composite foreign keys preserve their column order via `WITH ORDINALITY`
+  (#143).
+
+### Added
+
+- `get_materialized_view_definition` RPC method — the last
+  `not_implemented` stub — now returns a materialized view's DDL. Filters
+  by `relkind = 'm'` so a regular view or table name returns a clean
+  "not found" error instead of wrong DDL (#32, #146).
+
 ## [1.0.0-rc.7] - 2026-10-08
 
 ### Fixed
