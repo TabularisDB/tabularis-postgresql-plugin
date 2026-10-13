@@ -143,7 +143,10 @@ async fn exec_update(
 
     let column_types = client::get_column_types_map(conn_params, table, schema)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|error| {
+            log::warn!("Failed to load PostgreSQL column types for {schema}.{table}: {error}; row matching may fail");
+            Default::default()
+        });
     let enum_types = client::get_enum_column_types(conn_params, schema, table)
         .await
         .unwrap_or_default();
@@ -223,7 +226,10 @@ async fn exec_delete(
 
     let column_types = client::get_column_types_map(conn_params, table, schema)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|error| {
+            log::warn!("Failed to load PostgreSQL column types for {schema}.{table}: {error}; row matching may fail");
+            Default::default()
+        });
 
     let (predicate, owned_params) = build_pk_map_predicate(pk_map, &column_types, 1)?;
 
