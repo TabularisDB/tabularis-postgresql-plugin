@@ -147,6 +147,153 @@ fn execute_query_returns_rows_from_live_database() {
     assert_eq!(rows[0][0], json!(1));
 }
 
+#[test]
+fn float4_values_use_short_decimals_in_scalars_arrays_and_composites() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "CREATE TABLE IF NOT EXISTS live_float4_values (price real, prices real[])",
+        }),
+    );
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({
+            "params": params,
+            "query": "SELECT 89.9::real, 59.99::real, 29.5::real, -89.9::real, \
+                       1.2345678::real, NULL::real, 'NaN'::real, 'Infinity'::real, \
+                       ARRAY[89.9::real, NULL, 59.99::real], \
+                       ROW(89.9::real, ARRAY[59.99::real, NULL])::live_float4_values, \
+                       89.9000015258789::double precision",
+        }),
+    );
+    assert_eq!(
+        result["rows"],
+        json!([[89.9, 59.99, 29.5, -89.9, 1.2345678, null, null, null,
+            [89.9, null, 59.99], {"price": 89.9, "prices": [59.99, null]},
+            89.9000015258789]]),
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "DROP TABLE live_float4_values"}),
+    );
+}
+
+#[test]
+fn real_row_identity_allows_update_and_delete_with_short_decimals() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    for primary_key in ["", ", PRIMARY KEY (price)", ", PRIMARY KEY (price, id)"] {
+        plugin.call_ok(
+            "execute_query",
+            json!({"params": params, "query": "DROP TABLE IF EXISTS live_float4_identity"}),
+        );
+        plugin.call_ok(
+            "execute_query",
+            json!({
+                "params": params,
+                "query": format!("CREATE TABLE live_float4_identity \
+                    (price real, id integer, label text{primary_key})"),
+            }),
+        );
+        for value in [
+            89.9f32,
+            f32::from_bits(0x15ae43fd),
+            -f32::from_bits(0x15ae43fd),
+        ] {
+            plugin.call_ok(
+                "insert_record",
+                json!({
+                    "params": params, "table": "live_float4_identity", "schema": "public",
+                    "data": {"price": value, "id": 1, "label": "before"},
+                }),
+            );
+            let row = plugin.call_ok(
+                "execute_query",
+                json!({"params": params, "query": "SELECT price FROM live_float4_identity"}),
+            );
+            let price = &row["rows"][0][0];
+            assert_eq!((price.as_f64().unwrap() as f32).to_bits(), value.to_bits());
+            let mut pk_map = match primary_key {
+                "" => json!({"price": price, "id": 1, "label": "before"}),
+                ", PRIMARY KEY (price)" => json!({"price": price}),
+                _ => json!({"price": price, "id": 1}),
+            };
+            let updated = plugin.call_ok(
+                "update_record",
+                json!({
+                    "params": params, "table": "live_float4_identity", "schema": "public",
+                    "pk_map": pk_map, "col_name": "label", "new_val": "after",
+                }),
+            );
+            assert_eq!(
+                updated,
+                json!(1),
+                "REAL value must identify the row: {value}"
+            );
+            if primary_key.is_empty() {
+                pk_map["label"] = json!("after");
+            }
+            let deleted = plugin.call_ok(
+                "delete_record",
+                json!({
+                    "params": params, "table": "live_float4_identity", "schema": "public",
+                    "pk_map": pk_map,
+                }),
+            );
+            assert_eq!(deleted, json!(1));
+        }
+        plugin.call_ok(
+            "execute_query",
+            json!({"params": params, "query": "DROP TABLE live_float4_identity"}),
+        );
+    }
+}
+
+#[test]
+fn keyless_real_two_column_update_accepts_string_identity() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    for query in [
+        "DROP TABLE IF EXISTS live_float4_keyless_edit",
+        "CREATE TABLE live_float4_keyless_edit (price real, label text)",
+        "INSERT INTO live_float4_keyless_edit VALUES (89.9, 'a')",
+    ] {
+        plugin.call_ok("execute_query", json!({"params": params, "query": query}));
+    }
+    let mut identity = json!({"price": 89.9, "label": "a"});
+    let edited_price = json!("59.99");
+    let first = plugin.call_ok(
+        "update_record",
+        json!({
+            "params": params, "table": "live_float4_keyless_edit", "schema": "public",
+            "pk_map": identity, "col_name": "price", "new_val": edited_price,
+        }),
+    );
+    assert_eq!(first, json!(1), "price update");
+    // The next keyless step carries the editor's string without re-reading the row.
+    identity["price"] = edited_price;
+    let second = plugin.call_ok(
+        "update_record",
+        json!({
+            "params": params, "table": "live_float4_keyless_edit", "schema": "public",
+            "pk_map": identity, "col_name": "label", "new_val": "b",
+        }),
+    );
+    assert_eq!(second, json!(1), "label update with string REAL identity");
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "SELECT price, label FROM live_float4_keyless_edit"}),
+    );
+    assert_eq!(result["rows"], json!([[59.99, "b"]]));
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": "DROP TABLE live_float4_keyless_edit"}),
+    );
+}
+
 // Coverage for #66: `tokio_postgres::Error`'s own `Display` impl prints the
 // generic "db error" string for any server-side error (its `Kind::Db` arm),
 // throwing away the real message in the wrapped `DbError`. `exec_query_on_client`

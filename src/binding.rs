@@ -586,19 +586,31 @@ pub fn bind_pk_value(
     column_type: Option<&str>,
 ) -> Result<BoundValue, String> {
     let base_type = column_type.map(extract_base_type);
+    let is_real = matches!(base_type.as_deref(), Some("REAL" | "FLOAT4"));
+    // Numeric and numeric-string float4 values must compare at column precision.
+    let row_value = |bound: BoundValue| {
+        if is_real {
+            BoundValue {
+                sql: format!("CAST({} AS real)", bound.sql),
+                param: bound.param,
+            }
+        } else {
+            bound
+        }
+    };
 
     match value {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(BoundValue {
+                Ok(row_value(BoundValue {
                     sql: format!("CAST(${} AS bigint)", placeholder_idx),
                     param: Some((Box::new(i), Type::INT8)),
-                })
+                }))
             } else if let Some(f) = n.as_f64() {
-                Ok(BoundValue {
+                Ok(row_value(BoundValue {
                     sql: format!("CAST(${} AS double precision)", placeholder_idx),
                     param: Some((Box::new(f), Type::FLOAT8)),
-                })
+                }))
             } else {
                 Err("Unsupported numeric PK value".to_string())
             }
@@ -626,7 +638,7 @@ pub fn bind_pk_value(
                 if let Some(bound) = bind_pg_numeric_string(s, bt, placeholder_idx)
                     .or_else(|| bind_pg_temporal_string(s, bt, placeholder_idx))
                 {
-                    return bound;
+                    return bound.map(row_value);
                 }
             }
 
