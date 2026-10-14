@@ -6,11 +6,12 @@ use tokio::sync::Mutex;
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
     get_pool_client, load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode,
-    NoCertVerifier, VerifyCaCertVerifier, POOLS,
+    with_text_types, NoCertVerifier, VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use crate::settings;
 use deadpool_postgres::SslMode;
+use tokio_postgres::types::{ToSql, Type};
 
 // `POOLS` is a single process-wide static, and Rust's test harness runs
 // `#[tokio::test]` fns concurrently on separate threads — without this,
@@ -1175,6 +1176,37 @@ fn build_tls_connector_verify_ca_without_ssl_ca_returns_a_clear_error() {
     assert!(
         err.contains("verify-ca") && err.contains("ssl_ca"),
         "unexpected error message: {err}"
+    );
+}
+
+// `with_text_types` lifts the untyped `&[&(dyn ToSql + Sync)]` param slice
+// the catalog-query helpers (`query_rows`/`query_strings`) take into the
+// `(value, Type)` pairs the unnamed-statement protocol needs, binding each
+// param as `TEXT`. This is the bridge that lets those helpers switch from
+// the named `query` path (which mints `s{N}` and splits Parse/Bind across
+// two Syncs — the pooler-unsafe behavior behind tabularis#1097) to tokio's
+// inherent `query_typed` (unnamed `parse("")`, single Sync). Every caller
+// passes string params to catalog queries, so `TEXT` is always the right
+// wire type; a non-string value would fail `to_sql_checked`'s `accepts`
+// check at bind time with a `WrongType` error rather than mis-encoding.
+#[test]
+fn with_text_types_pairs_each_param_with_text_oid() {
+    let a: String = "public".to_string();
+    let b: String = "users".to_string();
+    let params: &[&(dyn ToSql + Sync)] = &[&a, &b];
+    let typed = with_text_types(params);
+    assert_eq!(typed.len(), 2, "one (value, Type) pair per input param");
+    assert_eq!(typed[0].1, Type::TEXT, "first param bound as TEXT");
+    assert_eq!(typed[1].1, Type::TEXT, "second param bound as TEXT");
+}
+
+#[test]
+fn with_text_types_empty_slice_yields_empty_vec() {
+    let params: &[&(dyn ToSql + Sync)] = &[];
+    let typed = with_text_types(params);
+    assert!(
+        typed.is_empty(),
+        "no params -> no typed pairs (unnamed parse with no bind OIDs)"
     );
 }
 

@@ -4,6 +4,24 @@
 //! cache keyed by connection identity, and query helpers for common patterns
 //! (single-column string queries, parameterized queries).
 //!
+//! # Unnamed statements / pooler safety
+//!
+//! Every query helper here uses the **unnamed-statement protocol** (tokio-postgres's
+//! inherent `query_typed`/`execute_typed`/`query_typed_one`, which send `Parse("")` +
+//! `Bind` + `Describe` + `Execute` in a *single* flushed message followed by one
+//! `Sync`). This is pooler-safe under transaction-mode connection poolers like
+//! PgBouncer (`pool_mode = transaction`) — the original named `query`/`query_one`/
+//! `execute` path mints a named statement `s{N}` and splits it across *two* Syncs
+//! (Parse+Describe, then later Bind+Execute), so a transaction-mode pooler can
+//! reassign the server connection between them and the Bind lands on a backend where
+//! the statement was never created: `ERROR: prepared statement "s42" does not exist`
+//! (tabularis#1097). The unnamed statement has no name to go missing and lives only
+//! for the single extended-query sequence, so no reassignment can orphan it. The
+//! tradeoff is a Parse per call (no client-side prepared-statement reuse), which is
+//! the correct tradeoff for a connection browser that almost never re-runs the same
+//! statement twice within a pooled session — and matches psql/psql-derived clients,
+//! which use the unnamed statement by default for exactly this reason.
+//!
 //! # Pool caching
 //!
 //! Every RPC call originally built a brand-new `Pool` (connect, run one
@@ -71,10 +89,15 @@ pub(crate) fn format_pool_error(e: &deadpool_postgres::PoolError) -> String {
 
 /// Build a connection pool from the given params and verify connectivity
 /// by acquiring one client and running `SELECT 1`.
+///
+/// Uses the unnamed-statement protocol (`query_typed_one`) rather than the
+/// named `query_one` so the `SELECT 1` is pooler-safe under transaction-mode
+/// poolers (PgBouncer) — see the module-level note on unnamed statements
+/// (tabularis#1097).
 pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
     let client = get_pool_client(params).await?;
     client
-        .query_one("SELECT 1", &[])
+        .query_typed_one("SELECT 1", &[])
         .await
         .map_err(|e| format_pg_error(&e))?;
     Ok(())
@@ -82,6 +105,13 @@ pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
 
 /// Run a query and extract a single text column from each row.
 /// Used for schema discovery methods that return `Vec<String>`.
+///
+/// Uses the unnamed-statement protocol (`query_typed`) rather than the named
+/// `query` so the statement is pooler-safe under transaction-mode poolers
+/// (PgBouncer) — see the module-level note (tabularis#1097). Parameters are
+/// bound as `TEXT` (every caller passes string params to these catalog
+/// queries); the server implicitly casts `TEXT` params to the actual column
+/// type at bind time, the same outcome the named path produces.
 pub async fn query_strings(
     params: &ConnectionParams,
     query: &str,
@@ -89,8 +119,9 @@ pub async fn query_strings(
     column: &str,
 ) -> Result<Vec<String>, String> {
     let client = get_pool_client(params).await?;
+    let typed_params = with_text_types(query_params);
     let rows = client
-        .query(query, query_params)
+        .query_typed(query, &typed_params)
         .await
         .map_err(|e| format_pg_error(&e))?;
 
@@ -102,56 +133,63 @@ pub async fn query_strings(
 }
 
 /// Run a query and return the raw rows for caller-side mapping.
+///
+/// Uses the unnamed-statement protocol (`query_typed`) rather than the named
+/// `query` so the statement is pooler-safe under transaction-mode poolers
+/// (PgBouncer) — see the module-level note (tabularis#1097). Same `TEXT`
+/// param binding rationale as `query_strings`.
 pub async fn query_rows(
     params: &ConnectionParams,
     query: &str,
     query_params: &[&(dyn ToSql + Sync)],
 ) -> Result<Vec<Row>, String> {
     let client = get_pool_client(params).await?;
+    let typed_params = with_text_types(query_params);
     client
-        .query(query, query_params)
+        .query_typed(query, &typed_params)
         .await
         .map_err(|e| format_pg_error(&e))
 }
 
-/// Execute a statement with explicit per-placeholder wire types, pinned via
-/// `prepare_typed`. Required for `CAST($N AS X)`-style placeholders where
-/// letting the server infer the type from query context would reject the
-/// bind before PostgreSQL's own parser sees the value. Returns affected rows.
+/// Execute a statement with explicit per-placeholder wire types. Required
+/// for `CAST($N AS X)`-style placeholders where letting the server infer the
+/// type from query context would reject the bind before PostgreSQL's own
+/// parser sees the value. Returns affected rows.
+///
+/// Uses tokio-postgres's inherent `Client::execute_typed` (the unnamed
+/// `parse("")` single-Sync protocol) rather than the named `prepare_typed` +
+/// `execute(&stmt)` pair, so the statement is pooler-safe under
+/// transaction-mode poolers (PgBouncer) — see the module-level note
+/// (tabularis#1097). The two are otherwise equivalent: both pin the wire
+/// types via an explicit parameter-OID list in the Parse message.
 pub async fn execute_typed(
     params: &ConnectionParams,
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<u64, String> {
     let client = get_pool_client(params).await?;
-    let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
-    let stmt = client
-        .prepare_typed(query, &types)
-        .await
-        .map_err(|e| format_pg_error(&e))?;
-    let values: Vec<&(dyn ToSql + Sync)> = typed_params.iter().map(|(v, _)| *v).collect();
     client
-        .execute(&stmt, &values)
+        .execute_typed(query, typed_params)
         .await
         .map_err(|e| format_pg_error(&e))
 }
 
 /// Run a SELECT with explicit per-placeholder wire types (same rationale as
 /// `execute_typed`) and return the resulting rows.
+///
+/// Uses tokio-postgres's inherent `Client::query_typed` (the unnamed
+/// `parse("")` single-Sync protocol) rather than the named `prepare_typed` +
+/// `query(&stmt)` pair, so the statement is pooler-safe under
+/// transaction-mode poolers (PgBouncer) — see the module-level note
+/// (tabularis#1097).
 pub async fn query_typed(
     params: &ConnectionParams,
     query: &str,
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<Vec<Row>, String> {
     let client = get_pool_client(params).await?;
-    let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
-    let stmt = client
-        .prepare_typed(query, &types)
-        .await
-        .map_err(|e| format_pg_error(&e))?;
-    let values: Vec<&(dyn ToSql + Sync)> = typed_params.iter().map(|(v, _)| *v).collect();
     client
-        .query(&stmt, &values)
+        .query_typed(query, typed_params)
         .await
         .map_err(|e| format_pg_error(&e))
 }
@@ -248,6 +286,27 @@ fn quote_qualified_type(type_schema: &str, type_name: &str) -> String {
         type_schema.replace('"', "\"\""),
         type_name.replace('"', "\"\""),
     )
+}
+
+/// Lift untyped `&[&(dyn ToSql + Sync)]` params into the `(value, Type)`
+/// pairs the unnamed-statement protocol needs, binding each as `TEXT`.
+///
+/// Every caller of `query_rows`/`query_strings` passes string params to
+/// catalog queries (schema names, table names, routine names, …). Binding
+/// those as `TEXT` (OID 25) is safe: PostgreSQL implicitly casts a `TEXT`
+/// param to the actual column type at bind time — `$1` against a `name`
+/// column casts `text → name` — which is the same resolution the named
+/// `query` path arrived at by letting the server infer the type from the
+/// prepared statement's parameter description. Non-string params would need
+/// their own `Type` (callers with non-text params already use `execute_typed`
+/// /`query_typed` with explicit types), so this helper is string-only by
+/// design; a non-text value bound as `TEXT` would fail `to_sql_checked`'s
+/// `accepts` check at bind time with a clear `WrongType` error rather than
+/// silently mis-encoding.
+fn with_text_types<'a>(
+    params: &'a [&'a (dyn ToSql + Sync)],
+) -> Vec<(&'a (dyn ToSql + Sync), Type)> {
+    params.iter().map(|p| (*p, Type::TEXT)).collect()
 }
 
 /// Get the cached pool for these connection params, creating and caching one
