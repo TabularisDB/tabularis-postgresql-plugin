@@ -3,6 +3,7 @@
 use deadpool_postgres::Object as PgClient;
 use serde_json::{json, Value};
 use std::time::Instant;
+use tokio_postgres::types::Type;
 
 use crate::cancel;
 use crate::client;
@@ -337,9 +338,9 @@ async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), Str
     // (missing_ok), so the snapshot's absence is a clean fallback, not an
     // error.
     let read = pg_client
-        .query_one(
+        .query_typed_one(
             "SELECT current_setting($1, true), current_setting('search_path')",
-            &[&client::BASE_SEARCH_PATH_GUC],
+            &[(&client::BASE_SEARCH_PATH_GUC, Type::TEXT)],
         )
         .await
         .map_err(|e| {
@@ -379,10 +380,7 @@ async fn exec_query_on_client(
 ) -> Result<Value, String> {
     // Check if the statement returns a result set
     if !returns_result_set(query) {
-        let affected = pg_client
-            .execute(query, &[])
-            .await
-            .map_err(|e| client::format_pg_error(&e))?;
+        let affected = client::execute_unnamed(pg_client, query, []).await?;
         return Ok(json!({
             "columns": [],
             "rows": [],
@@ -412,12 +410,17 @@ async fn exec_query_on_client(
 
     // Execute query
     let rows = pg_client
-        .query(&final_query, &[])
+        .query_typed(&final_query, &[])
         .await
         .map_err(|e| client::format_pg_error(&e))?;
 
     if rows.is_empty() {
-        // Get columns from the statement if possible
+        // Get columns from the statement if possible. `query_typed` exposes
+        // column metadata only through returned rows, so this still prepares
+        // a named statement. Behind a transaction-mode pooler the prepare
+        // succeeds (it is a single round trip), but the statement may outlive
+        // the server connection it was created on — tolerable for a header
+        // lookup that already degrades to no columns on error.
         let columns: Vec<String> = if let Ok(stmt) = pg_client.prepare(&final_query).await {
             stmt.columns()
                 .iter()

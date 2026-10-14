@@ -18,6 +18,16 @@
 //! `build_connection_key` pattern in `src-tauri/src/pool_manager.rs`, minus
 //! the per-connection_id refinement that plugin doesn't need yet) closes that
 //! gap.
+//!
+//! # Transaction-mode poolers
+//!
+//! `Client::query`/`execute` with a SQL string prepare a *named* statement in
+//! one round trip and execute it in the next. A pooler in transaction mode
+//! (PgBouncer `pool_mode = transaction`) may route those round trips to
+//! different server connections, failing with `prepared statement "sN" does
+//! not exist` (tabularis#1097). The helpers below therefore go through
+//! `Client::query_typed*`, which parses an *unnamed* statement and executes it
+//! within a single Sync, so it never outlives one server-side transaction.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -74,7 +84,7 @@ pub(crate) fn format_pool_error(e: &deadpool_postgres::PoolError) -> String {
 pub async fn test_connection(params: &ConnectionParams) -> Result<(), String> {
     let client = get_pool_client(params).await?;
     client
-        .query_one("SELECT 1", &[])
+        .query_typed_one("SELECT 1", &[])
         .await
         .map_err(|e| format_pg_error(&e))?;
     Ok(())
@@ -90,7 +100,7 @@ pub async fn query_strings(
 ) -> Result<Vec<String>, String> {
     let client = get_pool_client(params).await?;
     let rows = client
-        .query(query, query_params)
+        .query_typed(query, &as_text_params(query_params))
         .await
         .map_err(|e| format_pg_error(&e))?;
 
@@ -109,13 +119,26 @@ pub async fn query_rows(
 ) -> Result<Vec<Row>, String> {
     let client = get_pool_client(params).await?;
     client
-        .query(query, query_params)
+        .query_typed(query, &as_text_params(query_params))
         .await
         .map_err(|e| format_pg_error(&e))
 }
 
+/// Pin every placeholder of `query_strings`/`query_rows` to `text`.
+/// `query_typed` needs the wire types up front instead of asking the server
+/// to infer them (that inference is the named-statement round trip a
+/// transaction-mode pooler breaks). Every caller binds identifier strings
+/// (schema, table, routine names) compared against `name`/`text` catalog
+/// columns, which `text` covers via implicit casts. A non-string value fails
+/// with a `WrongType` error — use `query_typed`/`execute_typed` for those.
+fn as_text_params<'a>(
+    query_params: &[&'a (dyn ToSql + Sync)],
+) -> Vec<(&'a (dyn ToSql + Sync), Type)> {
+    query_params.iter().map(|v| (*v, Type::TEXT)).collect()
+}
+
 /// Execute a statement with explicit per-placeholder wire types, pinned via
-/// `prepare_typed`. Required for `CAST($N AS X)`-style placeholders where
+/// `query_typed_raw`. Required for `CAST($N AS X)`-style placeholders where
 /// letting the server infer the type from query context would reject the
 /// bind before PostgreSQL's own parser sees the value. Returns affected rows.
 pub async fn execute_typed(
@@ -124,16 +147,31 @@ pub async fn execute_typed(
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<u64, String> {
     let client = get_pool_client(params).await?;
-    let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
-    let stmt = client
-        .prepare_typed(query, &types)
+    execute_unnamed(&client, query, typed_params.iter().cloned()).await
+}
+
+/// Execute a statement as an unnamed one (see the module docs on
+/// transaction-mode poolers) and return the affected row count, which
+/// `RowStream` only reports once drained.
+pub(crate) async fn execute_unnamed<'a>(
+    client: &tokio_postgres::Client,
+    query: &str,
+    typed_params: impl IntoIterator<Item = (&'a (dyn ToSql + Sync), Type)>,
+) -> Result<u64, String> {
+    use futures_util::TryStreamExt;
+
+    let stream = client
+        .query_typed_raw(query, typed_params)
         .await
         .map_err(|e| format_pg_error(&e))?;
-    let values: Vec<&(dyn ToSql + Sync)> = typed_params.iter().map(|(v, _)| *v).collect();
-    client
-        .execute(&stmt, &values)
+    let mut stream = std::pin::pin!(stream);
+    while stream
+        .try_next()
         .await
-        .map_err(|e| format_pg_error(&e))
+        .map_err(|e| format_pg_error(&e))?
+        .is_some()
+    {}
+    Ok(stream.rows_affected().unwrap_or(0))
 }
 
 /// Run a SELECT with explicit per-placeholder wire types (same rationale as
@@ -144,14 +182,8 @@ pub async fn query_typed(
     typed_params: &[(&(dyn ToSql + Sync), Type)],
 ) -> Result<Vec<Row>, String> {
     let client = get_pool_client(params).await?;
-    let types: Vec<Type> = typed_params.iter().map(|(_, t)| t.clone()).collect();
-    let stmt = client
-        .prepare_typed(query, &types)
-        .await
-        .map_err(|e| format_pg_error(&e))?;
-    let values: Vec<&(dyn ToSql + Sync)> = typed_params.iter().map(|(v, _)| *v).collect();
     client
-        .query(&stmt, &values)
+        .query_typed(query, typed_params)
         .await
         .map_err(|e| format_pg_error(&e))
 }
