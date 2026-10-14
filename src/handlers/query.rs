@@ -433,13 +433,21 @@ async fn exec_query_on_client(
         .map_err(|e| client::format_pg_error(&e))?;
 
     if rows.is_empty() {
-        // Get columns from the statement if possible. `prepare` is a single
-        // `Parse + Describe + Sync` round-trip — pooler-safe under
-        // transaction-mode poolers (the functional result, the column
-        // metadata, comes back before the `ReadyForQuery` that lets the
-        // pooler reassign). The `Statement`'s `Drop` sends a fire-and-forget
-        // `Close` that may land on a different backend — harmless, the
-        // response is discarded (`let _ =` in `StatementInner::drop`).
+        // Get columns from the statement if possible. `prepare`'s own
+        // `Parse + Describe + Sync` round-trip is pooler-safe for built-in
+        // column types (the metadata returns before the `ReadyForQuery`
+        // that lets a transaction-mode pooler reassign), and the
+        // `Statement`'s `Drop` sends a fire-and-forget `Close` whose
+        // response is harmlessly discarded (`let _ =` in
+        // `StatementInner::drop`). But for user-defined types (custom
+        // enums/composites), `prepare` internally calls `get_type`, which
+        // triggers tokio-postgres's cached `typeinfo_statement` — a named
+        // statement prepared and executed across separate Syncs, the same
+        // pooler-unsafe pattern this PR eliminates elsewhere. That path is
+        // a tokio-postgres 0.7 limitation (see the module note in
+        // `client.rs`); this `prepare` is the only remaining named-
+        // statement call, used only here for column discovery on empty
+        // result sets.
         let columns: Vec<String> = if let Ok(stmt) = pg_client.prepare(&final_query).await {
             stmt.columns()
                 .iter()

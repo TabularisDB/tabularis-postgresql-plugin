@@ -1198,6 +1198,18 @@ fn with_text_types_pairs_each_param_with_text_oid() {
     assert_eq!(typed.len(), 2, "one (value, Type) pair per input param");
     assert_eq!(typed[0].1, Type::TEXT, "first param bound as TEXT");
     assert_eq!(typed[1].1, Type::TEXT, "second param bound as TEXT");
+    // Verify the value references are preserved in order — without this, a
+    // bug that duplicates params[0] for every entry (or swaps them) would
+    // pass the len/Type assertions above while silently mis-binding catalog
+    // queries ($1 and $2 would both get "public").
+    assert!(
+        std::ptr::eq(typed[0].0, params[0]),
+        "first value reference preserved"
+    );
+    assert!(
+        std::ptr::eq(typed[1].0, params[1]),
+        "second value reference preserved"
+    );
 }
 
 #[test]

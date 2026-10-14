@@ -300,9 +300,11 @@ fn quote_qualified_type(type_schema: &str, type_name: &str) -> String {
 /// prepared statement's parameter description. Non-string params would need
 /// their own `Type` (callers with non-text params already use `execute_typed`
 /// /`query_typed` with explicit types), so this helper is string-only by
-/// design; a non-text value bound as `TEXT` would fail `to_sql_checked`'s
-/// `accepts` check at bind time with a clear `WrongType` error rather than
-/// silently mis-encoding.
+/// design; a non-text value bound as `TEXT` fails `to_sql_checked`'s
+/// `accepts` check at bind time (rather than silently mis-encoding), though
+/// the surfaced error is the generic `"error serializing parameter N"` —
+/// `format_pg_error` falls to `e.to_string()` which doesn't walk the
+/// `source()` chain where `WrongType`'s type-mismatch detail lives.
 fn with_text_types<'a>(
     params: &'a [&'a (dyn ToSql + Sync)],
 ) -> Vec<(&'a (dyn ToSql + Sync), Type)> {
