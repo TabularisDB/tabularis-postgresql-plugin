@@ -36,6 +36,7 @@ fn params(host: &str, port: u16, db: &str, user: &str) -> ConnectionParams {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        pooler_mode: None,
     }
 }
 
@@ -804,6 +805,7 @@ fn params_with_ssl(ssl_mode: &str) -> ConnectionParams {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        pooler_mode: None,
     }
 }
 

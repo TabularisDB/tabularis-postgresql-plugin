@@ -48,6 +48,7 @@ fn live_params(password: &str) -> Option<ConnectionParams> {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        pooler_mode: None,
     })
 }
 

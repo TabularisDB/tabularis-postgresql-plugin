@@ -158,7 +158,14 @@ async fn run_batch_in_session(
     let mut results: Vec<Value> = Vec::new();
     for query in queries {
         let start = Instant::now();
-        let outcome = exec_query_on_client(&pg_client, query, limit, page).await;
+        let outcome = exec_query_on_client(
+            &pg_client,
+            query,
+            limit,
+            page,
+            conn_params.is_transaction_pooler(),
+        )
+        .await;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         in_transaction =
@@ -296,7 +303,14 @@ async fn exec_query(
         apply_search_path(&pg_client, s).await?;
     }
 
-    exec_query_on_client(&pg_client, query, limit, page).await
+    exec_query_on_client(
+        &pg_client,
+        query,
+        limit,
+        page,
+        conn_params.is_transaction_pooler(),
+    )
+    .await
 }
 
 /// Build a `SET search_path TO` statement that prepends `schema` onto the
@@ -386,6 +400,7 @@ async fn exec_query_on_client(
     query: &str,
     limit: Option<u32>,
     page: u32,
+    is_transaction_pooler: bool,
 ) -> Result<Value, String> {
     // Check if the statement returns a result set
     if !returns_result_set(query) {
@@ -427,10 +442,15 @@ async fn exec_query_on_client(
     // Unnamed-statement protocol (`query_typed`) — pooler-safe under
     // transaction-mode poolers (PgBouncer); see `client`'s module note
     // (tabularis#1097). No params for user-issued queries.
+    //
+    // On a transaction-mode pooler, a prepared-statement error (26000/42P05)
+    // from tokio-postgres's internal `typeinfo_statement` (fired by
+    // non-builtin column types) is rewritten with actionable guidance via
+    // `format_query_error` (#157).
     let rows = pg_client
         .query_typed(&final_query, &[])
         .await
-        .map_err(|e| client::format_pg_error(&e))?;
+        .map_err(|e| client::format_query_error(&e, is_transaction_pooler))?;
 
     if rows.is_empty() {
         // Get columns from the statement if possible. `prepare`'s own
@@ -445,14 +465,27 @@ async fn exec_query_on_client(
         // statement prepared and executed across separate Syncs, the same
         // pooler-unsafe pattern this PR eliminates elsewhere. That path is
         // a tokio-postgres 0.7 limitation (see the module note in
-        // `client.rs`); this `prepare` is the only remaining named-
-        // statement call, used only here for column discovery on empty
-        // result sets.
-        let columns: Vec<String> = if let Ok(stmt) = pg_client.prepare(&final_query).await {
-            stmt.columns()
-                .iter()
-                .map(|c| c.name().to_string())
-                .collect()
+        // `client.rs`).
+        //
+        // On a transaction-mode pooler connection, skip `prepare()`
+        // entirely and return `columns: []` — the host handles empty
+        // columns gracefully, and avoiding `prepare()` eliminates the
+        // plugin's own named-statement trigger (#157, tabularis#1097).
+        // The remaining trigger (tokio-postgres's internal
+        // `typeinfo_statement` during `Row` deserialization on the
+        // non-empty-rows path) is handled by the error-message rewrite
+        // below + `max_prepared_statements` on the pooler side. On direct
+        // connections, `prepare()` is still used (it's safe there and
+        // gives better column discovery for empty result sets).
+        let columns: Vec<String> = if !is_transaction_pooler {
+            if let Ok(stmt) = pg_client.prepare(&final_query).await {
+                stmt.columns()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect()
+            } else {
+                vec![]
+            }
         } else {
             vec![]
         };
