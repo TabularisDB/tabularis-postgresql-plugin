@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.9] - 2026-10-15
+
+### Fixed
+
+- Every query now uses the unnamed-statement protocol (`Parse("")` + `Bind` +
+  `Describe` + `Execute` in a single flushed message) instead of minting a
+  named prepared statement (`s{N}`) split across two `Sync`s. A
+  transaction-mode connection pooler such as PgBouncer (`pool_mode =
+  transaction`) can reassign the server connection between those two
+  `Sync`s, so the `Bind` could land on a backend where the statement was
+  never created — `ERROR: prepared statement "s42" does not exist`
+  (SQLSTATE 26000). The unnamed statement has no name to go missing and
+  lives only for the single extended-query sequence, so no reassignment can
+  orphan it. This matches `psql`, which uses the unnamed statement by
+  default for the same reason (#149, tabularis#1097).
+
+### Changed
+
+- Bumped `rustls` from 0.23.45 to 0.23.46 (#150).
+- Bumped `serde_json` from 1.0.151 to 1.0.154 (#152).
+- Bumped `uuid` from 1.27.0 to 1.28.0 (#153).
+
 ## [1.0.0-rc.8] - 2026-10-13
 
 ### Fixed
