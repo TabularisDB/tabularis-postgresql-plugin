@@ -50,9 +50,15 @@ const POOL_CLEANUP_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
 /// it cannot bound the pooler-accepts-but-never-responds case; only this
 /// shutdown deadline covers every hang mode (connect, handshake, query,
 /// pool wait) uniformly. Elapsing it `abort()`s the stuck worker, which
-/// drops its held `deadpool::Object` and closes the DB socket — releasing
-/// the connection server-side — instead of detaching the task and leaking
-/// it.
+/// cancels its future and drops whatever it holds across the await: a held
+/// `deadpool::Object` (the hung-query case, where `pool.get()` already
+/// returned a connection) OR the in-flight `pool.get()` / `connect()` future
+/// itself (the stuck-handshake and saturated-pool-wait cases, where the
+/// worker is blocked *inside* `pool.get()` and has not yet obtained an
+/// `Object`). In every case the underlying DB socket is released — either
+/// directly (dropping the half-open connect future closes the TCP socket)
+/// or when the process exits and the pool's connections are dropped —
+/// instead of detaching the task and leaking it indefinitely.
 ///
 /// 5s is long enough for a typical metadata/catalog query to finish without
 /// being aborted, and short enough that an orphaned plugin exits promptly
