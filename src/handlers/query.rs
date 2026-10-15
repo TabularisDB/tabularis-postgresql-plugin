@@ -474,7 +474,7 @@ async fn exec_query_on_client(
         // The remaining trigger (tokio-postgres's internal
         // `typeinfo_statement` during `Row` deserialization on the
         // non-empty-rows path) is handled by the error-message rewrite
-        // below + `max_prepared_statements` on the pooler side. On direct
+        // above + `max_prepared_statements` on the pooler side. On direct
         // connections, `prepare()` is still used (it's safe there and
         // gives better column discovery for empty result sets).
         let columns: Vec<String> = if !is_transaction_pooler {

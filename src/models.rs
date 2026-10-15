@@ -68,7 +68,9 @@ impl ConnectionParams {
     /// and surfaces actionable error messages for tokio-postgres's internal
     /// `typeinfo_statement` (#157, tabularis#1097).
     pub fn is_transaction_pooler(&self) -> bool {
-        self.pooler_mode.as_deref() == Some("transaction")
+        self.pooler_mode
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("transaction"))
     }
 }
 
@@ -102,3 +104,7 @@ pub struct RoutineCallArg {
     #[serde(default)]
     pub is_raw: bool,
 }
+
+#[cfg(test)]
+#[path = "models_tests.rs"]
+mod tests;

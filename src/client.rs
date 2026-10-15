@@ -101,11 +101,7 @@ pub(crate) fn format_query_error(e: &tokio_postgres::Error, is_transaction_poole
                      set `max_prepared_statements > 0` in pgbouncer.ini — this enables \
                      server-side prepared statement caching so named statements survive \
                      reassignment. See: https://www.pgbouncer.org/config.html#max_prepared_statements",
-                    if let Some(db) = e.as_db_error() {
-                        format!("{}: {}", db.severity(), db.message())
-                    } else {
-                        e.to_string()
-                    }
+                    format_pg_error(e)
                 );
             }
         }
