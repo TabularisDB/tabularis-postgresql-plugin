@@ -20,6 +20,16 @@ pub struct ConnectionParams {
     pub ssl_key: Option<String>,
     pub connection_string: Option<String>,
     pub startup_script: Option<String>,
+    /// Connection pooler mode, set by the host when the user declares the
+    /// connection goes through a transaction-mode pooler (e.g. PgBouncer
+    /// `pool_mode = transaction`). When `"transaction"`, the plugin avoids
+    /// its own named-statement `prepare()` calls (which split across two
+    /// Syncs and can be orphaned by pooler reassignment) and surfaces
+    /// actionable error messages for tokio-postgres's internal
+    /// `typeinfo_statement` (which requires `max_prepared_statements > 0`
+    /// on the pooler side for non-builtin column types — see #157,
+    /// tabularis#1097). `None` for direct connections — no behavior change.
+    pub pooler_mode: Option<String>,
 }
 
 impl ConnectionParams {
@@ -48,7 +58,19 @@ impl ConnectionParams {
             ssl_key: get_str("ssl_key"),
             connection_string: get_str("connection_string"),
             startup_script: get_str("startup_script"),
+            pooler_mode: get_str("pooler_mode"),
         }
+    }
+
+    /// True when the connection goes through a transaction-mode pooler
+    /// (e.g. PgBouncer `pool_mode = transaction`). Drives pooler-safe
+    /// behavior: the plugin avoids its own named-statement `prepare()` calls
+    /// and surfaces actionable error messages for tokio-postgres's internal
+    /// `typeinfo_statement` (#157, tabularis#1097).
+    pub fn is_transaction_pooler(&self) -> bool {
+        self.pooler_mode
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("transaction"))
     }
 }
 
@@ -82,3 +104,7 @@ pub struct RoutineCallArg {
     #[serde(default)]
     pub is_raw: bool,
 }
+
+#[cfg(test)]
+#[path = "models_tests.rs"]
+mod tests;

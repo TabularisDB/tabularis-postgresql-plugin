@@ -71,6 +71,44 @@ pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
     }
 }
 
+/// Format a `tokio_postgres::Error` from a query path, rewriting
+/// prepared-statement errors (SQLSTATE 26000 / 42P05) with actionable
+/// guidance when the connection is through a transaction-mode pooler.
+///
+/// Under PgBouncer `pool_mode = transaction`, tokio-postgres's internal
+/// `typeinfo_statement` (fired during `Row` deserialization for non-builtin
+/// column types — custom enums, composites, extension types) splits across
+/// two Syncs and can be orphaned by pooler reassignment, producing
+/// `ERROR: prepared statement "typeinfo_statement" does not exist`. The fix
+/// is pooler-side: `max_prepared_statements > 0` in pgbouncer.ini makes
+/// PgBouncer track prepared statements across reassignments. This rewrites
+/// the cryptic error into that guidance so the user knows what to configure
+/// (#157, tabularis#1097).
+///
+/// For non-pooler connections or non-prepared-statement errors, falls
+/// through to `format_pg_error` unchanged.
+pub(crate) fn format_query_error(e: &tokio_postgres::Error, is_transaction_pooler: bool) -> String {
+    if is_transaction_pooler {
+        if let Some(code) = e.code() {
+            if *code == tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME
+                || *code == tokio_postgres::error::SqlState::DUPLICATE_PSTATEMENT
+            {
+                return format!(
+                    "{}\n\n\
+                     This error occurs under transaction-mode poolers (e.g. PgBouncer) \
+                     when a named prepared statement is lost to connection reassignment. \
+                     For queries returning custom types (enums, composites, extension types), \
+                     set `max_prepared_statements > 0` in pgbouncer.ini — this enables \
+                     server-side prepared statement caching so named statements survive \
+                     reassignment. See: https://www.pgbouncer.org/config.html#max_prepared_statements",
+                    format_pg_error(e)
+                );
+            }
+        }
+    }
+    format_pg_error(e)
+}
+
 /// Format a `pool.get()` failure. The pool's own connection-establishment
 /// handshake (bad database name, bad password, ...) surfaces as a
 /// `tokio_postgres::Error` wrapped in `PoolError::Backend` — the exact same
