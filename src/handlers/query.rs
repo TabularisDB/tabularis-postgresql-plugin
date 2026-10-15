@@ -3,6 +3,7 @@
 use deadpool_postgres::Object as PgClient;
 use serde_json::{json, Value};
 use std::time::Instant;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::cancel;
 use crate::client;
@@ -336,10 +337,19 @@ async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), Str
     // current_setting(name, true) returns NULL when the GUC is unset
     // (missing_ok), so the snapshot's absence is a clean fallback, not an
     // error.
+    //
+    // Uses the unnamed-statement protocol (`query_typed_one`) rather than
+    // the named `query_one` so this is pooler-safe under transaction-mode
+    // poolers (PgBouncer) — see `client`'s module note (tabularis#1097). The
+    // GUC name is bound as `TEXT`; PostgreSQL's `current_setting(text, bool)`
+    // accepts it directly.
     let read = pg_client
-        .query_one(
+        .query_typed_one(
             "SELECT current_setting($1, true), current_setting('search_path')",
-            &[&client::BASE_SEARCH_PATH_GUC],
+            &[(
+                &client::BASE_SEARCH_PATH_GUC as &(dyn ToSql + Sync),
+                Type::TEXT,
+            )],
         )
         .await
         .map_err(|e| {
@@ -379,8 +389,11 @@ async fn exec_query_on_client(
 ) -> Result<Value, String> {
     // Check if the statement returns a result set
     if !returns_result_set(query) {
+        // Unnamed-statement protocol (`execute_typed`) — pooler-safe under
+        // transaction-mode poolers (PgBouncer); see `client`'s module note
+        // (tabularis#1097). No params for this branch.
         let affected = pg_client
-            .execute(query, &[])
+            .execute_typed(query, &[])
             .await
             .map_err(|e| client::format_pg_error(&e))?;
         return Ok(json!({
@@ -411,13 +424,30 @@ async fn exec_query_on_client(
     let manual_limit = if is_paginated { None } else { limit };
 
     // Execute query
+    // Unnamed-statement protocol (`query_typed`) — pooler-safe under
+    // transaction-mode poolers (PgBouncer); see `client`'s module note
+    // (tabularis#1097). No params for user-issued queries.
     let rows = pg_client
-        .query(&final_query, &[])
+        .query_typed(&final_query, &[])
         .await
         .map_err(|e| client::format_pg_error(&e))?;
 
     if rows.is_empty() {
-        // Get columns from the statement if possible
+        // Get columns from the statement if possible. `prepare`'s own
+        // `Parse + Describe + Sync` round-trip is pooler-safe for built-in
+        // column types (the metadata returns before the `ReadyForQuery`
+        // that lets a transaction-mode pooler reassign), and the
+        // `Statement`'s `Drop` sends a fire-and-forget `Close` whose
+        // response is harmlessly discarded (`let _ =` in
+        // `StatementInner::drop`). But for user-defined types (custom
+        // enums/composites), `prepare` internally calls `get_type`, which
+        // triggers tokio-postgres's cached `typeinfo_statement` — a named
+        // statement prepared and executed across separate Syncs, the same
+        // pooler-unsafe pattern this PR eliminates elsewhere. That path is
+        // a tokio-postgres 0.7 limitation (see the module note in
+        // `client.rs`); this `prepare` is the only remaining named-
+        // statement call, used only here for column discovery on empty
+        // result sets.
         let columns: Vec<String> = if let Ok(stmt) = pg_client.prepare(&final_query).await {
             stmt.columns()
                 .iter()
