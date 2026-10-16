@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.10] - 2026-10-16
+
+### Fixed
+
+- The plugin process no longer hangs forever when Tabularis quits while an
+  RPC is in flight. After stdin EOF (the orphan path — the host is gone),
+  in-flight RPCs now drain for at most 5s (`SHUTDOWN_GRACE`), then any
+  worker still blocked on an unbounded await is force-cancelled via
+  `handle.abort()`, which drops the held `deadpool::Object` and closes the
+  DB socket server-side. `tokio-postgres`'s `connect_timeout` bounds only
+  the socket-level connect, not the startup handshake, so it could not
+  bound the pooler-accepts-but-never-responds case — only this shutdown
+  deadline covers every hang mode (connect, handshake, query, pool wait)
+  uniformly (#156, #155).
+
+### Added
+
+- `pooler_mode` field in `ConnectionParams` for PgBouncer transaction-mode
+  pooler awareness. When the host declares `"transaction"` (companion:
+  tabularis#1126), the plugin skips its own `prepare()` call for
+  column discovery on empty result sets (eliminating the plugin's
+  named-statement trigger) and rewrites SQLSTATE 26000/42P05 errors
+  (from tokio-postgres's internal `typeinfo_statement` fired by non-builtin
+  column types — custom enums, composites, extension types) with actionable
+  guidance pointing to `max_prepared_statements > 0` in pgbouncer.ini.
+  Backward-compatible: `pooler_mode` defaults to `None` — no behavior
+  change until the host sends the field (#158, #157, tabularis#1097).
+
 ## [1.0.0-rc.9] - 2026-10-15
 
 ### Fixed
