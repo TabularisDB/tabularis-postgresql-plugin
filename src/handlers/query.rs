@@ -68,6 +68,50 @@ pub async fn execute_query(id: Value, params: &Value) -> Value {
     }
 }
 
+pub async fn execute_read_only_query(id: Value, params: &Value) -> Value {
+    let conn_params = ConnectionParams::from_value(inner_params(params));
+    let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    let page = params.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
+    let schema = params.get("schema").and_then(Value::as_str);
+
+    match exec_read_only_query(&conn_params, query, limit, page, schema, &id).await {
+        Ok(result) => ok_response(id, result),
+        Err(e) => error_response(id, -32603, &e),
+    }
+}
+
+async fn exec_read_only_query(
+    conn_params: &ConnectionParams,
+    query: &str,
+    limit: Option<u32>,
+    page: u32,
+    schema: Option<&str>,
+    request_id: &Value,
+) -> Result<Value, String> {
+    let pg_client = client::get_pool_client(conn_params).await?;
+    let _cancel_guard =
+        cancel::CancelGuard::register(request_id.as_u64(), &pg_client, conn_params.clone());
+
+    if let Some(s) = schema {
+        apply_search_path(&pg_client, s).await?;
+    }
+
+    pg_client
+        .batch_execute("BEGIN READ ONLY")
+        .await
+        .map_err(|e| client::format_pg_error(&e))?;
+    let outcome = exec_query_on_client(&pg_client, query, limit, page).await;
+    if let Err(e) = pg_client.batch_execute("ROLLBACK").await {
+        log::warn!("ROLLBACK after a read-only query failed: {e}");
+        drop(PgClient::take(pg_client));
+    }
+    outcome
+}
+
 pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
     let queries: Vec<String> = params

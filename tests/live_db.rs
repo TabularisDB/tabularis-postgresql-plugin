@@ -709,6 +709,52 @@ fn get_tables_and_get_columns_return_real_comments() {
 }
 
 #[test]
+fn execute_read_only_query_runs_in_a_read_only_transaction() {
+    let mut plugin = Plugin::spawn();
+    let result = plugin.call_ok(
+        "execute_read_only_query",
+        json!({ "params": conn_params(), "query": "SHOW transaction_read_only" }),
+    );
+    assert_eq!(result["rows"][0][0], json!("on"));
+}
+
+#[test]
+fn execute_read_only_query_rejects_writes_and_leaves_no_transaction_behind() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "CREATE TABLE IF NOT EXISTS read_only_probe (id int)" }),
+    );
+
+    let response = plugin.call(
+        "execute_read_only_query",
+        json!({ "params": params, "query": "INSERT INTO read_only_probe VALUES (1)" }),
+    );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("read-only transaction"),
+        "expected a read-only rejection, got: {response:?}"
+    );
+
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "SHOW transaction_read_only" }),
+    );
+    assert_eq!(result["rows"][0][0], json!("off"));
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "SELECT count(*) FROM read_only_probe" }),
+    );
+    assert_eq!(result["rows"][0][0], json!(0));
+
+    plugin.call_ok(
+        "execute_query",
+        json!({ "params": params, "query": "DROP TABLE read_only_probe" }),
+    );
+}
+
+#[test]
 fn show_command_with_a_limit_param_does_not_error() {
     let mut plugin = Plugin::spawn();
     let params = conn_params();
