@@ -73,7 +73,9 @@ pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
 
 /// Format a `tokio_postgres::Error` from a query path, rewriting
 /// prepared-statement errors (SQLSTATE 26000 / 42P05) with actionable
-/// guidance when the connection is through a transaction-mode pooler.
+/// pooler guidance. The rewrite is unconditional on these SQLSTATEs;
+/// `is_transaction_pooler` only selects the phrasing (definitive when the
+/// host declared a transaction pooler, conditional when it didn't).
 ///
 /// Under PgBouncer `pool_mode = transaction`, tokio-postgres's internal
 /// `typeinfo_statement` (fired during `Row` deserialization for non-builtin
@@ -92,19 +94,29 @@ pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
 /// transaction-mode pooler…") rather than suppressed. Suppressing it would
 /// hide the only actionable hint from users on older hosts that can't send
 /// `pooler_mode` yet (#160, #163).
+/// The lead sentence of the pooler guidance [`format_query_error`] prepends
+/// to a 26000/42P05 message. Extracted as a pure function so the conditional
+/// phrasing — definitive when the host declared a transaction pooler,
+/// conditional ("If this connection goes through…") when it didn't (#160,
+/// #163) — is unit-testable without a live `tokio_postgres::Error` (whose
+/// `DbError`/SQLSTATE can't be constructed without a real server response).
+pub(crate) fn pooler_error_lead(is_transaction_pooler: bool) -> &'static str {
+    if is_transaction_pooler {
+        "This error occurs under transaction-mode poolers (e.g. PgBouncer) \
+         when a named prepared statement is lost to connection reassignment."
+    } else {
+        "If this connection goes through a transaction-mode pooler \
+         (e.g. PgBouncer or Supabase/Supavisor), this error occurs when a \
+         named prepared statement is lost to connection reassignment."
+    }
+}
+
 pub(crate) fn format_query_error(e: &tokio_postgres::Error, is_transaction_pooler: bool) -> String {
     if let Some(code) = e.code() {
         if *code == tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME
             || *code == tokio_postgres::error::SqlState::DUPLICATE_PSTATEMENT
         {
-            let lead = if is_transaction_pooler {
-                "This error occurs under transaction-mode poolers (e.g. PgBouncer) \
-                 when a named prepared statement is lost to connection reassignment."
-            } else {
-                "If this connection goes through a transaction-mode pooler \
-                 (e.g. PgBouncer or Supabase/Supavisor), this error occurs when a \
-                 named prepared statement is lost to connection reassignment."
-            };
+            let lead = pooler_error_lead(is_transaction_pooler);
             return format!(
                 "{msg}\n\n\
                  {lead} For queries returning custom types (enums, composites, extension \

@@ -70,7 +70,7 @@ impl ConnectionParams {
     pub fn is_transaction_pooler(&self) -> bool {
         self.pooler_mode
             .as_deref()
-            .is_some_and(|m| m.eq_ignore_ascii_case("transaction"))
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("transaction"))
     }
 }
 

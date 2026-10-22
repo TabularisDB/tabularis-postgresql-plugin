@@ -58,6 +58,19 @@ fn is_transaction_pooler_case_insensitive() {
     assert!(params_with_pooler_mode(Some("Transaction")).is_transaction_pooler());
 }
 
+/// Trimmed: a `pooler_mode` with surrounding whitespace (e.g. a hand-edited
+/// `connections.json` with a trailing space) still routes to the pinned path
+/// — matching how `startup_script` is trimmed in `build_pool`. Without the
+/// trim, "transaction " would silently bypass the fix and the user would hit
+/// the #160/#163 hang on the shared cached client (the very thing this PR
+/// fixes), with no diagnostic pointing at the whitespace.
+#[test]
+fn is_transaction_pooler_trims_surrounding_whitespace() {
+    assert!(params_with_pooler_mode(Some("transaction ")).is_transaction_pooler());
+    assert!(params_with_pooler_mode(Some(" transaction")).is_transaction_pooler());
+    assert!(params_with_pooler_mode(Some(" transaction ")).is_transaction_pooler());
+}
+
 /// Non-string JSON for `pooler_mode` (number, bool, null) is silently
 /// treated as None — not a transaction pooler.
 #[test]
