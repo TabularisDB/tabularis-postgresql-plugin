@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.11] - 2026-10-22
+
+### Fixed
+
+- Querying a table with a non-builtin PostgreSQL type (custom `enum`,
+  composite, domain, range, or extension type like `citext` / Supabase
+  `auth.uid`) no longer hangs or errors behind a transaction-mode pooler
+  (PgBouncer `pool_mode = transaction`, Supavisor) — the rc.9/rc.10
+  regression (#160, #163). Result-set queries on connections marked
+  Pooler Mode = "Transaction" now take a pinned one-shot transaction path:
+  `BEGIN` pins the backend, `DEALLOCATE ALL` clears stale server-side
+  prepared statements, `prepare` resolves every result column's type
+  while pinned (before the data fetch drains anything), and the #149
+  unnamed-protocol `query_typed` runs the data fetch — so tokio-postgres's
+  internal cached `typeinfo_statement` no longer collides across pooler
+  backend reassignment. The one-shot client is discarded after each call,
+  so its private type-cache handle (which `DEALLOCATE ALL` can't clear)
+  dies with the connection. The whole sequence is bounded by a 90s
+  plugin-side timeout (below the host's 120s call timeout) so a Supavisor
+  stall surfaces as an actionable error instead of the opaque host timeout.
+
+- The one-shot pool path skips the redundant startup-script preflight —
+  the `post_create` hook already validates the script on the real
+  connection with the same error shape, so the preflight would just open a
+  second throwaway connection per query for nothing. Only affects the
+  `pooler_mode = transaction` + `startup_script` intersection.
+
+- `pooler_mode` is now trimmed before the transaction comparison (matching
+  how `startup_script` is normalized in `build_pool`), so a hand-edited
+  `connections.json` with surrounding whitespace can't silently bypass the
+  pinned path.
+
+### Changed
+
+- `format_query_error` now emits the `max_prepared_statements > 0` +
+  `pooler_mode` guidance on **all** 26000/42P05 errors, not only when
+  `pooler_mode = transaction` is set. `is_transaction_pooler` now selects
+  the phrasing (definitive when the host declared a transaction pooler,
+  conditional when it didn't), so users on older hosts that can't send the
+  field still see the hint.
+
+### Security
+
+- Bumped `rustls-webpki` (0.103.15 → 0.103.16) and `webpki-root-certs`
+  (1.0.9 → 1.0.10) to clear the emSign root-cert advisories. `cargo audit`
+  now reports zero vulnerabilities (only the pre-existing `chacha20`
+  yanked-crate warning remains). The existing `rustls` 0.23.46 and
+  `rustls-platform-verifier` 0.7.1 floors already accept the patched
+  versions, so no `Cargo.toml` change was needed.
+
+### Dependencies
+
+- `tokio` 1.53.2 → 1.53.3 (#161).
+- `sha2` 0.11.0 → 0.11.1 (#162).
+
 ## [1.0.0-rc.10] - 2026-10-16
 
 ### Fixed
