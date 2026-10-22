@@ -348,12 +348,14 @@ const POOLED_TXN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 ///    backend (left behind by a previous assignment's `typeinfo_statement`).
 /// 2. `search_path` is set locally (inside the transaction) if a schema was
 ///    selected.
-/// 3. `prepare(&final_query)` resolves every result column's type via
-///    tokio's `typeinfo_statement` — *while the backend is pinned*, so the
-///    named statement can't be orphaned mid-resolution, and *before* the
-///    data fetch drains the response stream, so tokio never interleaves a
-///    fresh named prepare+query into a mid-drain unnamed batch (the
-///    Supavisor hang mechanism).
+/// 3. `prepare(&query)` (the original user query, before pagination) resolves
+///    every result column's type via tokio's `typeinfo_statement` — *while the
+///    backend is pinned*, so the named statement can't be orphaned
+///    mid-resolution, and *before* the data fetch drains the response stream,
+///    so tokio never interleaves a fresh named prepare+query into a mid-drain
+///    unnamed batch (the Supavisor hang mechanism). Pagination's appended
+///    `LIMIT`/`OFFSET` does not change result column types, so the warmed
+///    cache applies to the paginated data fetch too.
 /// 4. `query_typed(&final_query, &[])` runs the data fetch using the
 ///    unnamed protocol — #149's pooler-safe path is preserved (#1097 stays
 ///    fixed), and binary `Row` decoding / `extract_value` is unchanged.
@@ -416,10 +418,13 @@ async fn exec_query_pooled_txn(
 /// wrap it in a timeout without holding the one-shot client's lifetime in a
 /// `Future`. `pg_client` must already be acquired.
 ///
-/// Every error path after `BEGIN` best-effort rolls back before returning. In
-/// practice the one-shot client drops on return and the server aborts any
-/// leftover transaction when the connection closes, so the rollback is
-/// belt-and-suspenders — but explicit is cheaper than relying on that.
+/// Every error path after `BEGIN` except a `COMMIT` failure best-effort
+/// rolls back before returning. A failed `COMMIT` doesn't need it: PostgreSQL
+/// itself rolls the transaction back when `COMMIT` fails (e.g. on a deferred
+/// constraint). In all cases the one-shot client drops on return and the
+/// server aborts any leftover transaction when the connection closes, so the
+/// explicit rollback is belt-and-suspenders — but explicit is cheaper than
+/// relying on that.
 async fn pin_pooled_txn(
     pg_client: &PgClient,
     query: &str,
@@ -541,38 +546,36 @@ async fn apply_search_path_local(pg_client: &PgClient, schema: &str) -> Result<(
         )
     })?;
     let current = snapshot.unwrap_or(live);
-    let set_path = if current.trim().is_empty() {
-        format!("SET LOCAL search_path TO {}", quote_identifier(schema))
-    } else {
-        format!(
-            "SET LOCAL search_path TO {}, {}",
-            quote_identifier(schema),
-            current
-        )
-    };
+    let set_path = build_search_path_sql(schema, &current, true);
     pg_client
         .batch_execute(&set_path)
         .await
         .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))
 }
 
-/// Build a `SET search_path TO` statement that prepends `schema` onto the
-/// connection's existing `search_path` rather than replacing it (#51), so
+/// Build a `SET [LOCAL] search_path TO` statement that prepends `schema` onto
+/// the connection's existing `search_path` rather than replacing it (#51), so
 /// queries against objects in a different schema still resolve. `current`
 /// is the verbatim value of `current_setting('search_path')`, emitted
 /// unchanged — PostgreSQL accepts its own display form back as the right-hand
 /// side of `SET search_path TO`, including the `"$user"` placeholder (probed
 /// against a live database: `"$user"` set back verbatim still resolves to the
 /// user's schema; unquoting it is a syntax error).
-fn build_search_path_sql(schema: &str, current: &str) -> String {
-    if current.trim().is_empty() {
-        format!("SET search_path TO {}", quote_identifier(schema))
+///
+/// `local` selects `SET LOCAL` (scoped to the current transaction) over `SET`
+/// (session-scoped). The pinned one-shot transaction path uses `SET LOCAL` so
+/// the change can't leak across pooler reassignment; the shared cached path
+/// uses `SET`.
+fn build_search_path_sql(schema: &str, current: &str, local: bool) -> String {
+    let kw = if local {
+        "SET LOCAL search_path TO"
     } else {
-        format!(
-            "SET search_path TO {}, {}",
-            quote_identifier(schema),
-            current
-        )
+        "SET search_path TO"
+    };
+    if current.trim().is_empty() {
+        format!("{kw} {}", quote_identifier(schema))
+    } else {
+        format!("{kw} {}, {}", quote_identifier(schema), current)
     }
 }
 
@@ -630,7 +633,7 @@ async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), Str
     // Prefer the stable base snapshot; fall back to the live value if it's
     // unset so an older pool (no snapshot hook) keeps working.
     let current = snapshot.unwrap_or(live);
-    let set_path = build_search_path_sql(schema, &current);
+    let set_path = build_search_path_sql(schema, &current, false);
     pg_client
         .batch_execute(&set_path)
         .await
