@@ -144,3 +144,109 @@ async fn wrong_password_error_message_has_no_debug_dump() {
     let key = connection_key(&wrong);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression guard for #160 / #163: a query against a table with a
+/// non-builtin column type (a custom `enum` here) must return rows, not
+/// hang. The rc.9 regression (#149's unnamed `query_typed` path) resolved
+/// each result column's type *inside* the response-drain loop, and for the
+/// enum OID tokio-postgres fired an interleaved named `typeinfo_statement`
+/// round-trip mid-stream — which deadlocks on a pooler and hangs until the
+/// host's 120s RPC timeout. The fix pre-warms the type cache with a
+/// best-effort `prepare` before `query_typed`, restoring the clean
+/// pre-Execute type-resolution window rc.8's named path had.
+///
+/// This exercises the exact handler path the reporters hit (`execute_query`
+/// → `exec_query_on_client`'s non-empty-rows branch). A custom `enum`
+/// column is the minimal non-builtin type that triggers the
+/// `typeinfo_statement` cache miss; if the interleave is present this test
+/// hangs past the host-style timeout, so it's wrapped in a bounded
+/// `tokio::time::timeout` to fail fast rather than stall the suite.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn query_with_nonbuiltin_enum_column_returns_rows() {
+    use crate::client;
+    use crate::handlers::query::execute_query;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // Unique names so repeated runs (and concurrent test DB users) don't
+    // collide. `DROP ... IF EXISTS` is idempotent on both setup and teardown.
+    let type_name = "plugin_test_160_color";
+    let table_name = "plugin_test_160_enum_table";
+
+    // Setup: create a custom enum type and a table with an enum column, then
+    // insert a row. `execute_typed` uses the unnamed protocol with no result
+    // columns, so setup itself can't hang on the type-resolution interleave.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+        format!("CREATE TYPE {type_name} AS ENUM ('red', 'green', 'blue')"),
+        format!("CREATE TABLE {table_name} (id int, color {type_name})"),
+        format!("INSERT INTO {table_name} (id, color) VALUES (1, 'red')"),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    // The actual regression check: SELECT * from the enum-typed table through
+    // the full `execute_query` handler path. Build the JSON params object the
+    // host would send (connection fields at the top level; `inner_params`
+    // falls back to the value itself when there's no nested `params` key).
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "query": format!("SELECT * FROM {table_name}"),
+        "limit": 100,
+        "page": 1,
+    });
+
+    // Fail fast instead of hanging: the bug manifests as a stall past 120s,
+    // so a 30s ceiling catches a regression well before the host-style
+    // timeout would, while leaving headroom for a slow podman container.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query(json!(1), &request_params),
+    )
+    .await
+    .expect(
+        "execute_query on an enum-typed table hung past 30s — the #160/#163 regression is present",
+    );
+
+    // Success: `result.rows` is a non-empty array.
+    assert!(
+        response.get("error").is_none(),
+        "execute_query should succeed for an enum-typed table; got: {response}"
+    );
+    let result = response
+        .get("result")
+        .expect("ok_response carries a `result` object");
+    let rows = result
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .expect("`result.rows` is an array");
+    assert!(
+        !rows.is_empty(),
+        "the enum-typed table has one row; got empty rows: {result}"
+    );
+
+    // Teardown: drop the test objects, then evict the pool entry this test
+    // populated so it doesn't linger for the idle sweep or leak into other
+    // tests' cache assertions.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+    ] {
+        let _ = client::execute_typed(&params, &stmt, &[]).await;
+    }
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}

@@ -438,6 +438,36 @@ async fn exec_query_on_client(
     };
     let manual_limit = if is_paginated { None } else { limit };
 
+    // Pre-warm tokio-postgres's per-connection type cache by running a
+    // Parse+Describe+Sync (no Bind/Execute) for the user's query. This
+    // resolves every result-column's type via tokio's internal
+    // `typeinfo_statement` *before* the unnamed `query_typed` data fetch
+    // drains the response stream — restoring the clean pre-Execute
+    // type-resolution window rc.8's named path had. Without this,
+    // `query_typed` resolves each column's type inside its response-drain
+    // loop (tokio-postgres 0.7.18, src/query.rs:102), and for non-builtin
+    // types fires an interleaved named `typeinfo_statement` round-trip
+    // mid-stream — which deadlocks on transaction-mode poolers (the #160 /
+    // #163 hang). See `client.rs`'s module note on unnamed statements (#149)
+    // and #158's residual-gap writeup.
+    //
+    // Best-effort: a 26000 (orphaned named statement on a bare transaction
+    // pooler with max_prepared_statements=0) is swallowed — the unnamed
+    // `query_typed` below is the #149-safe path and may still succeed (it
+    // always succeeds for builtin-type columns, where `get_type` hits
+    // `Type::from_oid` and never touches `typeinfo_statement`). Any other
+    // prepare error (syntax, permission) will be reproduced by
+    // `query_typed` and surfaced from there. The `Statement`'s `Drop` sends
+    // a fire-and-forget `Close(s{N})` that is harmlessly discarded (same as
+    // the empty-rows `prepare` below at line ~481).
+    if let Err(e) = pg_client.prepare(&final_query).await {
+        log::debug!(
+            "pre-query type-warming prepare failed (will still attempt \
+             unnamed query_typed): {}",
+            client::format_pg_error(&e)
+        );
+    }
+
     // Execute query
     // Unnamed-statement protocol (`query_typed`) — pooler-safe under
     // transaction-mode poolers (PgBouncer); see `client`'s module note
