@@ -73,7 +73,9 @@ pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
 
 /// Format a `tokio_postgres::Error` from a query path, rewriting
 /// prepared-statement errors (SQLSTATE 26000 / 42P05) with actionable
-/// guidance when the connection is through a transaction-mode pooler.
+/// pooler guidance. The rewrite is unconditional on these SQLSTATEs;
+/// `is_transaction_pooler` only selects the phrasing (definitive when the
+/// host declared a transaction pooler, conditional when it didn't).
 ///
 /// Under PgBouncer `pool_mode = transaction`, tokio-postgres's internal
 /// `typeinfo_statement` (fired during `Row` deserialization for non-builtin
@@ -85,25 +87,47 @@ pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
 /// the cryptic error into that guidance so the user knows what to configure
 /// (#157, tabularis#1097).
 ///
-/// For non-pooler connections or non-prepared-statement errors, falls
-/// through to `format_pg_error` unchanged.
-pub(crate) fn format_query_error(e: &tokio_postgres::Error, is_transaction_pooler: bool) -> String {
+/// When `is_transaction_pooler` is already true, the guidance is definitive.
+/// When it's false/unknown (the host did not send `pooler_mode`), the same
+/// SQLSTATEs still suggest a transaction pooler the host didn't declare — so
+/// guidance is phrased conditionally ("if this connection goes through a
+/// transaction-mode pooler…") rather than suppressed. Suppressing it would
+/// hide the only actionable hint from users on older hosts that can't send
+/// `pooler_mode` yet (#160, #163).
+/// The lead sentence of the pooler guidance [`format_query_error`] prepends
+/// to a 26000/42P05 message. Extracted as a pure function so the conditional
+/// phrasing — definitive when the host declared a transaction pooler,
+/// conditional ("If this connection goes through…") when it didn't (#160,
+/// #163) — is unit-testable without a live `tokio_postgres::Error` (whose
+/// `DbError`/SQLSTATE can't be constructed without a real server response).
+pub(crate) fn pooler_error_lead(is_transaction_pooler: bool) -> &'static str {
     if is_transaction_pooler {
-        if let Some(code) = e.code() {
-            if *code == tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME
-                || *code == tokio_postgres::error::SqlState::DUPLICATE_PSTATEMENT
-            {
-                return format!(
-                    "{}\n\n\
-                     This error occurs under transaction-mode poolers (e.g. PgBouncer) \
-                     when a named prepared statement is lost to connection reassignment. \
-                     For queries returning custom types (enums, composites, extension types), \
-                     set `max_prepared_statements > 0` in pgbouncer.ini — this enables \
-                     server-side prepared statement caching so named statements survive \
-                     reassignment. See: https://www.pgbouncer.org/config.html#max_prepared_statements",
-                    format_pg_error(e)
-                );
-            }
+        "This error occurs under transaction-mode poolers (e.g. PgBouncer) \
+         when a named prepared statement is lost to connection reassignment."
+    } else {
+        "If this connection goes through a transaction-mode pooler \
+         (e.g. PgBouncer or Supabase/Supavisor), this error occurs when a \
+         named prepared statement is lost to connection reassignment."
+    }
+}
+
+pub(crate) fn format_query_error(e: &tokio_postgres::Error, is_transaction_pooler: bool) -> String {
+    if let Some(code) = e.code() {
+        if *code == tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME
+            || *code == tokio_postgres::error::SqlState::DUPLICATE_PSTATEMENT
+        {
+            let lead = pooler_error_lead(is_transaction_pooler);
+            return format!(
+                "{msg}\n\n\
+                 {lead} For queries returning custom types (enums, composites, extension \
+                 types), set `max_prepared_statements > 0` in pgbouncer.ini (or the \
+                 equivalent prepared-statement setting on your pooler) — this enables \
+                 server-side prepared statement caching so named statements survive \
+                 reassignment. In Tabularis, also mark the connection's Pooler Mode as \
+                 \"Transaction\" so the plugin uses its transaction-pooler-safe query \
+                 path. See: https://www.pgbouncer.org/config.html#max_prepared_statements",
+                msg = format_pg_error(e),
+            );
         }
     }
     format_pg_error(e)
@@ -530,6 +554,38 @@ pub(crate) async fn get_pool_client(
     }
 }
 
+/// Acquire a one-shot client from a **transient** pool that is never inserted
+/// into the global `POOLS` cache. The `pool` local is dropped at the end of
+/// this function (only the `Object` is returned), so the underlying TCP
+/// connection simply closes when the caller later drops the `Object`:
+/// `Object`'s `Drop` upgrades a `WeakPool`; when the pool itself is already
+/// gone the upgrade fails and the inner connection is dropped, never returned
+/// to any pool.
+///
+/// This exists for the transaction-pooler result-set path (#160 / #163): it
+/// runs `DEALLOCATE ALL`, which clears server-side prepared statements but
+/// cannot clear tokio-postgres's private cached `typeinfo_statement` handle
+/// on the `InnerClient`. Reusing that same `Client` afterward would leave
+/// its private cache pointing at a now-deallocated statement name. A
+/// one-shot client guarantees no stale client-side type cache is ever reused
+/// — the connection (and its caches) die when the operation ends.
+///
+/// Builds via [`build_oneshot_pool`] (same as the cached path's
+/// [`build_pool`] but without the startup-script preflight — the `post_create`
+/// hook already validates the script on the real connection with the same
+/// error shape, so the preflight would just open a second throwaway
+/// connection per query). TLS, startup script, and `search_path` snapshot
+/// hooks are otherwise identical to the cached path.
+pub(crate) async fn oneshot_pool_client(
+    params: &ConnectionParams,
+) -> Result<deadpool_postgres::Object, String> {
+    let pool = build_oneshot_pool(params).await?;
+    match pool.get().await {
+        Ok(client) => Ok(client),
+        Err(e) => Err(format!("Connection failed: {}", format_pool_error(&e))),
+    }
+}
+
 /// Drop pools that currently have no checked-out connections. Called
 /// periodically so long-idle sessions don't linger for the plugin's
 /// lifetime — matches the sqlserver/dynamodb sibling plugins' pattern.
@@ -574,7 +630,26 @@ pub(crate) fn make_tls_connect(params: &ConnectionParams) -> Result<MakeRustlsCo
 /// built-in's configurable pool size in `pool_manager.rs` (tabularis#681):
 /// applied via the builder's `.max_size()`, which overwrites the
 /// `PoolConfig` default unconditionally. See `src/settings.rs`.
+///
+/// `skip_preflight` omits the startup-script preflight (the throwaway
+/// connection that validates the script's syntax before the pool is built).
+/// The cached path runs the preflight once at pool-creation so a bad script
+/// fails fast; the one-shot path ([`oneshot_pool_client`]) skips it because
+/// `build_pool` runs *per query* there, and the `post_create` hook already
+/// validates the script on the real connection with the same error shape
+/// (`format_pool_error` unwrapping `PostCreateHook(Backend)`) — running the
+/// preflight too would open a second connection per query for nothing.
 async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
+    build_pool_impl(params, false).await
+}
+
+/// Like [`build_pool`] but skips the startup-script preflight. See
+/// [`build_pool`]'s `skip_preflight` note for why the one-shot path uses this.
+async fn build_oneshot_pool(params: &ConnectionParams) -> Result<Pool, String> {
+    build_pool_impl(params, true).await
+}
+
+async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Result<Pool, String> {
     let mut cfg = Config::new();
 
     match params
@@ -621,8 +696,10 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
     if needs_tls(params) {
         let tls_config = build_tls_connector(params)?;
         let tls = MakeRustlsConnect::new(tls_config);
-        if let Some(script) = script {
-            preflight_startup_script(&cfg, tls.clone(), script).await?;
+        if !skip_preflight {
+            if let Some(script) = script {
+                preflight_startup_script(&cfg, tls.clone(), script).await?;
+            }
         }
         let mut builder = cfg
             .builder(tls)
@@ -641,8 +718,10 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
             .build()
             .map_err(|e| format!("Pool creation failed (TLS): {e}"))
     } else {
-        if let Some(script) = script {
-            preflight_startup_script(&cfg, NoTls, script).await?;
+        if !skip_preflight {
+            if let Some(script) = script {
+                preflight_startup_script(&cfg, NoTls, script).await?;
+            }
         }
         let mut builder = cfg
             .builder(NoTls)

@@ -5,8 +5,8 @@ use tokio::sync::Mutex;
 
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
-    get_pool_client, load_client_cert_from_pem, load_roots_from_pem, resolve_ssl_mode,
-    with_text_types, NoCertVerifier, VerifyCaCertVerifier, POOLS,
+    get_pool_client, load_client_cert_from_pem, load_roots_from_pem, pooler_error_lead,
+    resolve_ssl_mode, with_text_types, NoCertVerifier, VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use crate::settings;
@@ -1300,4 +1300,42 @@ fn num_cpus_from_deadpool_default() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get() * 2)
         .unwrap_or(20)
+}
+
+/// `pooler_error_lead` selects the lead sentence of the pooler guidance
+/// `format_query_error` prepends to a 26000/42P05 error (#160/#163). The
+/// `false` branch is the new behavior this PR added (older hosts that don't
+/// send `pooler_mode` still see conditional guidance instead of a bare
+/// message); the `true` branch is definitive. `format_query_error` itself
+/// needs a live `tokio_postgres::Error` to exercise (its `DbError`/SQLSTATE
+/// can't be built without a server response), so the pure phrasing selection
+/// is tested here and the SQLSTATE-gated assembly is covered by the live
+/// `client_live_tests` error-message tests.
+#[test]
+fn pooler_error_lead_definitive_when_pooler_declared() {
+    let lead = pooler_error_lead(true);
+    assert!(
+        lead.starts_with("This error occurs under transaction-mode poolers"),
+        "definitive lead for a declared transaction pooler: {lead:?}"
+    );
+    assert!(
+        !lead.starts_with("If this connection"),
+        "must not hedge when the host declared pooler_mode=transaction"
+    );
+}
+
+#[test]
+fn pooler_error_lead_conditional_when_pooler_not_declared() {
+    // The PR's new behavior: even when is_transaction_pooler is false, the
+    // guidance is emitted (conditionally phrased) rather than suppressed —
+    // so users on older hosts that can't send pooler_mode still see the hint.
+    let lead = pooler_error_lead(false);
+    assert!(
+        lead.starts_with("If this connection goes through a transaction-mode pooler"),
+        "conditional lead for an undeclared pooler: {lead:?}"
+    );
+    assert!(
+        lead.contains("Supabase/Supavisor"),
+        "conditional lead should name the pooler flavors users hit (#163): {lead:?}"
+    );
 }

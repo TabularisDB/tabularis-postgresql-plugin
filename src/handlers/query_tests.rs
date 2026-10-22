@@ -365,7 +365,7 @@ fn build_search_path_sql_prepends_onto_existing_path() {
     // The selected schema resolves first; the connection's real path is kept
     // as fallback so queries against other schemas still resolve (#51).
     assert_eq!(
-        build_search_path_sql("analyst", "\"$user\", public"),
+        build_search_path_sql("analyst", "\"$user\", public", false),
         "SET search_path TO \"analyst\", \"$user\", public"
     );
 }
@@ -373,7 +373,7 @@ fn build_search_path_sql_prepends_onto_existing_path() {
 #[test]
 fn build_search_path_sql_emits_only_schema_when_current_is_empty() {
     assert_eq!(
-        build_search_path_sql("analyst", ""),
+        build_search_path_sql("analyst", "", false),
         "SET search_path TO \"analyst\""
     );
 }
@@ -381,7 +381,7 @@ fn build_search_path_sql_emits_only_schema_when_current_is_empty() {
 #[test]
 fn build_search_path_sql_emits_only_schema_when_current_is_whitespace() {
     assert_eq!(
-        build_search_path_sql("analyst", "   "),
+        build_search_path_sql("analyst", "   ", false),
         "SET search_path TO \"analyst\""
     );
 }
@@ -393,7 +393,7 @@ fn build_search_path_sql_preserves_user_placeholder_verbatim() {
     // live database). The helper must not unquote it — unquoted `$user` is a
     // syntax error in `SET search_path TO`.
     assert_eq!(
-        build_search_path_sql("analyst", "\"$user\", public"),
+        build_search_path_sql("analyst", "\"$user\", public", false),
         "SET search_path TO \"analyst\", \"$user\", public"
     );
 }
@@ -403,7 +403,54 @@ fn build_search_path_sql_quotes_schema_with_special_characters() {
     // A schema name needing quoting is escaped via `quote_identifier`, not
     // emitted raw.
     assert_eq!(
-        build_search_path_sql("a\"b", "public"),
+        build_search_path_sql("a\"b", "public", false),
         "SET search_path TO \"a\"\"b\", public"
+    );
+}
+
+// `local: true` selects `SET LOCAL` (transaction-scoped) over `SET`
+// (session-scoped). The pinned one-shot transaction path (#160/#163) uses
+// `SET LOCAL` so the change can't leak across pooler reassignment. These
+// mirror the `SET` cases above so the local branch is exercised for every
+// shape the shared cached path covers — a unit-test analog of
+// `apply_search_path_local`, which is otherwise only reachable through the
+// live pinned-path test (and only when a `schema` param is sent).
+#[test]
+fn build_search_path_sql_local_prepends_onto_existing_path() {
+    assert_eq!(
+        build_search_path_sql("analyst", "\"$user\", public", true),
+        "SET LOCAL search_path TO \"analyst\", \"$user\", public"
+    );
+}
+
+#[test]
+fn build_search_path_sql_local_emits_only_schema_when_current_is_empty() {
+    assert_eq!(
+        build_search_path_sql("analyst", "", true),
+        "SET LOCAL search_path TO \"analyst\""
+    );
+}
+
+#[test]
+fn build_search_path_sql_local_emits_only_schema_when_current_is_whitespace() {
+    assert_eq!(
+        build_search_path_sql("analyst", "   ", true),
+        "SET LOCAL search_path TO \"analyst\""
+    );
+}
+
+#[test]
+fn build_search_path_sql_local_preserves_user_placeholder_verbatim() {
+    assert_eq!(
+        build_search_path_sql("analyst", "\"$user\", public", true),
+        "SET LOCAL search_path TO \"analyst\", \"$user\", public"
+    );
+}
+
+#[test]
+fn build_search_path_sql_local_quotes_schema_with_special_characters() {
+    assert_eq!(
+        build_search_path_sql("a\"b", "public", true),
+        "SET LOCAL search_path TO \"a\"\"b\", public"
     );
 }
