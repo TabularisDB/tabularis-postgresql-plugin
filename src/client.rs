@@ -555,11 +555,12 @@ pub(crate) async fn get_pool_client(
 }
 
 /// Acquire a one-shot client from a **transient** pool that is never inserted
-/// into the global `POOLS` cache. The caller drops both the client and the
-/// pool after one operation, so the underlying TCP connection simply closes
-/// (`Object`'s `Drop` upgrades a `WeakPool`; when the pool itself is already
+/// into the global `POOLS` cache. The `pool` local is dropped at the end of
+/// this function (only the `Object` is returned), so the underlying TCP
+/// connection simply closes when the caller later drops the `Object`:
+/// `Object`'s `Drop` upgrades a `WeakPool`; when the pool itself is already
 /// gone the upgrade fails and the inner connection is dropped, never returned
-/// to any pool).
+/// to any pool.
 ///
 /// This exists for the transaction-pooler result-set path (#160 / #163): it
 /// runs `DEALLOCATE ALL`, which clears server-side prepared statements but
@@ -569,12 +570,16 @@ pub(crate) async fn get_pool_client(
 /// one-shot client guarantees no stale client-side type cache is ever reused
 /// — the connection (and its caches) die when the operation ends.
 ///
-/// Builds via the same `build_pool` as the cached path so TLS, startup
-/// script, and `search_path` snapshot hooks are identical.
+/// Builds via [`build_oneshot_pool`] (same as the cached path's
+/// [`build_pool`] but without the startup-script preflight — the `post_create`
+/// hook already validates the script on the real connection with the same
+/// error shape, so the preflight would just open a second throwaway
+/// connection per query). TLS, startup script, and `search_path` snapshot
+/// hooks are otherwise identical to the cached path.
 pub(crate) async fn oneshot_pool_client(
     params: &ConnectionParams,
 ) -> Result<deadpool_postgres::Object, String> {
-    let pool = build_pool(params).await?;
+    let pool = build_oneshot_pool(params).await?;
     match pool.get().await {
         Ok(client) => Ok(client),
         Err(e) => Err(format!("Connection failed: {}", format_pool_error(&e))),
@@ -625,7 +630,26 @@ pub(crate) fn make_tls_connect(params: &ConnectionParams) -> Result<MakeRustlsCo
 /// built-in's configurable pool size in `pool_manager.rs` (tabularis#681):
 /// applied via the builder's `.max_size()`, which overwrites the
 /// `PoolConfig` default unconditionally. See `src/settings.rs`.
+///
+/// `skip_preflight` omits the startup-script preflight (the throwaway
+/// connection that validates the script's syntax before the pool is built).
+/// The cached path runs the preflight once at pool-creation so a bad script
+/// fails fast; the one-shot path ([`oneshot_pool_client`]) skips it because
+/// `build_pool` runs *per query* there, and the `post_create` hook already
+/// validates the script on the real connection with the same error shape
+/// (`format_pool_error` unwrapping `PostCreateHook(Backend)`) — running the
+/// preflight too would open a second connection per query for nothing.
 async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
+    build_pool_impl(params, false).await
+}
+
+/// Like [`build_pool`] but skips the startup-script preflight. See
+/// [`build_pool`]'s `skip_preflight` note for why the one-shot path uses this.
+async fn build_oneshot_pool(params: &ConnectionParams) -> Result<Pool, String> {
+    build_pool_impl(params, true).await
+}
+
+async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Result<Pool, String> {
     let mut cfg = Config::new();
 
     match params
@@ -672,8 +696,10 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
     if needs_tls(params) {
         let tls_config = build_tls_connector(params)?;
         let tls = MakeRustlsConnect::new(tls_config);
-        if let Some(script) = script {
-            preflight_startup_script(&cfg, tls.clone(), script).await?;
+        if !skip_preflight {
+            if let Some(script) = script {
+                preflight_startup_script(&cfg, tls.clone(), script).await?;
+            }
         }
         let mut builder = cfg
             .builder(tls)
@@ -692,8 +718,10 @@ async fn build_pool(params: &ConnectionParams) -> Result<Pool, String> {
             .build()
             .map_err(|e| format!("Pool creation failed (TLS): {e}"))
     } else {
-        if let Some(script) = script {
-            preflight_startup_script(&cfg, NoTls, script).await?;
+        if !skip_preflight {
+            if let Some(script) = script {
+                preflight_startup_script(&cfg, NoTls, script).await?;
+            }
         }
         let mut builder = cfg
             .builder(NoTls)
