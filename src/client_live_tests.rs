@@ -147,20 +147,18 @@ async fn wrong_password_error_message_has_no_debug_dump() {
 
 /// Regression guard for #160 / #163: a query against a table with a
 /// non-builtin column type (a custom `enum` here) must return rows, not
-/// hang. The rc.9 regression (#149's unnamed `query_typed` path) resolved
-/// each result column's type *inside* the response-drain loop, and for the
-/// enum OID tokio-postgres fired an interleaved named `typeinfo_statement`
-/// round-trip mid-stream — which deadlocks on a pooler and hangs until the
-/// host's 120s RPC timeout. The fix pre-warms the type cache with a
-/// best-effort `prepare` before `query_typed`, restoring the clean
-/// pre-Execute type-resolution window rc.8's named path had.
+/// hang. The failure mode under a transaction-mode pooler (#160/#163) is
+/// tokio-postgres's internal cached named `typeinfo_statement` — fired for
+/// non-builtin result column OIDs — colliding with stale server-side
+/// prepared statements across pooler backend reassignment, or hanging on
+/// Supavisor.
 ///
-/// This exercises the exact handler path the reporters hit (`execute_query`
-/// → `exec_query_on_client`'s non-empty-rows branch). A custom `enum`
-/// column is the minimal non-builtin type that triggers the
-/// `typeinfo_statement` cache miss; if the interleave is present this test
-/// hangs past the host-style timeout, so it's wrapped in a bounded
-/// `tokio::time::timeout` to fail fast rather than stall the suite.
+/// This test runs against a *direct* Postgres (no pooler), so it validates
+/// the happy path and that the enum type still decodes correctly through the
+/// unnamed `query_typed` binary path. It does NOT reproduce the pooler
+/// failure — that needs a transaction-mode pooler fixture (see
+/// `pooled_txn_enum_column_returns_rows` below for the pinned-path coverage,
+/// and the manual PgBouncer matrix documented in the PR body).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
 async fn query_with_nonbuiltin_enum_column_returns_rows() {
@@ -241,6 +239,104 @@ async fn query_with_nonbuiltin_enum_column_returns_rows() {
     // Teardown: drop the test objects, then evict the pool entry this test
     // populated so it doesn't linger for the idle sweep or leak into other
     // tests' cache assertions.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+    ] {
+        let _ = client::execute_typed(&params, &stmt, &[]).await;
+    }
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Exercises the transaction-pooler pinned path (`exec_query_pooled_txn`)
+/// against a *direct* Postgres. Setting `pooler_mode: "transaction"` routes
+/// result-set queries through `BEGIN; DEALLOCATE ALL; prepare; query_typed;
+/// DEALLOCATE ALL; COMMIT` on a one-shot client. On a direct connection this
+/// must still succeed — the sequence is valid SQL and the enum column must
+/// decode correctly — proving the pinned path doesn't break the happy path
+/// and that repeated calls don't leave a stale typeinfo cache (the one-shot
+/// client is discarded each call).
+///
+/// The actual pooler hang (#160/#163) needs a transaction-mode pooler
+/// fixture; this test covers the direct-Postgres correctness of the new
+/// path. The manual PgBouncer matrix in the PR body covers the pooler case.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn pooled_txn_enum_column_returns_rows() {
+    use crate::client;
+    use crate::handlers::query::execute_query;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    let type_name = "plugin_test_160b_color";
+    let table_name = "plugin_test_160b_enum_table";
+
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+        format!("CREATE TYPE {type_name} AS ENUM ('red', 'green', 'blue')"),
+        format!("CREATE TABLE {table_name} (id int, color {type_name})"),
+        format!("INSERT INTO {table_name} (id, color) VALUES (1, 'red')"),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    // `pooler_mode: "transaction"` routes the result-set query through the
+    // pinned one-shot transaction path even against a direct Postgres.
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "query": format!("SELECT * FROM {table_name}"),
+        "limit": 100,
+        "page": 1,
+    });
+
+    // Run twice: the second run proves the one-shot client discard works —
+    // no stale cached typeinfo_statement from run 1 leaks into run 2. A
+    // regression here would surface as a 26000/42P05 or a hang.
+    for run in 1..=2 {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            execute_query(json!(run), &request_params),
+        )
+        .await
+        .expect("pooled-txn enum query hung past 30s on direct Postgres");
+
+        assert!(
+            response.get("error").is_none(),
+            "pooled-txn run {run} should succeed; got: {response}"
+        );
+        let result = response
+            .get("result")
+            .expect("ok_response carries a `result` object");
+        let rows = result
+            .get("rows")
+            .and_then(|r| r.as_array())
+            .expect("`result.rows` is an array");
+        assert!(
+            !rows.is_empty(),
+            "pooled-txn run {run}: expected one row; got empty: {result}"
+        );
+        // The enum value must decode correctly through the binary path.
+        assert_eq!(
+            rows[0].as_array().unwrap()[1],
+            json!("red"),
+            "pooled-txn run {run}: enum column should decode to \"red\"; got: {result}"
+        );
+    }
+
     for stmt in [
         format!("DROP TABLE IF EXISTS {table_name}"),
         format!("DROP TYPE IF EXISTS {type_name}"),

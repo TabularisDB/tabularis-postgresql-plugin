@@ -290,6 +290,23 @@ async fn exec_query(
     schema: Option<&str>,
     request_id: &Value,
 ) -> Result<Value, String> {
+    // Transaction-pooler result-set queries take a pinned one-shot path
+    // (#160 / #163): tokio-postgres's internal cached named `typeinfo_statement`
+    // — fired for non-builtin result column types (custom enums, composites,
+    // extension types like `citext`/Supabase `auth.uid`) — collides with stale
+    // server-side prepared statements across pooler backend reassignment, or
+    // hangs on Supavisor. Pinning the backend with an explicit transaction,
+    // clearing stale statements, pre-resolving column types, then running the
+    // #149-unnamed data fetch on a connection that is *not* returned to the
+    // pool closes that. See `exec_query_pooled_txn`.
+    //
+    // Non-result-set statements (DDL, writes) and the batch path
+    // (`run_batch_in_session`, which owns its own transaction) stay on the
+    // shared cached client — `execute_typed` is unnamed and needs no pinning.
+    if conn_params.is_transaction_pooler() && returns_result_set(query) {
+        return exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id).await;
+    }
+
     let pg_client = client::get_pool_client(conn_params).await?;
 
     // Register a cancel handle for this in-flight query (#126). The guard
@@ -311,6 +328,232 @@ async fn exec_query(
         conn_params.is_transaction_pooler(),
     )
     .await
+}
+
+/// Bounded lifetime of the transaction-pooler pinned path. Kept below the
+/// host's plugin-call timeout (120s) so a wedged pooler connection surfaces
+/// as an actionable error here instead of the opaque "timed out after 120s"
+/// the host would otherwise emit. Long enough that a legitimately slow query
+/// on a healthy pooler isn't cut short, short enough that a Supavisor-style
+/// stall never reaches the host timeout (#160 / #163).
+const POOLED_TXN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Run a result-set query on a transaction-mode pooler through an explicit
+/// pinned transaction on a one-shot client (#160 / #163).
+///
+/// On a transaction-mode pooler, `BEGIN` pins the client to one server backend
+/// for the whole sequence. While pinned:
+///
+/// 1. `DEALLOCATE ALL` clears stale server-side prepared statements on that
+///    backend (left behind by a previous assignment's `typeinfo_statement`).
+/// 2. `search_path` is set locally (inside the transaction) if a schema was
+///    selected.
+/// 3. `prepare(&final_query)` resolves every result column's type via
+///    tokio's `typeinfo_statement` — *while the backend is pinned*, so the
+///    named statement can't be orphaned mid-resolution, and *before* the
+///    data fetch drains the response stream, so tokio never interleaves a
+///    fresh named prepare+query into a mid-drain unnamed batch (the
+///    Supavisor hang mechanism).
+/// 4. `query_typed(&final_query, &[])` runs the data fetch using the
+///    unnamed protocol — #149's pooler-safe path is preserved (#1097 stays
+///    fixed), and binary `Row` decoding / `extract_value` is unchanged.
+/// 5. A final `DEALLOCATE ALL` clears the statements `prepare` created.
+/// 6. `COMMIT` ends the pin.
+///
+/// The client comes from [`client::oneshot_pool_client`] — a transient pool
+/// not inserted into the global cache. Both the client and its pool drop at
+/// the end, so the connection (and tokio-postgres's private cached
+/// `typeinfo_statement` handle, which `DEALLOCATE ALL` can't clear) dies with
+/// it. No stale client-side type cache is ever returned to the pool.
+///
+/// The whole sequence is bounded by [`POOLED_TXN_TIMEOUT`]; a stall is an
+/// actionable error, not a 120s host timeout. On any error after `BEGIN` we
+/// best-effort `ROLLBACK` (the one-shot client drop closes the connection
+/// regardless).
+async fn exec_query_pooled_txn(
+    conn_params: &ConnectionParams,
+    query: &str,
+    limit: Option<u32>,
+    page: u32,
+    schema: Option<&str>,
+    request_id: &Value,
+) -> Result<Value, String> {
+    // One-shot client: not returned to any pool, so its caches die with it.
+    let pg_client = client::oneshot_pool_client(conn_params).await?;
+
+    // Register a cancel handle for this in-flight query (#126). The guard
+    // deregisters on drop — at every return path below, Ok or Err.
+    let _cancel_guard =
+        cancel::CancelGuard::register(request_id.as_u64(), &pg_client, conn_params.clone());
+
+    // Wrap the pinned work in a plugin-owned timeout so a Supavisor-style
+    // stall surfaces here instead of at the host's 120s call timeout. A
+    // timeout means the pooler wedged; the one-shot client drops and its
+    // connection (and stale caches) dies regardless of the COMMIT/ROLLBACK
+    // below.
+    match tokio::time::timeout(
+        POOLED_TXN_TIMEOUT,
+        pin_pooled_txn(&pg_client, query, limit, page, schema),
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_elapsed) => Err(format!(
+            "Query timed out after {}s on a transaction-mode pooler. \
+             This is the known #160/#163 failure mode when the pooler can't \
+             track prepared statements for non-builtin result column types \
+             (custom enums, composites, extension types). For PgBouncer, set \
+             `max_prepared_statements > 0` in pgbouncer.ini; for poolers \
+             without that setting, use a direct/session connection or the \
+             pooler's session mode. See: \
+             https://www.pgbouncer.org/config.html#max_prepared_statements",
+            POOLED_TXN_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// The pinned-transaction body, split out so [`exec_query_pooled_txn`] can
+/// wrap it in a timeout without holding the one-shot client's lifetime in a
+/// `Future`. `pg_client` must already be acquired.
+///
+/// Every error path after `BEGIN` best-effort rolls back before returning. In
+/// practice the one-shot client drops on return and the server aborts any
+/// leftover transaction when the connection closes, so the rollback is
+/// belt-and-suspenders — but explicit is cheaper than relying on that.
+async fn pin_pooled_txn(
+    pg_client: &PgClient,
+    query: &str,
+    limit: Option<u32>,
+    page: u32,
+    schema: Option<&str>,
+) -> Result<Value, String> {
+    // Pin the backend for the whole sequence.
+    if let Err(e) = pg_client.batch_execute("BEGIN").await {
+        return Err(client::format_pg_error(&e));
+    }
+
+    let result = run_pinned_body(pg_client, query, limit, page, schema).await;
+
+    match result {
+        Ok(value) => {
+            if let Err(e) = pg_client.batch_execute("COMMIT").await {
+                return Err(format!("COMMIT failed: {}", client::format_pg_error(&e)));
+            }
+            Ok(value)
+        }
+        Err(e) => {
+            // best-effort rollback; the one-shot client drops and closes
+            // regardless, so the server aborts the txn even if this fails.
+            let _ = pg_client.batch_execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
+
+/// The pinned-transaction steps between `BEGIN` and `COMMIT`/`ROLLBACK`:
+/// clear stale statements, set search_path, pre-resolve column types, run
+/// the unnamed data fetch, clear statements again. Any error propagates up
+/// to [`pin_pooled_txn`]'s rollback branch.
+async fn run_pinned_body(
+    pg_client: &PgClient,
+    query: &str,
+    limit: Option<u32>,
+    page: u32,
+    schema: Option<&str>,
+) -> Result<Value, String> {
+    // Clear stale server-side prepared statements left by a previous
+    // assignment's typeinfo query (or the connection's prior use).
+    pg_client
+        .batch_execute("DEALLOCATE ALL")
+        .await
+        .map_err(|e| format!("DEALLOCATE ALL failed: {}", client::format_pg_error(&e)))?;
+
+    // Apply search_path inside the pinned transaction. `SET LOCAL` keeps the
+    // change scoped to this transaction so it can't leak across pooler
+    // reassignment — and since the backend is pinned for the transaction,
+    // the `SET LOCAL` is guaranteed to land on the same backend that runs
+    // the query.
+    if let Some(s) = schema {
+        apply_search_path_local(pg_client, s).await?;
+    }
+
+    // Pre-resolve result column types while the backend is pinned. This is
+    // the core of the fix: `prepare`'s internal `get_type`/`typeinfo_statement`
+    // round-trip runs inside the pin, before the data fetch drains anything.
+    // A 26000 here (the pooler couldn't track the statement even while
+    // pinned — only possible if it rejects named statements outright) is
+    // surfaced via `format_query_error` so the user sees the actionable
+    // `max_prepared_statements` guidance.
+    let is_transaction_pooler = true;
+    if let Err(e) = pg_client.prepare(query).await {
+        return Err(client::format_query_error(&e, is_transaction_pooler));
+    }
+
+    // Data fetch: unnamed protocol (#149's pooler-safe path). Binary Row
+    // decoding + extract_value unchanged.
+    let result = exec_query_on_client(pg_client, query, limit, page, is_transaction_pooler).await;
+
+    // Clear the statements `prepare` created before COMMIT. Errors here are
+    // non-fatal — the one-shot client drops and closes regardless. Log and
+    // continue to the result.
+    if let Err(e) = pg_client.batch_execute("DEALLOCATE ALL").await {
+        log::debug!(
+            "pooled-txn trailing DEALLOCATE failed: {}",
+            client::format_pg_error(&e)
+        );
+    }
+
+    result
+}
+
+/// Read the connection's base `search_path` and set it locally (`SET LOCAL`)
+/// for the current pinned transaction. Same base-snapshot logic as
+/// [`apply_search_path`], but the `SET LOCAL` (rather than `SET`) keeps the
+/// change scoped to this transaction so it can't leak across pooler
+/// reassignment — and since the backend is pinned for the transaction, the
+/// `SET LOCAL` is guaranteed to land on the same backend that runs the query.
+async fn apply_search_path_local(pg_client: &PgClient, schema: &str) -> Result<(), String> {
+    let read = pg_client
+        .query_typed_one(
+            "SELECT current_setting($1, true), current_setting('search_path')",
+            &[(
+                &client::BASE_SEARCH_PATH_GUC as &(dyn ToSql + Sync),
+                Type::TEXT,
+            )],
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to read search_path: {}",
+                client::format_pg_error(&e)
+            )
+        })?;
+    let snapshot: Option<String> = read.try_get(0).map_err(|e| {
+        format!(
+            "Failed to read search_path: {}",
+            client::format_pg_error(&e)
+        )
+    })?;
+    let live: String = read.try_get(1).map_err(|e| {
+        format!(
+            "Failed to read search_path: {}",
+            client::format_pg_error(&e)
+        )
+    })?;
+    let current = snapshot.unwrap_or(live);
+    let set_path = if current.trim().is_empty() {
+        format!("SET LOCAL search_path TO {}", quote_identifier(schema))
+    } else {
+        format!(
+            "SET LOCAL search_path TO {}, {}",
+            quote_identifier(schema),
+            current
+        )
+    };
+    pg_client
+        .batch_execute(&set_path)
+        .await
+        .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))
 }
 
 /// Build a `SET search_path TO` statement that prepends `schema` onto the
@@ -437,36 +680,6 @@ async fn exec_query_on_client(
         (query.to_string(), 0u32)
     };
     let manual_limit = if is_paginated { None } else { limit };
-
-    // Pre-warm tokio-postgres's per-connection type cache by running a
-    // Parse+Describe+Sync (no Bind/Execute) for the user's query. This
-    // resolves every result-column's type via tokio's internal
-    // `typeinfo_statement` *before* the unnamed `query_typed` data fetch
-    // drains the response stream — restoring the clean pre-Execute
-    // type-resolution window rc.8's named path had. Without this,
-    // `query_typed` resolves each column's type inside its response-drain
-    // loop (tokio-postgres 0.7.18, src/query.rs:102), and for non-builtin
-    // types fires an interleaved named `typeinfo_statement` round-trip
-    // mid-stream — which deadlocks on transaction-mode poolers (the #160 /
-    // #163 hang). See `client.rs`'s module note on unnamed statements (#149)
-    // and #158's residual-gap writeup.
-    //
-    // Best-effort: a 26000 (orphaned named statement on a bare transaction
-    // pooler with max_prepared_statements=0) is swallowed — the unnamed
-    // `query_typed` below is the #149-safe path and may still succeed (it
-    // always succeeds for builtin-type columns, where `get_type` hits
-    // `Type::from_oid` and never touches `typeinfo_statement`). Any other
-    // prepare error (syntax, permission) will be reproduced by
-    // `query_typed` and surfaced from there. The `Statement`'s `Drop` sends
-    // a fire-and-forget `Close(s{N})` that is harmlessly discarded (same as
-    // the empty-rows `prepare` below at line ~481).
-    if let Err(e) = pg_client.prepare(&final_query).await {
-        log::debug!(
-            "pre-query type-warming prepare failed (will still attempt \
-             unnamed query_typed): {}",
-            client::format_pg_error(&e)
-        );
-    }
 
     // Execute query
     // Unnamed-statement protocol (`query_typed`) — pooler-safe under

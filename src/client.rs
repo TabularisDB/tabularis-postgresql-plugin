@@ -85,25 +85,37 @@ pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
 /// the cryptic error into that guidance so the user knows what to configure
 /// (#157, tabularis#1097).
 ///
-/// For non-pooler connections or non-prepared-statement errors, falls
-/// through to `format_pg_error` unchanged.
+/// When `is_transaction_pooler` is already true, the guidance is definitive.
+/// When it's false/unknown (the host did not send `pooler_mode`), the same
+/// SQLSTATEs still suggest a transaction pooler the host didn't declare — so
+/// guidance is phrased conditionally ("if this connection goes through a
+/// transaction-mode pooler…") rather than suppressed. Suppressing it would
+/// hide the only actionable hint from users on older hosts that can't send
+/// `pooler_mode` yet (#160, #163).
 pub(crate) fn format_query_error(e: &tokio_postgres::Error, is_transaction_pooler: bool) -> String {
-    if is_transaction_pooler {
-        if let Some(code) = e.code() {
-            if *code == tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME
-                || *code == tokio_postgres::error::SqlState::DUPLICATE_PSTATEMENT
-            {
-                return format!(
-                    "{}\n\n\
-                     This error occurs under transaction-mode poolers (e.g. PgBouncer) \
-                     when a named prepared statement is lost to connection reassignment. \
-                     For queries returning custom types (enums, composites, extension types), \
-                     set `max_prepared_statements > 0` in pgbouncer.ini — this enables \
-                     server-side prepared statement caching so named statements survive \
-                     reassignment. See: https://www.pgbouncer.org/config.html#max_prepared_statements",
-                    format_pg_error(e)
-                );
-            }
+    if let Some(code) = e.code() {
+        if *code == tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME
+            || *code == tokio_postgres::error::SqlState::DUPLICATE_PSTATEMENT
+        {
+            let lead = if is_transaction_pooler {
+                "This error occurs under transaction-mode poolers (e.g. PgBouncer) \
+                 when a named prepared statement is lost to connection reassignment."
+            } else {
+                "If this connection goes through a transaction-mode pooler \
+                 (e.g. PgBouncer or Supabase/Supavisor), this error occurs when a \
+                 named prepared statement is lost to connection reassignment."
+            };
+            return format!(
+                "{msg}\n\n\
+                 {lead} For queries returning custom types (enums, composites, extension \
+                 types), set `max_prepared_statements > 0` in pgbouncer.ini (or the \
+                 equivalent prepared-statement setting on your pooler) — this enables \
+                 server-side prepared statement caching so named statements survive \
+                 reassignment. In Tabularis, also mark the connection's Pooler Mode as \
+                 \"Transaction\" so the plugin uses its transaction-pooler-safe query \
+                 path. See: https://www.pgbouncer.org/config.html#max_prepared_statements",
+                msg = format_pg_error(e),
+            );
         }
     }
     format_pg_error(e)
@@ -527,6 +539,33 @@ pub(crate) async fn get_pool_client(
             }
             Err(format!("Connection failed: {}", format_pool_error(&e)))
         }
+    }
+}
+
+/// Acquire a one-shot client from a **transient** pool that is never inserted
+/// into the global `POOLS` cache. The caller drops both the client and the
+/// pool after one operation, so the underlying TCP connection simply closes
+/// (`Object`'s `Drop` upgrades a `WeakPool`; when the pool itself is already
+/// gone the upgrade fails and the inner connection is dropped, never returned
+/// to any pool).
+///
+/// This exists for the transaction-pooler result-set path (#160 / #163): it
+/// runs `DEALLOCATE ALL`, which clears server-side prepared statements but
+/// cannot clear tokio-postgres's private cached `typeinfo_statement` handle
+/// on the `InnerClient`. Reusing that same `Client` afterward would leave
+/// its private cache pointing at a now-deallocated statement name. A
+/// one-shot client guarantees no stale client-side type cache is ever reused
+/// — the connection (and its caches) die when the operation ends.
+///
+/// Builds via the same `build_pool` as the cached path so TLS, startup
+/// script, and `search_path` snapshot hooks are identical.
+pub(crate) async fn oneshot_pool_client(
+    params: &ConnectionParams,
+) -> Result<deadpool_postgres::Object, String> {
+    let pool = build_pool(params).await?;
+    match pool.get().await {
+        Ok(client) => Ok(client),
+        Err(e) => Err(format!("Connection failed: {}", format_pool_error(&e))),
     }
 }
 
