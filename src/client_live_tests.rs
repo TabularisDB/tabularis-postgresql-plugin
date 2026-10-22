@@ -254,9 +254,7 @@ async fn query_with_nonbuiltin_enum_column_returns_rows() {
 /// result-set queries through `BEGIN; DEALLOCATE ALL; prepare; query_typed;
 /// DEALLOCATE ALL; COMMIT` on a one-shot client. On a direct connection this
 /// must still succeed — the sequence is valid SQL and the enum column must
-/// decode correctly — proving the pinned path doesn't break the happy path
-/// and that repeated calls don't leave a stale typeinfo cache (the one-shot
-/// client is discarded each call).
+/// decode correctly — proving the pinned path doesn't break the happy path.
 ///
 /// The actual pooler hang (#160/#163) needs a transaction-mode pooler
 /// fixture; this test covers the direct-Postgres correctness of the new
@@ -303,9 +301,17 @@ async fn pooled_txn_enum_column_returns_rows() {
         "page": 1,
     });
 
-    // Run twice: the second run proves the one-shot client discard works —
-    // no stale cached typeinfo_statement from run 1 leaks into run 2. A
-    // regression here would surface as a 26000/42P05 or a hang.
+    // Run twice. This proves the pinned path is repeatable on a direct
+    // connection — no client-side state (a leaked BEGIN, an uncleared
+    // DEALLOCATE, a cached typeinfo handle pointing at a dropped statement)
+    // from run 1 breaks run 2. It does NOT prove the one-shot client's
+    // *discard* prevents the stale-`typeinfo_statement` collision: that
+    // collision is pooler-only (it needs a backend reassignment between the
+    // prepare and a later reuse), and on direct PG reusing the client would
+    // also succeed. The discard property itself is covered by the manual
+    // PgBouncer matrix in the PR body, not by this test. A regression in the
+    // direct-Postgres repeatable path would surface here as a 26000/42P05
+    // or a hang.
     for run in 1..=2 {
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -343,6 +349,85 @@ async fn pooled_txn_enum_column_returns_rows() {
     ] {
         let _ = client::execute_typed(&params, &stmt, &[]).await;
     }
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression guard for the routing decision at `exec_query` (#160/#163):
+/// a *non-result-set* statement (DDL) on a `pooler_mode: "transaction"`
+/// connection must stay on the shared cached-client path, NOT take the
+/// pinned one-shot path. The guard is `is_transaction_pooler() &&
+/// returns_result_set(query)`; if the `returns_result_set` half were dropped,
+/// this DDL would route to `exec_query_pooled_txn` → `run_pinned_body` →
+/// `prepare("CREATE TABLE ...")`, which fails (DDL has no prepared-statement
+/// form) — so a successful CREATE here proves the guard's FALSE side holds.
+///
+/// `execute_query` returns a `result` with `affected_rows` for non-result-set
+/// statements (the `execute_typed` branch of `exec_query_on_client`), never
+/// rows. Run against direct Postgres so the assertion is about routing, not
+/// pooler behavior.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn pooled_txn_ddl_stays_off_the_pinned_path() {
+    use crate::client;
+    use crate::handlers::query::execute_query;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    let table_name = "plugin_test_160c_ddl_table";
+    // Idempotent setup: drop first so a leftover from a prior run doesn't
+    // make the CREATE a no-op. The DROP uses execute_typed directly, not the
+    // path under test, so it can't mask a routing regression.
+    let _ =
+        client::execute_typed(&params, &format!("DROP TABLE IF EXISTS {table_name}"), &[]).await;
+
+    // `pooler_mode: "transaction"` + a DDL query. If the routing guard's
+    // `returns_result_set` half is intact, this stays on the shared cached
+    // client and the CREATE succeeds. If it were removed, this would take
+    // the pinned path and fail at `prepare("CREATE TABLE ...")`.
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "query": format!("CREATE TABLE {table_name} (id int)"),
+        "limit": 100,
+        "page": 1,
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query(json!(1), &request_params),
+    )
+    .await
+    .expect("pooled-txn DDL query hung past 30s on direct Postgres");
+
+    assert!(
+        response.get("error").is_none(),
+        "DDL on a transaction-pooler connection should succeed (routing guard keeps it off the \
+         pinned path); got: {response}"
+    );
+    let result = response
+        .get("result")
+        .expect("ok_response carries a `result` object");
+    // Non-result-set statements return rows: [] and affected_rows (0 for
+    // CREATE TABLE, which reports no affected rows in PostgreSQL). The key
+    // assertion is no error; assert the shape, not the count.
+    assert!(
+        result.get("rows").and_then(|r| r.as_array()).is_some(),
+        "non-result-set statements return a rows array: {result}"
+    );
+
+    // Teardown.
+    let _ =
+        client::execute_typed(&params, &format!("DROP TABLE IF EXISTS {table_name}"), &[]).await;
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
