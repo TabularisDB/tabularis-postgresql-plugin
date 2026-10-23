@@ -133,6 +133,13 @@ async fn run_batch_in_session(
     // A pinned connection only exists because its transaction is still open.
     let mut in_transaction = pinned.is_some();
     let reused = pinned.is_some();
+    // Whether any earlier non-result-set statement in this batch set
+    // session-local state (a session `SET`, a `CREATE TEMP TABLE`) that a
+    // later result-set `SELECT` would see only on this shared connection —
+    // not on a fresh one-shot connection (#173). Sticky for the rest of the
+    // batch: once set, a later `SELECT` that needs to see it stays on the
+    // shared client. See the routing comment below.
+    let mut session_state_set = false;
 
     // Acquire ONE connection for the entire batch (session state must survive)
     let pg_client = match pinned {
@@ -173,7 +180,8 @@ async fn run_batch_in_session(
         // #166/#168). `exec_query` routes single queries to the one-shot
         // pinned path (`exec_query_pooled_txn`) for this; the batch path
         // bypasses `exec_query`, so it makes the same routing decision here.
-        // Two sub-cases, keyed on `in_transaction` (not `reused`):
+        // The routing keys on whether the SELECT must run on this shared
+        // connection, with two cases (plus the cancel-guard note):
         //
         // * `in_transaction` (the user's `BEGIN` has pinned the backend on
         //   this shared connection — either a session-pinned batch reusing a
@@ -183,28 +191,49 @@ async fn run_batch_in_session(
         //   SELECT on the same connection where transaction-local state
         //   (temp tables, SET variables) is visible. Run
         //   `exec_query_on_client` with `pre_resolve_types = true`.
-        // * Not `in_transaction` (no open transaction pins the backend): a
-        //   plain `prepare` could collide across reassignment (the `s0`→`s1`
-        //   shift that killed the removed pre-warm, ca33b98). Route to the
-        //   one-shot pinned path (`exec_query_pooled_txn`) — the proven
-        //   #164 mechanism. The one-shot client dies with its stale
+        // * `session_state_set` (a prior non-result-set statement in this
+        //   bare batch set session-local state — a session `SET` or a
+        //   `CREATE TEMP TABLE` outside a transaction — #173): the SELECT
+        //   must stay on this shared connection to see that state. A fresh
+        //   one-shot connection never saw the `SET`/temp table (the one-shot
+        //   applies only the host's `schema` via `SET LOCAL`), so routing it
+        //   there would silently lose the state — wrong float precision, or
+        //   `ERROR: relation "t" does not exist`. Keep it on the shared
+        //   client with `pre_resolve_types = true` (the same path as the
+        //   `in_transaction` case). On a real PgBouncer a session `SET`
+        //   between autocommit statements is already lost to backend
+        //   reassignment (pre-existing on `main`), so this primarily
+        //   restores the direct-PostgreSQL + `pooler_mode=transaction`
+        //   config (one TCP connection = one backend, held) and the
+        //   temp-table case; see `sets_session_local_state` for the
+        //   classifier and why transaction-scoped forms are excluded.
+        // * Otherwise (no open transaction, no prior session state): route
+        //   to the one-shot pinned path (`exec_query_pooled_txn`) — the
+        //   proven #164 mechanism. The one-shot client dies with its stale
         //   client-side type cache; the shared batch client sits idle for
-        //   that one query (acceptable: correctness over connection reuse
-        //   for one statement; when there's no transaction there's no
-        //   transaction-local state to lose by using a different connection).
+        //   that one query (acceptable: when there's no transaction and no
+        //   session state there's nothing to lose by using a different
+        //   connection). A plain `prepare` here could collide across
+        //   reassignment (the `s0`→`s1` shift that killed the removed
+        //   pre-warm, ca33b98), so the one-shot is the safe choice.
         //
         // Non-result-set statements (DDL, writes) and direct connections
         // stay on the shared cached client — the unnamed protocol is
         // pooler-safe and needs no pinning (#149, #168).
+        let shared_client = in_transaction || session_state_set;
         let outcome = if conn_params.is_transaction_pooler() && returns_result_set(query) {
-            if in_transaction {
-                // The user's open transaction pins the backend on this
-                // connection. Pre-resolve column types via `prepare` inside
-                // it (safe — no reassignment can orphan the named statement)
-                // so `query_typed`'s `get_type` is a cache hit (no mid-stream
-                // `typeinfo_statement`, no deadlock). Keeps the SELECT on the
-                // shared connection where transaction-local state is visible.
-                // `cancel_guard` stays registered for this shared client.
+            if shared_client {
+                // Run on this shared connection (the user's open transaction
+                // pins it, or a prior statement set session-local state the
+                // SELECT must see — #173). Pre-resolve column types via
+                // `prepare` (safe — the backend is pinned by an open
+                // transaction, or there's no pooler reassignment to collide
+                // with on the direct+`pooler_mode=transaction` config) so
+                // `query_typed`'s `get_type` is a cache hit (no mid-stream
+                // `typeinfo_statement`, no deadlock). Keeps the SELECT on
+                // the shared connection where the session/transaction-local
+                // state is visible. `cancel_guard` stays registered for
+                // this shared client.
                 exec_query_on_client(
                     &pg_client,
                     query,
@@ -215,11 +244,11 @@ async fn run_batch_in_session(
                 )
                 .await
             } else {
-                // No open transaction pins the backend. Route to the one-shot
-                // pinned path. The one-shot client acquired inside
-                // `exec_query_pooled_txn` is its own connection (never
-                // returned to a pool, so no stale client-side type cache
-                // hazard — #164's core property).
+                // No open transaction pins the backend and no prior statement
+                // set session state. Route to the one-shot pinned path. The
+                // one-shot client acquired inside `exec_query_pooled_txn` is
+                // its own connection (never returned to a pool, so no stale
+                // client-side type cache hazard — #164's core property).
                 //
                 // Cancel-guard coexistence: `exec_query_pooled_txn` registers
                 // its own `CancelGuard` under the SAME `request_id` we hold
@@ -261,6 +290,15 @@ async fn run_batch_in_session(
 
         in_transaction =
             transaction_effect(query).in_transaction_after(outcome.is_ok(), in_transaction);
+        // Track session-local state set by a non-result-set statement so a
+        // later result-set SELECT in this bare batch routes to the shared
+        // client above instead of the one-shot (#173). A `SET`/`CREATE TEMP
+        // TABLE` here flips the flag; result-set statements and transaction
+        // verbs don't, and `SET LOCAL` deliberately doesn't (transaction-
+        // scoped, not session-local). Sticky once set.
+        if sets_session_local_state(query) {
+            session_state_set = true;
+        }
 
         match outcome {
             Ok(result) => results.push(json!({
@@ -1142,6 +1180,68 @@ fn returns_result_set(query: &str) -> bool {
         || upper.starts_with("TABLE")
         || upper.starts_with("PRAGMA")
         || upper.starts_with("CALL")
+}
+
+/// Whether `query` sets session-local state — a session `SET` (without
+/// `LOCAL`) or a `CREATE TEMP[ORARY] TABLE` outside a transaction — that a
+/// later statement in the same bare batch would see only on the *same*
+/// connection (#173).
+///
+/// `run_batch_in_session` uses this to keep a result-set `SELECT` on the
+/// shared batch client (with a column-type pre-resolve) instead of the #172
+/// one-shot path when routing to a fresh connection would lose the state:
+/// the one-shot applies only the host's `schema` via `SET LOCAL` and never
+/// replays the user's prior `SET`/temp table. On `main` (rc.11, before
+/// #172) every statement of a batch ran on one shared `pg_client`, so
+/// `["SET extra_float_digits = 3", "SELECT 1.0/3.0"]` (or `["CREATE TEMP
+/// TABLE t ...", "SELECT * FROM t"]`) reliably shared state; #172's
+/// `!in_transaction` routing to the one-shot broke that for transaction
+/// poolers.
+///
+/// Transaction-scoped forms are deliberately **excluded**:
+/// - `SET LOCAL ...` dies at transaction end. With no open transaction the
+///   one-shot path wraps its own `BEGIN`/`COMMIT`, so a `SET LOCAL` is
+///   correctly scoped there; with an open transaction the `in_transaction`
+///   branch already keeps the SELECT on the shared client. Either way a
+///   bare-batch SELECT on a fresh one-shot connection would never have seen
+///   it, so excluding it keeps the cheaper, pooler-safe one-shot path.
+/// - `CREATE TEMP TABLE` *inside* a `BEGIN` is likewise covered by the
+///   `in_transaction` branch; this classifier only decides the
+///   `!in_transaction` case.
+///
+/// A permanent `CREATE TABLE`/`CREATE TYPE`/etc. is visible to any
+/// connection, so the one-shot sees it — not session-local, excluded.
+///
+/// Soundness over completeness: uncommon session-state forms
+/// (`SELECT set_config(..., false)`, `RESET`, `SET SESSION AUTHORIZATION`)
+/// may be missed and degrade gracefully to the one-shot (the current, pre-fix
+/// behavior) — a false negative is never a *new* regression. A false positive
+/// routes to the shared client with a pre-resolve, the same safe path the
+/// `in_transaction` branch uses, so it is not dangerous, only occasionally
+/// suboptimal.
+///
+/// Shares [`leading_keywords`] with [`transaction_effect`], so comment
+/// stripping and string-literal handling match (a comment-headed `SET` still
+/// counts; a `SET` inside a string literal does not).
+pub fn sets_session_local_state(query: &str) -> bool {
+    let mut words = leading_keywords(query, 3).into_iter();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let second = words.next();
+    let third = words.next();
+    match first.as_str() {
+        // Any `SET` that is not `SET LOCAL` is session-scoped (`SET <guc>`,
+        // `SET ROLE`, `SET SESSION ...`).
+        "SET" => second.as_deref() != Some("LOCAL"),
+        // `CREATE TEMP[ORARY] TABLE` lives for the session and is
+        // connection-scoped; permanent `CREATE TABLE` is visible everywhere.
+        "CREATE" => {
+            matches!(second.as_deref(), Some("TEMP") | Some("TEMPORARY"))
+                && third.as_deref() == Some("TABLE")
+        }
+        _ => false,
+    }
 }
 
 /// Check if a result-set-bearing statement's syntax actually accepts a

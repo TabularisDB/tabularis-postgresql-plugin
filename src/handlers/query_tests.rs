@@ -11,8 +11,9 @@
 //! pagination is applied to a statement.
 
 use super::{
-    build_search_path_sql, raw_explain_output, returns_result_set, strip_leading_sql_comments,
-    supports_trailing_limit_clause, transaction_effect, TransactionEffect,
+    build_search_path_sql, raw_explain_output, returns_result_set, sets_session_local_state,
+    strip_leading_sql_comments, supports_trailing_limit_clause, transaction_effect,
+    TransactionEffect,
 };
 
 #[test]
@@ -453,4 +454,155 @@ fn build_search_path_sql_local_quotes_schema_with_special_characters() {
         build_search_path_sql("a\"b", "public", true),
         "SET LOCAL search_path TO \"a\"\"b\", public"
     );
+}
+
+// --- sets_session_local_state (#173) -----------------------------------------
+//
+// A bare batch (no `session_id`, no `BEGIN`) on a `pooler_mode = "transaction"`
+// connection runs its result-set `SELECT` on the shared batch client when an
+// earlier statement set session-local state, instead of the #172 one-shot
+// path (a fresh connection that never saw the `SET` / temp table). This
+// classifier decides which earlier statements flip that routing. See
+// `run_batch_in_session`'s routing comment and the `sets_session_local_state`
+// doc comment for why transaction-scoped forms are excluded (the
+// `in_transaction` branch already keeps those on the shared client).
+
+#[test]
+fn sets_session_local_state_detects_session_set() {
+    // A `SET` without `LOCAL` persists for the session on the held connection,
+    // so a later `SELECT` on the same connection sees it. The GUC name and
+    // `=`/`TO` forms both count.
+    for query in [
+        "SET extra_float_digits = 3",
+        "SET search_path TO analytics",
+        "SET statement_timeout = 5000",
+        "SET timezone TO 'UTC'",
+    ] {
+        assert!(
+            sets_session_local_state(query),
+            "{query} should count as session-local state"
+        );
+    }
+}
+
+#[test]
+fn sets_session_local_state_detects_set_role_and_session_authorization() {
+    // `SET ROLE` / `SET SESSION AUTHORIZATION` change session identity —
+    // session-scoped, visible to a later statement on the same connection.
+    for query in [
+        "SET ROLE analyst",
+        "SET SESSION AUTHORIZATION postgres",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    ] {
+        assert!(
+            sets_session_local_state(query),
+            "{query} should count as session-local state"
+        );
+    }
+}
+
+#[test]
+fn sets_session_local_state_detects_create_temp_table() {
+    // Both `TEMP` and `TEMPORARY`; a temp table created outside a transaction
+    // lives for the session and is visible only on the same connection.
+    for query in [
+        "CREATE TEMP TABLE t (id int)",
+        "CREATE TEMPORARY TABLE t AS SELECT 1 AS id",
+        "CREATE TEMP TABLE t (id int) ON COMMIT DROP",
+    ] {
+        assert!(
+            sets_session_local_state(query),
+            "{query} should count as session-local state"
+        );
+    }
+}
+
+#[test]
+fn sets_session_local_state_excludes_set_local() {
+    // `SET LOCAL` is transaction-scoped: it dies at transaction end, so on the
+    // one-shot path (which wraps its own `BEGIN`/`COMMIT`) it is correctly
+    // scoped and the `in_transaction` branch handles it when there is an open
+    // transaction. Either way it is not state a *bare-batch* SELECT on a fresh
+    // one-shot connection would have seen, so excluding it keeps the routing
+    // on the (cheaper, pooler-safe) one-shot path.
+    for query in [
+        "SET LOCAL statement_timeout = 5000",
+        "SET LOCAL search_path TO analytics",
+    ] {
+        assert!(
+            !sets_session_local_state(query),
+            "{query} is transaction-scoped, not session-local"
+        );
+    }
+}
+
+#[test]
+fn sets_session_local_state_excludes_permanent_create_and_other_ddl() {
+    // A permanent `CREATE TABLE` (or `CREATE TYPE`/`CREATE INDEX`) is visible to
+    // any connection, so the one-shot path sees it — routing to the shared
+    // client is unnecessary. Only *temp* tables are connection-scoped.
+    for query in [
+        "CREATE TABLE t (id int)",
+        "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+        "CREATE INDEX ON t (id)",
+        "CREATE SCHEMA s",
+        "CREATE OR REPLACE VIEW v AS SELECT 1",
+    ] {
+        assert!(
+            !sets_session_local_state(query),
+            "{query} is not session-local state"
+        );
+    }
+}
+
+#[test]
+fn sets_session_local_state_excludes_result_set_and_other_statements() {
+    // A `SELECT`/`UPDATE`/transaction-control verb sets no session state a
+    // later statement depends on; routing them to shared is unnecessary.
+    for query in [
+        "SELECT 1.0/3.0",
+        "SELECT * FROM t",
+        "UPDATE t SET x = 1",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "INSERT INTO t VALUES (1)",
+        "DELETE FROM t",
+    ] {
+        assert!(
+            !sets_session_local_state(query),
+            "{query} sets no session-local state"
+        );
+    }
+}
+
+#[test]
+fn sets_session_local_state_sees_through_leading_comments() {
+    // `leading_keywords` strips `--`/`/* */` comments, so a comment-headed
+    // session `SET` is still classified — matching `transaction_effect`'s
+    // comment handling (a comment-headed `BEGIN` still opens a transaction).
+    assert!(sets_session_local_state(
+        "-- tune precision\nSET extra_float_digits = 3"
+    ));
+    assert!(sets_session_local_state(
+        "/* temp scratch */ CREATE TEMP TABLE t (id int)"
+    ));
+}
+
+#[test]
+fn sets_session_local_state_handles_empty_and_comment_only_input() {
+    assert!(!sets_session_local_state(""));
+    assert!(!sets_session_local_state("   \n"));
+    assert!(!sets_session_local_state("-- only a comment"));
+    assert!(!sets_session_local_state("/* block only */"));
+}
+
+#[test]
+fn sets_session_local_state_ignores_set_inside_string_literal() {
+    // `leading_keywords` stops at a string/quoted identifier/dollar quote, so
+    // a `SET` that is data (e.g. inside a `SELECT 'SET x = 1'`) is not read as
+    // a keyword — matching `transaction_effect`'s string-handling.
+    assert!(!sets_session_local_state(
+        "SELECT 'SET extra_float_digits = 3'"
+    ));
 }
