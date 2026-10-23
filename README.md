@@ -7,8 +7,8 @@
   <br/>
 
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgres-banner-dark.svg" />
-    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgres-banner-light.svg" alt="Native PostgreSQL support" width="600" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgres-banner-dark.png" />
+    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgres-banner-light.png" alt="Native PostgreSQL support" width="600" />
   </picture>
 </div>
 
