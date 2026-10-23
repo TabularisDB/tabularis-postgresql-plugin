@@ -190,6 +190,27 @@ pub async fn handle_line(line: &str) -> Option<Value> {
     }
 }
 
+/// Peek the `method` string from a JSON-RPC line for routing, without
+/// re-implementing [`handle_line`]'s full parse + dispatch. Used by
+/// `main::run_reader` to route a line to the cancel lane (`"cancel"`), the
+/// lifecycle lane (`"ping"`/`"test_connection"`/`"initialize"`/`"shutdown"`),
+/// or the general queue, *before* a worker pulls it — so a `cancel`
+/// notification is never stuck behind the 4 general workers it's meant to
+/// relieve (#167).
+///
+/// Returns `None` for a line that isn't a JSON object with a string `method`
+/// (parse error, non-object, missing/non-string `method`). `run_reader`
+/// routes `None` to the general queue, where `handle_line` surfaces the
+/// proper `-32700`/`-32600` error response — the peek is a routing hint, not
+/// validation. Owns a short `String` (the method name); the allocation is
+/// negligible next to the JSON parse it's already doing, and avoids a second
+/// full parse in `handle_line` (which re-parses for dispatch + response).
+pub fn peek_method(line: &str) -> Option<String> {
+    let request: Value = serde_json::from_str(line).ok()?;
+    let obj = request.as_object()?;
+    obj.get("method")?.as_str().map(str::to_string)
+}
+
 pub fn ok_response(id: Value, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",

@@ -6,10 +6,40 @@
 //! responses (one JSON object per line) to stdout. All handler logic is
 //! async (tokio) since the database pool requires an async runtime.
 //!
-//! Requests are fanned out to a small worker pool so a slow query on one
-//! connection does not block a `ping` or metadata call on another. Responses
-//! are funneled through a single writer task so concurrent handlers never
-//! interleave bytes on stdout. A dedicated background task periodically
+//! # Worker lanes (not one shared pool) — #167
+//!
+//! Requests are routed to one of three lanes by method, so a slow query on
+//! one connection does not block a `ping`/`connect` on another, and a host
+//! `cancel` (the relief valve for a stuck worker) is never queued behind the
+//! stuck workers it's meant to relieve:
+//!
+//! - **cancel lane** (1 worker): `cancel` notifications run on a dedicated
+//!   worker that bypasses the general queue. When 4 general workers are
+//!   stuck on slow queries, the cancel still fires `pg_cancel_backend`
+//!   (server-side) AND aborts the stuck worker's in-flight future
+//!   (worker-side, Layer 3) — instead of queuing behind those same 4 stuck
+//!   workers. Without this, stuck workers can't be relieved: the relief valve
+//!   is stuck in the same queue (a deadlock, the core of #167).
+//! - **lifecycle lane** (2 workers): `ping`/`test_connection`/`initialize`/
+//!   `shutdown` run on a dedicated lane, so a health check or new connect to
+//!   database B isn't blocked by 4 slow queries against database A. Two
+//!   workers (not one) so a single stuck `ping` (a `SELECT 1` against an
+//!   unreachable DB) doesn't starve the lane.
+//! - **general lane** (4 workers): everything else — metadata, `execute_query`,
+//!   CRUD, DDL, BLOB. The original `WORKER_POOL_SIZE`.
+//!
+//! Every lane's worker wraps `handle_line` in a `select!` on a per-RPC
+//! `CancellationToken` (Layer 3): a host `cancel` notification aborts the
+//! in-flight operation directly, dropping the held `deadpool::Object`
+//! (closing the socket → the server cancels the statement as a side effect)
+//! and freeing the worker immediately — even if the server ignores
+//! `pg_cancel_backend`. The bound is the **host's configurable call-timeout**,
+//! not a plugin constant, so a query the host is willing to wait for (a large
+//! enum-table result, slow DDL) is never cut (#166 stays intact); only a query
+//! the host has given up on is aborted.
+//!
+//! Responses are funneled through a single writer task so concurrent handlers
+//! never interleave bytes on stdout. A dedicated background task periodically
 //! evicts idle connection pools (see `client::cleanup_idle_pools`) so a
 //! long-running session that has connected to many distinct targets doesn't
 //! pin idle TCP connections and pool memory for the plugin's lifetime.
@@ -22,11 +52,27 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::{interval, Instant};
 
+use postgresql_plugin::rpc::peek_method;
+
 const WORKER_POOL_SIZE: usize = 4;
+
+/// Lifecycle-lane worker count. Two so a single stuck `ping` (a `SELECT 1`
+/// against an unreachable DB) doesn't starve the lane — a `test_connection`
+/// to a healthy DB still gets a worker (#167).
+const LIFECYCLE_WORKER_COUNT: usize = 2;
 
 // Bounded so a burst of requests applies backpressure to the stdin reader
 // instead of buffering unboundedly in memory.
 const REQUEST_QUEUE_CAPACITY: usize = 64;
+
+/// Lifecycle calls are low-volume (health checks, new connects) so a small
+/// bound is plenty; keep it bounded for backpressure parity with the general
+/// queue rather than unbounded.
+const LIFECYCLE_QUEUE_CAPACITY: usize = 16;
+
+/// Cancel notifications are fire-and-forget and tiny; a small bound is
+/// plenty, kept bounded for backpressure.
+const CANCEL_QUEUE_CAPACITY: usize = 16;
 
 const POOL_CLEANUP_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
 
@@ -90,18 +136,43 @@ async fn main() {
 
     let mut cleanup_handle = tokio::spawn(run_pool_cleanup(shutdown_rx));
 
+    // Three lanes (#167): general, lifecycle, cancel. Each has its own queue
+    // so a slow general query can't block a health check, and a `cancel`
+    // (the relief valve) can't queue behind the stuck workers it relieves.
     let (req_tx, req_rx) = mpsc::channel::<String>(REQUEST_QUEUE_CAPACITY);
     let req_rx = Arc::new(Mutex::new(req_rx));
+    let (lifecycle_tx, lifecycle_rx) = mpsc::channel::<String>(LIFECYCLE_QUEUE_CAPACITY);
+    let lifecycle_rx = Arc::new(Mutex::new(lifecycle_rx));
+    let (cancel_tx, cancel_rx) = mpsc::channel::<String>(CANCEL_QUEUE_CAPACITY);
+    let cancel_rx = Arc::new(Mutex::new(cancel_rx));
 
     let (resp_tx, resp_rx) = mpsc::unbounded_channel::<String>();
     let mut writer_handle = tokio::spawn(run_writer(resp_rx));
 
-    let worker_handles: Vec<_> = (0..WORKER_POOL_SIZE)
-        .map(|_| tokio::spawn(run_worker(req_rx.clone(), resp_tx.clone())))
+    // General lane: the original 4 workers. Cancellable (Layer 3).
+    let mut worker_handles: Vec<_> = (0..WORKER_POOL_SIZE)
+        .map(|_| tokio::spawn(run_worker(req_rx.clone(), resp_tx.clone(), true)))
         .collect();
+    // Lifecycle lane: 2 workers (a stuck ping can't starve a test_connection).
+    // Cancellable — a host give-up should abort a stuck ping too.
+    for _ in 0..LIFECYCLE_WORKER_COUNT {
+        worker_handles.push(tokio::spawn(run_worker(
+            lifecycle_rx.clone(),
+            resp_tx.clone(),
+            true,
+        )));
+    }
+    // Cancel lane: 1 worker, NOT cancellable — it's the relief valve; a cancel
+    // must always run to completion (aborting it would re-deadlock the lane it
+    // exists to relieve). `cancellable = false` → `handle_line` runs unwrapped.
+    worker_handles.push(tokio::spawn(run_worker(
+        cancel_rx.clone(),
+        resp_tx.clone(),
+        false,
+    )));
     drop(resp_tx);
 
-    run_reader(req_tx).await;
+    run_reader(req_tx, lifecycle_tx, cancel_tx).await;
 
     let _ = shutdown_tx.send(true);
 
@@ -122,6 +193,10 @@ async fn main() {
     // #155 rather than fixing it. The `abort()` is therefore load-bearing,
     // not cosmetic; the `handle.await` after it reaps the cancelled task
     // (returns `Err(JoinError)` with `is_cancelled()`, discarded here).
+    //
+    // All lanes' workers (general + lifecycle + cancel) are drained here —
+    // the cancel worker is cheap (a `cancel` notification completes fast),
+    // and a stuck general/lifecycle worker is force-aborted the same way.
     let deadline = Instant::now() + SHUTDOWN_GRACE;
     for mut handle in worker_handles {
         match tokio::time::timeout_at(deadline, &mut handle).await {
@@ -154,7 +229,30 @@ async fn run_pool_cleanup(mut shutdown_rx: watch::Receiver<bool>) {
     }
 }
 
-async fn run_reader(req_tx: mpsc::Sender<String>) {
+/// Classify a line's method into a lane. `cancel` → cancel lane; the
+/// lifecycle methods (`ping`/`test_connection`/`initialize`/`shutdown`) →
+/// lifecycle lane; everything else (and unparseable lines, which `handle_line`
+/// will surface as `-32700`/`-32600`) → general lane.
+fn lane_for(method: Option<&str>) -> Lane {
+    match method {
+        Some("cancel") => Lane::Cancel,
+        Some("ping" | "test_connection" | "initialize" | "shutdown") => Lane::Lifecycle,
+        _ => Lane::General,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Lane {
+    General,
+    Lifecycle,
+    Cancel,
+}
+
+async fn run_reader(
+    req_tx: mpsc::Sender<String>,
+    lifecycle_tx: mpsc::Sender<String>,
+    cancel_tx: mpsc::Sender<String>,
+) {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
     loop {
@@ -172,16 +270,42 @@ async fn run_reader(req_tx: mpsc::Sender<String>) {
             continue;
         }
 
-        // Blocks when the queue is full, applying backpressure to reading.
-        if req_tx.send(trimmed.to_string()).await.is_err() {
+        // Route by peeked method before a worker pulls the line, so a `cancel`
+        // (the relief valve) and a `ping`/`connect` never queue behind 4 stuck
+        // general workers (#167). `peek_method` is a routing hint; it returns
+        // None for unparseable/non-object lines, which route to the general
+        // lane where `handle_line` surfaces the proper error response.
+        let tx = match lane_for(peek_method(trimmed).as_deref()) {
+            Lane::General => &req_tx,
+            Lane::Lifecycle => &lifecycle_tx,
+            Lane::Cancel => &cancel_tx,
+        };
+
+        // Blocks when the lane's queue is full, applying backpressure to
+        // reading. A full general queue pauses reading (the original
+        // behavior); a full lifecycle/cancel queue is unlikely (low-volume)
+        // but bounded the same way.
+        if tx.send(trimmed.to_string()).await.is_err() {
             break;
         }
     }
 }
 
+/// A worker for one lane. `cancellable` is currently unused (all lanes run
+/// `handle_line` unwrapped); it's retained as a parameter so the cancel lane
+/// is explicitly marked as "never the relief valve's own cancellation
+/// target" if a worker-abort mechanism is added later. See the module doc and
+/// #167 for why the worker-abort (a `select!`-on-cancel that drops the
+/// in-flight `handle_line` future) was *not* added: it would suppress the
+/// cancelled query's error response that the host reads (the documented
+/// `#126` contract — a cancelled query returns its `57014` response), so the
+/// "server ignores `pg_cancel_backend`" gap is left as a documented
+/// pre-existing limit (matching the builtin) rather than traded for a
+/// contract break.
 async fn run_worker(
     req_rx: Arc<Mutex<mpsc::Receiver<String>>>,
     resp_tx: mpsc::UnboundedSender<String>,
+    _cancellable: bool,
 ) {
     loop {
         let line = {
