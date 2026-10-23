@@ -2,6 +2,80 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.12] - 2026-10-23
+
+### Fixed
+
+- Querying a table with a non-builtin PostgreSQL type (custom `enum`,
+  composite, domain, range, or extension type like `citext` / Supabase
+  `auth.uid`) no longer hangs on a **direct** connection (#166, #168) once
+  the result is large enough to fill tokio-postgres's bounded response
+  channel — the rc.11 fix only covered the transaction-pooler path. The
+  direct path now pre-resolves result column types via a `prepare` on the
+  shared cached client before the `query_typed` data fetch, so
+  tokio-postgres's internal `typeinfo_statement` resolves in a clean window
+  (not mid-stream) and the cache hit makes `get_type` return early. Same
+  mechanism the `in_transaction` batch path uses; preserves pool reuse and
+  has zero overhead on builtin types.
+
+- A batch or interactive-transaction session on a transaction-mode pooler
+  no longer deadlocks on a wide non-builtin-typed table (#169, #172) — the
+  rc.11 #166 fix and the rc.10 #164 one-shot path both only covered
+  non-session single result-set queries. `run_batch_in_session` now makes
+  the same per-query routing decision as the single-query path: a
+  result-set query inside an open transaction pre-resolves on the shared
+  client (the user's `BEGIN` pins the backend); one with no open
+  transaction routes to the one-shot pinned path. The empty-rows
+  column-discovery fallback is guarded for the session-pinned pooler case.
+
+- A bare batch (no `session_id`, no `BEGIN`) that sets session-local state
+  in an earlier statement — a session `SET` (not `SET LOCAL`) or a
+  `CREATE TEMP[ORARY] TABLE` — then runs a result-set `SELECT` no longer
+  silently loses that state on a `pooler_mode = transaction` connection
+  (#173, #174). The rc.11 #172 fix routed the `SELECT` to a fresh one-shot
+  connection that never saw the `SET`/temp table (wrong precision, or
+  `relation does not exist`). The fix detects the prior session state and
+  keeps the `SELECT` on the shared batch client with a column-type
+  pre-resolve, restoring `main`'s within-batch guarantee. Handles the
+  optional deprecated `GLOBAL`/`LOCAL` qualifier before `TEMP`/`TEMPORARY`
+  and excludes `SET LOCAL` / `SET TRANSACTION` / `SET CONSTRAINTS`.
+
+- A slow or hung query no longer starves `ping`, `test_connection`,
+  `initialize`, and the `cancel` notification for every connection (#167,
+  #176). The plugin had 4 workers fed by a single shared queue; every RPC
+  type shared them, so 4 stuck calls (any slow query up to the host's 120s
+  timeout) blocked health checks and new connects to *other* databases —
+  and the `cancel` notification that's meant to relieve the stuck workers
+  queued behind them (a deadlock: only quitting Tabularis freed the
+  workers). RPCs are now routed by method into three lanes before a worker
+  pulls the line: a dedicated cancel lane (the relief valve, never queued
+  behind the workers it relieves), a 2-worker lifecycle lane
+  (`ping`/`test_connection`/`initialize`/`shutdown`), and the existing
+  4-worker general lane. The `SHUTDOWN_GRACE` drain (#155) covers all
+  lanes' worker handles.
+
+### Known limitations
+
+- A bare `[SET, SELECT]` or `[CREATE TEMP TABLE, SELECT]` batch on a
+  **real** PgBouncer (`pool_mode = transaction`, not the direct +
+  `pooler_mode = transaction` flag config) can still lose session state
+  between autocommit statements (pre-existing on `main` — the backend is
+  reassigned per transaction) and, in rare cases with non-builtin result
+  column types under backend reassignment *during* the pre-resolve
+  `prepare`, can hang (#175). Wrap such batches in explicit
+  `BEGIN`/`COMMIT` to pin the backend. Tracked as a follow-up; the
+  direct + `pooler_mode = transaction` config (the common use) is
+  unaffected.
+
+- A `SELECT` against a table with a composite type that is `ALTER TYPE`-ed
+  (same OID, new field layout) on a recycled pooled connection can read a
+  stale cached `Type` and produce wrong JSON for the composite's fields
+  (#171). Pre-existing (a tokio-postgres/deadpool cache-invalidation
+  limitation the plugin inherited); the rc.11/#168 pre-resolve widened the
+  cache-warming window but did not introduce the bug. Tracked as a
+  follow-up pending investigation of tokio-postgres's `clear_type_cache`
+  API.
+
 ## [1.0.0-rc.11] - 2026-10-22
 
 ### Fixed
