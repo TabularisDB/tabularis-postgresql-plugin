@@ -16,10 +16,9 @@
 //! - **cancel lane** (1 worker): `cancel` notifications run on a dedicated
 //!   worker that bypasses the general queue. When 4 general workers are
 //!   stuck on slow queries, the cancel still fires `pg_cancel_backend`
-//!   (server-side) AND aborts the stuck worker's in-flight future
-//!   (worker-side, Layer 3) — instead of queuing behind those same 4 stuck
-//!   workers. Without this, stuck workers can't be relieved: the relief valve
-//!   is stuck in the same queue (a deadlock, the core of #167).
+//!   (server-side) — instead of queuing behind those same 4 stuck workers.
+//!   Without this, stuck workers can't be relieved: the relief valve is
+//!   stuck in the same queue (a deadlock, the core of #167).
 //! - **lifecycle lane** (2 workers): `ping`/`test_connection`/`initialize`/
 //!   `shutdown` run on a dedicated lane, so a health check or new connect to
 //!   database B isn't blocked by 4 slow queries against database A. Two
@@ -28,15 +27,16 @@
 //! - **general lane** (4 workers): everything else — metadata, `execute_query`,
 //!   CRUD, DDL, BLOB. The original `WORKER_POOL_SIZE`.
 //!
-//! Every lane's worker wraps `handle_line` in a `select!` on a per-RPC
-//! `CancellationToken` (Layer 3): a host `cancel` notification aborts the
-//! in-flight operation directly, dropping the held `deadpool::Object`
-//! (closing the socket → the server cancels the statement as a side effect)
-//! and freeing the worker immediately — even if the server ignores
-//! `pg_cancel_backend`. The bound is the **host's configurable call-timeout**,
-//! not a plugin constant, so a query the host is willing to wait for (a large
-//! enum-table result, slow DDL) is never cut (#166 stays intact); only a query
-//! the host has given up on is aborted.
+//! A worker stuck on a slow query frees when the server returns `57014`
+//! (the common, cooperative case after `pg_cancel_backend`) or when the
+//! host's per-call timeout elapses. A worker-abort mechanism (dropping the
+//! in-flight `handle_line` future on cancel, to free the worker even when
+//! the server ignores `pg_cancel_backend`) was considered but deliberately
+//! not added: it would suppress the cancelled query's error response that
+//! the host reads (the `#126` contract — a cancelled query returns its
+//! `57014` response). See `cancel::cancel`'s doc for the full rationale. The
+//! "server ignores `pg_cancel_backend`" gap is a documented pre-existing
+//! limit matching the builtin.
 //!
 //! Responses are funneled through a single writer task so concurrent handlers
 //! never interleave bytes on stdout. A dedicated background task periodically
@@ -149,27 +149,24 @@ async fn main() {
     let (resp_tx, resp_rx) = mpsc::unbounded_channel::<String>();
     let mut writer_handle = tokio::spawn(run_writer(resp_rx));
 
-    // General lane: the original 4 workers. Cancellable (Layer 3).
+    // General lane: the original 4 workers.
     let mut worker_handles: Vec<_> = (0..WORKER_POOL_SIZE)
-        .map(|_| tokio::spawn(run_worker(req_rx.clone(), resp_tx.clone(), true)))
+        .map(|_| tokio::spawn(run_worker(req_rx.clone(), resp_tx.clone())))
         .collect();
     // Lifecycle lane: 2 workers (a stuck ping can't starve a test_connection).
-    // Cancellable — a host give-up should abort a stuck ping too.
     for _ in 0..LIFECYCLE_WORKER_COUNT {
         worker_handles.push(tokio::spawn(run_worker(
             lifecycle_rx.clone(),
             resp_tx.clone(),
-            true,
         )));
     }
-    // Cancel lane: 1 worker, NOT cancellable — it's the relief valve; a cancel
-    // must always run to completion (aborting it would re-deadlock the lane it
-    // exists to relieve). `cancellable = false` → `handle_line` runs unwrapped.
-    worker_handles.push(tokio::spawn(run_worker(
-        cancel_rx.clone(),
-        resp_tx.clone(),
-        false,
-    )));
+    // Cancel lane: 1 worker — the relief valve. A cancel notification
+    // (fire-and-forget, fast) runs here so it never queues behind the 4 general
+    // workers it's meant to relieve (#167). One worker is a deliberate
+    // tradeoff: cancel is low-volume, but a `cancel_query` that hangs on a
+    // non-responding handshake blocks the whole lane (see `cancel::run_cancel`
+    // — there is no `connect_timeout` on the fresh cancel connection).
+    worker_handles.push(tokio::spawn(run_worker(cancel_rx.clone(), resp_tx.clone())));
     drop(resp_tx);
 
     run_reader(req_tx, lifecycle_tx, cancel_tx).await;
@@ -241,7 +238,7 @@ fn lane_for(method: Option<&str>) -> Lane {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Lane {
     General,
     Lifecycle,
@@ -291,21 +288,18 @@ async fn run_reader(
     }
 }
 
-/// A worker for one lane. `cancellable` is currently unused (all lanes run
-/// `handle_line` unwrapped); it's retained as a parameter so the cancel lane
-/// is explicitly marked as "never the relief valve's own cancellation
-/// target" if a worker-abort mechanism is added later. See the module doc and
-/// #167 for why the worker-abort (a `select!`-on-cancel that drops the
-/// in-flight `handle_line` future) was *not* added: it would suppress the
-/// cancelled query's error response that the host reads (the documented
-/// `#126` contract — a cancelled query returns its `57014` response), so the
-/// "server ignores `pg_cancel_backend`" gap is left as a documented
-/// pre-existing limit (matching the builtin) rather than traded for a
-/// contract break.
+/// A worker for one lane. All lanes run `handle_line` unwrapped — a
+/// worker-abort mechanism (a `select!`-on-cancel that drops the in-flight
+/// `handle_line` future to free the worker even when the server ignores
+/// `pg_cancel_backend`) was considered for #167 but deliberately not added:
+/// it would suppress the cancelled query's error response that the host
+/// reads (the `#126` contract — a cancelled query returns its `57014`
+/// response), trading a rare failure for a contract break. See the module
+/// doc and `cancel::cancel`'s doc. The "server ignores `pg_cancel_backend`"
+/// gap is left as a documented pre-existing limit (matching the builtin).
 async fn run_worker(
     req_rx: Arc<Mutex<mpsc::Receiver<String>>>,
     resp_tx: mpsc::UnboundedSender<String>,
-    _cancellable: bool,
 ) {
     loop {
         let line = {
@@ -342,5 +336,55 @@ async fn run_writer(mut resp_rx: mpsc::UnboundedReceiver<String>) {
             break;
         }
         let _ = stdout.flush().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lane_for, Lane};
+
+    /// `lane_for` is the routing decision the whole #167 fix depends on, so
+    /// pin each classification directly — the integration tests in
+    /// `tests/worker_starvation.rs` exercise it end-to-end, but a direct unit
+    /// test catches a misrouted method arm that an end-to-end test (especially
+    /// the DB-gated ping test) might skip over in CI.
+
+    #[test]
+    fn cancel_routes_to_cancel_lane() {
+        assert_eq!(lane_for(Some("cancel")), Lane::Cancel);
+    }
+
+    #[test]
+    fn lifecycle_methods_route_to_lifecycle_lane() {
+        assert_eq!(lane_for(Some("ping")), Lane::Lifecycle);
+        assert_eq!(lane_for(Some("test_connection")), Lane::Lifecycle);
+        assert_eq!(lane_for(Some("initialize")), Lane::Lifecycle);
+        assert_eq!(lane_for(Some("shutdown")), Lane::Lifecycle);
+    }
+
+    #[test]
+    fn general_methods_route_to_general_lane() {
+        assert_eq!(lane_for(Some("execute_query")), Lane::General);
+        assert_eq!(lane_for(Some("get_tables")), Lane::General);
+        assert_eq!(lane_for(Some("insert_row")), Lane::General);
+        assert_eq!(lane_for(Some("create_table")), Lane::General);
+        assert_eq!(lane_for(Some("get_blob")), Lane::General);
+    }
+
+    #[test]
+    fn unparseable_lines_route_to_general_lane() {
+        // `peek_method` returns None for unparseable/non-object/missing-method
+        // lines, so `run_reader` passes `None` to `lane_for` — the `_` arm
+        // routes them to the general lane where `handle_line` surfaces the
+        // proper `-32700`/`-32600` error.
+        assert_eq!(lane_for(None), Lane::General);
+    }
+
+    #[test]
+    fn unknown_method_routes_to_general_lane() {
+        // A method `handle_line` doesn't dispatch (e.g. a typo) routes to
+        // general, where `handle_line` returns `-32601 Method not found`.
+        assert_eq!(lane_for(Some("execute")), Lane::General);
+        assert_eq!(lane_for(Some("get_foo")), Lane::General);
     }
 }

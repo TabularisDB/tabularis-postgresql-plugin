@@ -4,18 +4,24 @@
 //! stuck calls (a slow query holding a worker up to the host's 120s timeout)
 //! blocked every subsequent RPC — including a `ping` to a *different*
 //! database and the `cancel` notification that's meant to relieve the stuck
-//! workers. The fix routes `cancel` to a dedicated lane (Layer 1),
+//! workers. The fix routes `cancel` to a dedicated lane (Layer 1) and
 //! `ping`/`test_connection`/`initialize`/`shutdown` to a lifecycle lane
-//! (Layer 2), and wires the `cancel` notification to abort the in-flight
-//! worker operation directly (Layer 3) — so a host give-up frees the worker
-//! even if the server ignores `pg_cancel_backend`.
+//! (Layer 2) — so neither queues behind 4 stuck general workers.
+//!
+//! A worker-abort (Layer 3 — dropping the in-flight `handle_line` future on
+//! cancel, to free the worker even if the server ignores `pg_cancel_backend`)
+//! was considered but NOT added: it suppresses the cancelled query's `57014`
+//! error response that the host reads (the `#126` contract). The
+//! "server ignores `pg_cancel_backend`" gap is a documented pre-existing
+//! limit matching the builtin — see `cancel::cancel`'s doc. No test here
+//! exercises a worker-abort; a stuck worker frees only when the server
+//! returns `57014` or the host's call timeout elapses.
 //!
 //! These tests spawn the real plugin binary (like `tests/shutdown.rs`) and
 //! reuse its hanging-listener harness. The hung queries point at a TCP
 //! listener that accepts but never answers the PostgreSQL handshake (a
 //! worker blocks on the handshake read); the healthy `ping` points at the
-//! live database. No DB is needed for the cancel tests (the worker-abort
-//! fires regardless of server cooperation).
+//! live database.
 //!
 //! # Running
 //!
@@ -66,7 +72,6 @@ fn ping_line_live(id: u64) -> String {
     )
 }
 
-
 /// An `execute_query` line (general lane) pointing at `port`. Against the
 /// hanging listener this blocks on the connect handshake, holding a general
 /// worker indefinitely.
@@ -76,11 +81,19 @@ fn execute_query_line(id: u64, port: u16) -> String {
     )
 }
 
-/// A fire-and-forget `cancel` notification (no top-level `id`) carrying the
-/// request id to cancel. This is the form the host sends on its call timeout
-/// (#126); it routes to the cancel lane (Layer 1).
-fn cancel_notification(request_id: u64) -> String {
-    format!("{{\"jsonrpc\":\"2.0\",\"method\":\"cancel\",\"params\":{{\"id\":{request_id}}}}}\n")
+/// A `cancel` sent as a regular JSON-RPC *request* (with a top-level `id`).
+/// `handle_line` dispatches it to the same `cancel` handler the host's
+/// fire-and-forget notification hits, which returns `ok_response(id, Null)` —
+/// a stdout response the test can read. This is what makes the cancel-lane
+/// test observable: a misrouted cancel (sent to the general lane) would queue
+/// behind 4 stuck workers and never respond, where a cancel-lane cancel
+/// responds immediately. No live DB is needed (the cancel is a no-op for
+/// the hung queries — they have no registered `CancelGuard` — but the
+/// handler still returns its response).
+fn cancel_request(id: u64, request_id: u64) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"cancel\",\"params\":{{\"id\":{request_id}}}}}\n"
+    )
 }
 
 /// Layer 2: a `ping`/`test_connection` to a *different* database must NOT
@@ -158,13 +171,22 @@ fn ping_to_another_db_returns_past_four_hung_general_queries() {
     let _ = wait_with_deadline(&mut child, Duration::from_secs(20));
 }
 
-/// Layer 1: a `cancel` notification must NOT queue behind the stuck general
-/// workers it's meant to relieve. Before the fix the cancel shared the same
-/// 4-worker queue, so 4 stuck queries deadlocked the relief valve. With the
-/// cancel lane, the cancel runs on its own worker regardless. (Layer 3 — the
-/// worker-abort — is asserted in the next test.)
+/// Layer 1: a `cancel` must NOT queue behind the stuck general workers it's
+/// meant to relieve. Before the fix the cancel shared the same 4-worker queue,
+/// so 4 stuck queries deadlocked the relief valve. With the cancel lane, the
+/// cancel runs on its own worker regardless.
+///
+/// To make the routing observable, the cancel is sent as a regular JSON-RPC
+/// *request* (with a top-level `id`), not a fire-and-forget notification: the
+/// `cancel` handler returns `ok_response(id, Null)`, a stdout line the test
+/// reads. If the cancel were misrouted to the general lane (the #167
+/// regression), it would queue behind the 4 stuck workers and never respond —
+/// the read would time out and the test would panic. A cancel-lane cancel
+/// responds immediately. No live DB is needed: the cancel targets a hung
+/// query with no registered `CancelGuard` (a no-op), but the handler still
+/// returns its response on the cancel lane.
 #[test]
-fn cancel_notification_is_not_queued_behind_hung_general_workers() {
+fn cancel_runs_on_its_own_lane_not_behind_hung_general_workers() {
     let (_listener, hung_port) = spawn_hanging_listener();
 
     let mut child = Command::new(plugin_bin())
@@ -174,6 +196,7 @@ fn cancel_notification_is_not_queued_behind_hung_general_workers() {
         .spawn()
         .expect("spawn plugin binary");
     let mut stdin = child.stdin.take().expect("plugin stdin");
+    let stdout = child.stdout.take().expect("plugin stdout");
 
     // Saturate the 4 general workers with hung execute_query calls.
     for id in 1..=4 {
@@ -184,41 +207,43 @@ fn cancel_notification_is_not_queued_behind_hung_general_workers() {
     stdin.flush().expect("flush");
     std::thread::sleep(Duration::from_millis(300));
 
-    // A fire-and-forget cancel for one of the hung queries. Before the fix this
-    // queued behind the 4 stuck workers and never fired; with the cancel lane
-    // it runs immediately. The cancel is a notification (no id) → no stdout
-    // response, so we assert the cancel lane didn't wedge the process: a
-    // wedged cancel lane would backpressure the reader, so a second line
-    // couldn't be written / the process couldn't drain. (The cancel itself is a
-    // no-op for these hung queries — they're stuck on the connect handshake
-    // with no registered `CancelGuard`, so server-side `pg_cancel_backend`
-    // can't fire; only the stdin-EOF drain aborts them. That's the documented
-    // "server ignores cancel" limit, not a regression. The point here is the
-    // cancel *ran* on its own lane without queueing behind the stuck workers.)
-    let cancel = cancel_notification(1);
+    // A cancel sent as a request (id 200) for one of the hung queries. Before
+    // the fix this queued behind the 4 stuck workers and never got a worker;
+    // with the cancel lane it runs immediately and returns its response. The
+    // cancel itself is a no-op for these hung queries (stuck on the connect
+    // handshake with no registered `CancelGuard`, so server-side
+    // `pg_cancel_backend` can't fire — the documented "server ignores cancel"
+    // limit, not a regression), but the handler still returns
+    // `ok_response(200, Null)` on the cancel lane, which is the observable
+    // signal the cancel ran without queueing behind the stuck workers.
+    let cancel = cancel_request(200, 1);
+    let start = Instant::now();
     stdin.write_all(cancel.as_bytes()).expect("write cancel");
     stdin.flush().expect("flush");
 
-    // The cancel lane must have processed it promptly. Give it a moment, then
-    // confirm the process is still accepting input (not wedged). A wedged
-    // cancel lane would backpressure the reader; a second cancel for a
-    // different id should still be writable (the channel isn't full).
-    std::thread::sleep(Duration::from_millis(300));
-    let cancel2 = cancel_notification(2);
-    stdin
-        .write_all(cancel2.as_bytes())
-        .expect("write second cancel — process should still be reading");
-    stdin.flush().expect("flush second cancel");
+    let response =
+        read_stdout_until_marker(stdout, "\"id\":200", PING_DEADLINE).unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!(
+                "cancel (id 200) did not respond within {PING_DEADLINE:?} — the \
+                 cancel lane (#167 Layer 1) regressed: the cancel queued behind \
+                 the 4 stuck general workers instead of running on its own lane"
+            )
+        });
+    let elapsed = start.elapsed();
 
-    // The process must still be draining (the reader didn't wedge). A 5th
-    // execute_query (id 5) writes fine — it queues (the 4 general workers are
-    // still stuck on the handshake, so it won't run), but the write succeeding
-    // proves the reader and cancel lane are healthy. The stuck workers are
-    // cleaned up by the EOF drain below, not by the cancel.
-    stdin
-        .write_all(execute_query_line(5, hung_port).as_bytes())
-        .expect("write 5th execute_query — reader must keep draining");
-    stdin.flush().expect("flush");
+    // The cancel's response carries id 200 and a null result (no error — an
+    // unknown/unregistered cancel id is a no-op, never an error). Assert it
+    // came back promptly, not near the deadline.
+    assert!(
+        response.contains("\"result\""),
+        "expected the cancel's response (id 200, result), got: {response}"
+    );
+    assert!(
+        elapsed < PING_DEADLINE,
+        "cancel took {elapsed:?} — expected a prompt cancel-lane return, not \
+         near the {PING_DEADLINE:?} deadline (the lane regressed)"
+    );
 
     // Cleanup: the process has stuck workers; close stdin to trigger the
     // bounded drain (#155) and exit.

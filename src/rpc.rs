@@ -203,8 +203,10 @@ pub async fn handle_line(line: &str) -> Option<Value> {
 /// routes `None` to the general queue, where `handle_line` surfaces the
 /// proper `-32700`/`-32600` error response — the peek is a routing hint, not
 /// validation. Owns a short `String` (the method name); the allocation is
-/// negligible next to the JSON parse it's already doing, and avoids a second
-/// full parse in `handle_line` (which re-parses for dispatch + response).
+/// negligible next to the JSON parse it's already doing. `handle_line` then
+/// re-parses the line for dispatch + response — the double parse is an
+/// accepted cost of keeping `handle_line`'s signature unchanged (it stays
+/// the single source of truth for parse + dispatch + response).
 pub fn peek_method(line: &str) -> Option<String> {
     let request: Value = serde_json::from_str(line).ok()?;
     let obj = request.as_object()?;
