@@ -1086,3 +1086,251 @@ async fn empty_result_returns_columns_via_session_pinned_batch_on_pooler() {
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression guard for #173 (temp-table case): a bare non-session batch on
+/// a `pooler_mode: "transaction"` connection that creates a temp table in an
+/// earlier statement then selects from it must keep the `SELECT` on the
+/// shared batch connection — not the #172 one-shot path, which runs the
+/// `SELECT` on a fresh connection that never saw the temp table.
+///
+/// On rc.11+#172 this errors `ERROR: relation "t" does not exist` (the
+/// `SELECT` runs on a one-shot connection where `CREATE TEMP TABLE` never
+/// ran). The #173 fix detects the `CREATE TEMP TABLE` as session-local state
+/// and routes the `SELECT` to the shared client with a column-type
+/// pre-resolve, where the temp table is visible.
+///
+/// Run against direct Postgres with `pooler_mode: "transaction"` (the
+/// clearest regression config — one TCP connection = one backend, held —
+/// where `main` preserved within-batch state and #172 broke it). A real
+/// PgBouncer reassigns the backend per autocommit transaction, so the
+/// temp-table-in-a-bare-batch case needs `BEGIN`/`COMMIT` there regardless;
+/// that path is covered by `wide_enum_table_returns_rows_via_session_pinned_
+/// batch_on_pooler`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn temp_table_visible_in_bare_batch_on_pooler() {
+    use crate::client;
+    use crate::handlers::query::execute_query_batch;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // A unique temp-table name so a leftover from a prior run can't mask the
+    // assertion. Temp tables are connection-scoped and dropped at session end,
+    // but the bare batch uses a cached pool client that may survive the test.
+    let table_name = "plugin_test_173_temp_tbl";
+
+    // Ensure no permanent leftover (defensive — temp tables don't persist, but
+    // a prior crashed run could have left a permanent table of the same name).
+    let _ =
+        client::execute_typed(&params, &format!("DROP TABLE IF EXISTS {table_name}"), &[]).await;
+
+    // Bare non-session batch (no `session_id`): `CREATE TEMP TABLE` (a
+    // non-result-set statement → `else` branch on the shared client, sets
+    // `session_state_set`) then `SELECT * FROM t` (result-set → with the fix,
+    // `!in_transaction` + `session_state_set` routes to the shared client,
+    // not the one-shot). On rc.11+#172 the SELECT takes the one-shot path and
+    // errors `relation "t" does not exist`.
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": [
+            format!("CREATE TEMP TABLE {table_name} AS SELECT 1 AS id"),
+            format!("SELECT * FROM {table_name}"),
+        ],
+        "limit": 100,
+        "page": 1,
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &request_params),
+    )
+    .await
+    .expect(
+        "bare [CREATE TEMP TABLE, SELECT] batch hung past 30s on a pooler-mode connection — \
+         the #173 regression is present (the temp-table SELECT misroutes to the one-shot path)",
+    );
+
+    assert!(
+        response.get("error").is_none(),
+        "bare batch should succeed; got: {response}"
+    );
+    // Non-session batch returns a bare `result` array.
+    let results = response
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("non-session batch returns a bare `result` array");
+    assert_eq!(results.len(), 2, "two queries in the batch; got {response}");
+
+    // The CREATE TEMP TABLE statement (non-result-set) returns affected_rows,
+    // no error.
+    let create_result = &results[0];
+    assert!(
+        create_result
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "CREATE TEMP TABLE should not error; got: {create_result}"
+    );
+
+    // The SELECT must succeed and see the temp table on the shared
+    // connection. On rc.11+#172 this is the failing statement (one-shot path
+    // → `relation "t" does not exist`).
+    let select_result = &results[1];
+    assert!(
+        select_result
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "SELECT after CREATE TEMP TABLE should see the temp table (not error \
+         `relation \"t\" does not exist`); got: {select_result}"
+    );
+    let rows = select_result
+        .get("result")
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("the SELECT's result.rows is an array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the temp table has one row; got empty: {select_result}"
+    );
+    assert_eq!(
+        rows[0].as_array().unwrap()[0],
+        json!(1),
+        "the temp table's id column is 1; got: {select_result}"
+    );
+
+    // Teardown. The temp table is connection-scoped; the cached pool client
+    // holds it, so drop it explicitly before clearing the pool entry (a
+    // recycled connection would otherwise carry the temp table to the next
+    // borrower on direct PG). Then evict the pool so no state leaks to other
+    // tests.
+    let _ =
+        client::execute_typed(&params, &format!("DROP TABLE IF EXISTS {table_name}"), &[]).await;
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression guard for #173 (session-SET case): a bare non-session batch on
+/// a `pooler_mode: "transaction"` connection that sets a session GUC in an
+/// earlier statement then reads it back must keep the `SELECT` on the shared
+/// batch connection so it sees the `SET`.
+///
+/// `SET extra_float_digits = 3` (default is `1`) is read back via
+/// `SELECT current_setting('extra_float_digits')`, which returns the GUC's
+/// *current* value as `text`. On rc.11+#172 the `SELECT` runs on a one-shot
+/// connection that never saw the `SET`, so it returns the default `"1"`
+/// (the SET is lost). The #173 fix detects the `SET` as session-local state
+/// and routes the `SELECT` to the shared client where the GUC took effect,
+/// returning `"3"`. The probe is a direct `current_setting` read (not a
+/// value whose rendering the GUC influences), so the assertion is independent
+/// of how the plugin decodes/formats `float8`/`numeric` — it proves the
+/// SELECT ran on the connection that saw the SET, unambiguously.
+///
+/// Run against direct Postgres with `pooler_mode: "transaction"` (the
+/// clearest regression config). A real PgBouncer loses the GUC to backend
+/// reassignment between autocommit statements regardless (pre-existing on
+/// `main`), so the GUC case is not asserted on a real pooler — only the
+/// direct+flag config where `main` preserved it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn session_set_visible_in_bare_batch_on_pooler() {
+    use crate::handlers::query::execute_query_batch;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // Bare non-session batch: `SET extra_float_digits = 3` (non-result-set →
+    // shared client, sets `session_state_set`) then
+    // `SELECT current_setting('extra_float_digits')` (result-set → with the
+    // fix, routes to the shared client, not the one-shot). On rc.11+#172 the
+    // SELECT takes the one-shot path, loses the SET, and returns the default
+    // "1" instead of "3".
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": [
+            "SET extra_float_digits = 3",
+            "SELECT current_setting('extra_float_digits') AS digits",
+        ],
+        "limit": 100,
+        "page": 1,
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &request_params),
+    )
+    .await
+    .expect(
+        "bare [SET, SELECT] batch hung past 30s on a pooler-mode connection — \
+         the #173 regression is present",
+    );
+
+    assert!(
+        response.get("error").is_none(),
+        "bare batch should succeed; got: {response}"
+    );
+    let results = response
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("non-session batch returns a bare `result` array");
+    assert_eq!(results.len(), 2, "two queries in the batch; got {response}");
+
+    let set_result = &results[0];
+    assert!(
+        set_result.get("error").and_then(|e| e.as_str()).is_none(),
+        "SET should not error; got: {set_result}"
+    );
+
+    let select_result = &results[1];
+    assert!(
+        select_result
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "SELECT after SET should not error; got: {select_result}"
+    );
+    let rows = select_result
+        .get("result")
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("the SELECT's result.rows is an array");
+    assert_eq!(rows.len(), 1, "one row; got: {select_result}");
+
+    // `current_setting('extra_float_digits')` returns the GUC's current value
+    // as text: "3" if the SELECT ran on the connection that saw the SET, "1"
+    // (the default) if it ran on a one-shot that lost the SET. Decoded as a
+    // JSON string (text column).
+    let val = &rows[0].as_array().unwrap()[0];
+    assert_eq!(
+        val,
+        &json!("3"),
+        "current_setting('extra_float_digits') should be \"3\" (the SET took \
+         effect on the SELECT's connection); got: {val} — if this is \"1\", the \
+         SELECT ran on a one-shot connection that lost the SET (#173 regression)"
+    );
+
+    // Teardown: evict the pool entry so the SET GUC doesn't leak to other
+    // tests on the cached direct-PG connection.
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
