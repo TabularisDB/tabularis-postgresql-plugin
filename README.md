@@ -1,7 +1,15 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/plus.svg" width="40" height="40" alt="plus" />
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgresql-logo-3colors.png" width="120" height="120" alt="PostgreSQL logo" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis/main/.github/assets/banner-dark.png" />
+    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/.github/assets/banner-light.png" alt="tabularis — the database client your AI agent can actually use" width="600" />
+  </picture>
+
+  <br/>
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgres-banner-dark.svg" />
+    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-postgresql-plugin/main/assets/postgres-banner-light.svg" alt="Native PostgreSQL support" width="600" />
+  </picture>
 </div>
 
 # tabularis-postgresql-plugin
