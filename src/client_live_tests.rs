@@ -659,3 +659,287 @@ async fn wide_enum_table_returns_rows_via_batch_on_direct_connection() {
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression guard for #169: an interactive transaction **session** on a
+/// transaction-mode pooler (`pooler_mode: "transaction"` + `session_id` set)
+/// must not hang on a table with a non-builtin column type and a large
+/// result. The #166 fix (#168) only pre-resolves for non-session single
+/// queries; the #164 pinned one-shot path only covers non-session single
+/// queries. The batch/session path (`run_batch_in_session`) bypassed both,
+/// so a `SELECT *` on a wide enum table inside an open session transaction
+/// still deadlocked.
+///
+/// This test reproduces the reporter's actual scenario: a two-batch session
+/// (`BEGIN` in batch 1, `SELECT *` in batch 2) on a `pooler_mode:
+/// "transaction"` connection, so the SELECT runs on the reused/pinned
+/// connection. The wide-enum table (600 rows × 500-byte pad + the enum
+/// column) triggers the mid-stream `typeinfo_statement` deadlock without
+/// the pre-resolve. rc.11/#168 hangs past 120s on this; the fix pre-resolves
+/// via `prepare` inside the user's open transaction (the backend is pinned,
+/// so the named statement can't be orphaned) → returns cleanly.
+///
+/// Run against direct Postgres with `pooler_mode: "transaction"` (the
+/// `pooler_mode` flag routes through the pooler code paths even without a
+/// real pooler; the deadlock is a tokio-postgres interleave, not
+/// pooler-specific, so direct PG reproduces it).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn wide_enum_table_returns_rows_via_session_pinned_batch_on_pooler() {
+    use crate::client;
+    use crate::handlers::query::{execute_query_batch, release_session};
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    let type_name = "plugin_test_169_session_mood";
+    let table_name = "plugin_test_169_session_enum_table";
+    let session_id = "test-169-session-pinned";
+
+    // Setup: same wide-table fixture as the #166 tests (600 rows × 500-byte
+    // pad + the enum column — enough to fill the channel buffer and trigger
+    // the mid-stream get_type deadlock without the pre-resolve).
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+        format!("CREATE TYPE {type_name} AS ENUM ('happy', 'sad')"),
+        format!(
+            "CREATE TABLE {table_name} AS SELECT g AS id, 'happy'::{type_name} AS m, \
+             repeat('x', 500) AS pad FROM generate_series(1, 600) g"
+        ),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    // Batch 1: BEGIN (opens a transaction, pins the connection to the session).
+    let begin_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["BEGIN"],
+        "session_id": session_id,
+        "limit": 100,
+        "page": 1,
+    });
+    let begin_resp = execute_query_batch(json!(1), &begin_params).await;
+    assert!(
+        begin_resp.get("error").is_none(),
+        "BEGIN batch should succeed; got: {begin_resp}"
+    );
+
+    // Batch 2: SELECT * on the wide enum table, same session (reused/pinned
+    // connection). This is the hanging case on rc.11/#168: the batch path
+    // passes is_transaction_pooler=true to exec_query_on_client, skipping the
+    // pre-resolve → query_typed fires typeinfo_statement mid-stream on the
+    // wide result → deadlock. With the fix, reused=true → the pre-resolve
+    // prepare fires inside the user's open transaction (backend pinned) → no
+    // mid-stream typeinfo_statement → returns cleanly.
+    let select_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": [format!("SELECT * FROM {table_name}")],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let select_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(2), &select_params),
+    )
+    .await
+    .expect(
+        "session-pinned SELECT on a wide enum table hung past 30s on a pooler-mode connection — \
+         the #169 regression is present (the session-pinned pre-resolve is missing or broken)",
+    );
+
+    assert!(
+        select_resp.get("error").is_none(),
+        "session-pinned SELECT batch should succeed; got: {select_resp}"
+    );
+    // Session-aware batch returns {results, in_transaction}.
+    let results = select_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("session-aware batch returns result.results");
+    assert_eq!(
+        results.len(),
+        1,
+        "one query in the batch; got {select_resp}"
+    );
+    let first = &results[0];
+    assert!(
+        first.get("error").and_then(|e| e.as_str()).is_none(),
+        "the SELECT should not error; got: {first}"
+    );
+    let rows = first
+        .get("result")
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("the query's result.rows is an array");
+    assert!(
+        !rows.is_empty(),
+        "the wide enum-typed table has 600 rows; got empty rows: {first}"
+    );
+    assert_eq!(
+        rows[0].as_array().unwrap()[1],
+        json!("happy"),
+        "enum column should decode to \"happy\"; got: {first}"
+    );
+
+    // Batch 3: ROLLBACK (ends the transaction, releases the pin).
+    let rollback_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["ROLLBACK"],
+        "session_id": session_id,
+        "limit": 100,
+        "page": 1,
+    });
+    let _ = execute_query_batch(json!(3), &rollback_params).await;
+
+    // Release the session (frees the pinned connection).
+    let _ = release_session(json!(4), &json!({"session_id": session_id})).await;
+
+    // Teardown.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+    ] {
+        let _ = client::execute_typed(&params, &stmt, &[]).await;
+    }
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression guard for #169 (non-session sub-case): a non-session batch
+/// (`session_id` absent) on a transaction-mode pooler must route result-set
+/// queries to the one-shot pinned path (`exec_query_pooled_txn`), not the
+/// shared cached client (where a plain `prepare` would collide across
+/// backend reassignment). This is the batch-path equivalent of the existing
+/// `pooled_txn_enum_column_returns_rows` test (which covers the single-query
+/// `exec_query` routing).
+///
+/// Without the fix, a non-session pooler batch's result-set query would run
+/// `query_typed` on the shared cached client with no pre-resolve → the same
+/// mid-stream `typeinfo_statement` deadlock on wide non-builtin results. With
+/// the fix, `reused=false` + `is_transaction_pooler()` + `returns_result_set`
+/// routes to `exec_query_pooled_txn` (one-shot client, BEGIN/prepare/
+/// query_typed/COMMIT) → returns cleanly.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn wide_enum_table_returns_rows_via_non_session_batch_on_pooler() {
+    use crate::client;
+    use crate::handlers::query::execute_query_batch;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    let type_name = "plugin_test_169_nosession_mood";
+    let table_name = "plugin_test_169_nosession_enum_table";
+
+    // Setup: same wide-table fixture (600 rows × 500-byte pad + enum column).
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+        format!("CREATE TYPE {type_name} AS ENUM ('happy', 'sad')"),
+        format!(
+            "CREATE TABLE {table_name} AS SELECT g AS id, 'happy'::{type_name} AS m, \
+             repeat('x', 500) AS pad FROM generate_series(1, 600) g"
+        ),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    // Non-session batch (no `session_id`): `reused=false` +
+    // `is_transaction_pooler()` + `returns_result_set` → routes to
+    // `exec_query_pooled_txn` (one-shot client + BEGIN/prepare/query_typed/
+    // COMMIT). The wide enum table at limit 50 is the hanging case without
+    // the routing.
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": [format!("SELECT * FROM {table_name}")],
+        "limit": 50,
+        "page": 1,
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &request_params),
+    )
+    .await
+    .expect(
+        "non-session batch SELECT on a wide enum table hung past 30s on a pooler-mode connection — \
+         the #169 regression is present (the non-session batch routing is missing or broken)",
+    );
+
+    assert!(
+        response.get("error").is_none(),
+        "non-session batch should succeed; got: {response}"
+    );
+    // Non-session batch: `ok_response(id, json!(results))` puts the bare
+    // results array under the JSON-RPC `result` field.
+    let results = response
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("non-session batch returns a bare `result` array");
+    assert_eq!(results.len(), 1, "one query in the batch; got {response}");
+    let first = &results[0];
+    assert!(
+        first.get("error").and_then(|e| e.as_str()).is_none(),
+        "the batch query should not error; got: {first}"
+    );
+    let rows = first
+        .get("result")
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("the query's result.rows is an array");
+    assert!(
+        !rows.is_empty(),
+        "the wide enum-typed table has 600 rows; got empty rows: {first}"
+    );
+    assert_eq!(
+        rows[0].as_array().unwrap()[1],
+        json!("happy"),
+        "enum column should decode to \"happy\"; got: {first}"
+    );
+
+    // Teardown.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+    ] {
+        let _ = client::execute_typed(&params, &stmt, &[]).await;
+    }
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}

@@ -158,14 +158,75 @@ async fn run_batch_in_session(
     let mut results: Vec<Value> = Vec::new();
     for query in queries {
         let start = Instant::now();
-        let outcome = exec_query_on_client(
-            &pg_client,
-            query,
-            limit,
-            page,
-            conn_params.is_transaction_pooler(),
-        )
-        .await;
+
+        // On a transaction-mode pooler, a result-set query with non-builtin
+        // column types needs its column types pre-resolved before the data
+        // fetch, or `query_typed`'s internal `typeinfo_statement` fires
+        // mid-stream and deadlocks on large results (#169, same root as
+        // #166/#168). `exec_query` routes single queries to the one-shot
+        // pinned path (`exec_query_pooled_txn`) for this; the batch path
+        // bypasses `exec_query`, so it makes the same routing decision here.
+        // Two sub-cases, keyed on `in_transaction` (not `reused`):
+        //
+        // * `in_transaction` (the user's `BEGIN` has pinned the backend on
+        //   this shared connection — either a session-pinned batch reusing a
+        //   prior `BEGIN`, or a bare batch whose earlier statement was
+        //   `BEGIN`): a plain `prepare` inside that transaction is safe (no
+        //   reassignment can orphan the named statement) and keeps the
+        //   SELECT on the same connection where transaction-local state
+        //   (temp tables, SET variables) is visible. Run
+        //   `exec_query_on_client` with `pre_resolve_types = true`.
+        // * Not `in_transaction` (no open transaction pins the backend): a
+        //   plain `prepare` could collide across reassignment (the `s0`→`s1`
+        //   shift that killed the removed pre-warm, ca33b98). Route to the
+        //   one-shot pinned path (`exec_query_pooled_txn`) — the proven
+        //   #164 mechanism. The one-shot client dies with its stale
+        //   client-side type cache; the shared batch client sits idle for
+        //   that one query (acceptable: correctness over connection reuse
+        //   for one statement; when there's no transaction there's no
+        //   transaction-local state to lose by using a different connection).
+        //
+        // Non-result-set statements (DDL, writes) and direct connections
+        // stay on the shared cached client — the unnamed protocol is
+        // pooler-safe and needs no pinning (#149, #168).
+        let outcome = if conn_params.is_transaction_pooler() && returns_result_set(query) {
+            if in_transaction {
+                // The user's open transaction pins the backend on this
+                // connection. Pre-resolve column types via `prepare` inside
+                // it (safe — no reassignment can orphan the named statement)
+                // so `query_typed`'s `get_type` is a cache hit (no mid-stream
+                // `typeinfo_statement`, no deadlock). Keeps the SELECT on the
+                // shared connection where transaction-local state is visible.
+                exec_query_on_client(
+                    &pg_client,
+                    query,
+                    limit,
+                    page,
+                    conn_params.is_transaction_pooler(),
+                    /* pre_resolve_types = */ true,
+                )
+                .await
+            } else {
+                // No open transaction pins the backend. Route to the one-shot
+                // pinned path. The one-shot client acquired inside
+                // `exec_query_pooled_txn` is its own connection (never
+                // returned to a pool, so no stale client-side type cache
+                // hazard — #164's core property).
+                exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id).await
+            }
+        } else {
+            // Non-result-set (DDL, writes) or direct connection — the
+            // unnamed protocol is pooler-safe and needs no pre-resolve.
+            exec_query_on_client(
+                &pg_client,
+                query,
+                limit,
+                page,
+                conn_params.is_transaction_pooler(),
+                !conn_params.is_transaction_pooler(),
+            )
+            .await
+        };
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         in_transaction =
@@ -336,6 +397,7 @@ async fn exec_query(
         limit,
         page,
         conn_params.is_transaction_pooler(),
+        !conn_params.is_transaction_pooler(),
     )
     .await
 }
@@ -505,8 +567,17 @@ async fn run_pinned_body(
     }
 
     // Data fetch: unnamed protocol (#149's pooler-safe path). Binary Row
-    // decoding + extract_value unchanged.
-    let result = exec_query_on_client(pg_client, query, limit, page, is_transaction_pooler).await;
+    // Decoding + extract_value unchanged. `pre_resolve_types = false` because
+    // `run_pinned_body` already pre-resolved via its own `prepare` above.
+    let result = exec_query_on_client(
+        pg_client,
+        query,
+        limit,
+        page,
+        is_transaction_pooler,
+        /* pre_resolve_types = */ false,
+    )
+    .await;
 
     // Clear the statements `prepare` created before COMMIT. Errors here are
     // non-fatal — the one-shot client drops and closes regardless. Log and
@@ -651,12 +722,22 @@ async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), Str
 }
 
 /// Execute a query on an existing client (used by both single and batch execution).
+///
+/// `is_transaction_pooler` selects error-message phrasing (definitive when
+/// the host declared a transaction pooler, conditional when it didn't).
+/// `pre_resolve_types` controls whether column types are pre-resolved via
+/// `prepare` before the `query_typed` data fetch (#166/#168). The two are
+/// independent: a session-pinned pooler connection passes
+/// `is_transaction_pooler = true` (for correct error phrasing) AND
+/// `pre_resolve_types = true` (because the backend is pinned by the user's
+/// open transaction, so the `prepare` is safe) — see `run_batch_in_session`.
 async fn exec_query_on_client(
     pg_client: &PgClient,
     query: &str,
     limit: Option<u32>,
     page: u32,
     is_transaction_pooler: bool,
+    pre_resolve_types: bool,
 ) -> Result<Value, String> {
     // Check if the statement returns a result set
     if !returns_result_set(query) {
@@ -730,7 +811,7 @@ async fn exec_query_on_client(
     // regardless of the `Statement`'s lifetime — `Statement::Drop` sends a
     // server `Close` but does not clear `CachedTypeInfo.types` — so holding
     // it alive is for `.columns()` reuse, not cache persistence.)
-    let prepared = if !is_transaction_pooler {
+    let prepared = if pre_resolve_types {
         pg_client.prepare(&final_query).await.ok()
     } else {
         None
@@ -751,19 +832,22 @@ async fn exec_query_on_client(
         .map_err(|e| client::format_query_error(&e, is_transaction_pooler))?;
 
     if rows.is_empty() {
-        // Get columns from the statement if possible. On a direct connection
-        // the pre-resolve above already prepared `final_query`, so reuse its
-        // `.columns()` instead of preparing a second time. On a transaction-
-        // mode pooler, `prepare()` is skipped (its named statement would
-        // collide across backend reassignment) and `columns: []` is returned
-        // — the host handles empty columns gracefully (#157, tabularis#1097).
+        // Get columns from the statement if possible. When the pre-resolve
+        // ran and succeeded, reuse its `.columns()` instead of preparing a
+        // second time. When the pre-resolve didn't run (or failed), try once
+        // more for column discovery only if `prepare` is safe here (direct
+        // connections, or session-pinned pooler connections where the backend
+        // is pinned). On a transaction-mode pooler where `prepare` is unsafe
+        // (the one-shot path handles its own pre-resolve), return `columns:
+        // []` — the host handles empty columns gracefully (#157,
+        // tabularis#1097).
         let columns: Vec<String> = if let Some(stmt) = prepared.as_ref() {
             stmt.columns()
                 .iter()
                 .map(|c| c.name().to_string())
                 .collect()
-        } else if !is_transaction_pooler {
-            // Pre-resolve didn't run or failed; try once more for column
+        } else if pre_resolve_types {
+            // Pre-resolve was attempted but failed; try once more for column
             // discovery (the pre-#166 behavior for direct empty result sets).
             if let Ok(stmt) = pg_client.prepare(&final_query).await {
                 stmt.columns()
