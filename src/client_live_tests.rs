@@ -549,3 +549,113 @@ async fn wide_enum_table_returns_rows_on_direct_connection() {
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression guard for #166 via the **batch** path: `execute_query_batch`
+/// routes through `run_batch_in_session` → `exec_query_on_client` (bypassing
+/// `exec_query`), so a wide enum result on a direct connection must return rows
+/// through the batch path too, not hang. The single-query test above covers
+/// `exec_query` → `exec_query_on_client`; this one covers the batch caller,
+/// which is a distinct path with its own connection handling. If the
+/// pre-resolve were removed from the batch path specifically (e.g.
+/// `run_batch_in_session` started passing `is_transaction_pooler = true` to
+/// skip it), this test would hang past 30s.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn wide_enum_table_returns_rows_via_batch_on_direct_connection() {
+    use crate::client;
+    use crate::handlers::query::execute_query_batch;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    let type_name = "plugin_test_166b_wide_mood";
+    let table_name = "plugin_test_166b_wide_enum_table";
+
+    // Same wide-table setup as the single-query test: 600 rows × 500-byte
+    // pad + the enum column — enough to fill the channel buffer and trigger
+    // the mid-stream `get_type` deadlock without the pre-resolve.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+        format!("CREATE TYPE {type_name} AS ENUM ('happy', 'sad')"),
+        format!(
+            "CREATE TABLE {table_name} AS SELECT g AS id, 'happy'::{type_name} AS m, \
+             repeat('x', 500) AS pad FROM generate_series(1, 600) g"
+        ),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    // `execute_query_batch` with no `session_id` routes through
+    // `run_batch_in_session` → `exec_query_on_client` (the batch caller),
+    // returning a bare `results` array (not the session-aware shape). The
+    // batch contains the wide enum `SELECT` at limit 50 — the hanging case
+    // on rc.11.
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "queries": [format!("SELECT * FROM {table_name}")],
+        "limit": 50,
+        "page": 1,
+    });
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &request_params),
+    )
+    .await
+    .expect(
+        "execute_query_batch on a wide enum-typed table hung past 30s on a direct connection — \
+         the #166 regression is present on the batch path (the pre-resolve is missing or broken)",
+    );
+
+    assert!(
+        response.get("error").is_none(),
+        "execute_query_batch should succeed for a wide enum-typed table; got: {response}"
+    );
+    // Non-session batch: `ok_response(id, json!(results))` puts the bare
+    // results array under the JSON-RPC `result` field (one entry per query).
+    let results = response
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("non-session batch returns a bare `result` array");
+    assert_eq!(results.len(), 1, "one query in the batch; got {response}");
+    let first = &results[0];
+    assert!(
+        first.get("error").and_then(|e| e.as_str()).is_none(),
+        "the batch query should not error; got: {first}"
+    );
+    let rows = first
+        .get("result")
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("the query's result.rows is an array");
+    assert!(
+        !rows.is_empty(),
+        "the wide enum-typed table has 600 rows; got empty rows: {first}"
+    );
+    assert_eq!(
+        rows[0].as_array().unwrap()[1],
+        json!("happy"),
+        "enum column should decode to \"happy\"; got: {first}"
+    );
+
+    // Teardown.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+    ] {
+        let _ = client::execute_typed(&params, &stmt, &[]).await;
+    }
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
