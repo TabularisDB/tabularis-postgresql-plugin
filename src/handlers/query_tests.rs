@@ -524,14 +524,39 @@ fn sets_session_local_state_excludes_set_local() {
     // scoped and the `in_transaction` branch handles it when there is an open
     // transaction. Either way it is not state a *bare-batch* SELECT on a fresh
     // one-shot connection would have seen, so excluding it keeps the routing
-    // on the (cheaper, pooler-safe) one-shot path.
+    // on the (cheaper, pooler-safe) one-shot path. `SET TRANSACTION` /
+    // `SET CONSTRAINTS` are likewise transaction-control verbs, not GUCs —
+    // outside a `BEGIN` they set no session state a later SELECT depends on.
     for query in [
         "SET LOCAL statement_timeout = 5000",
         "SET LOCAL search_path TO analytics",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "SET CONSTRAINTS ALL IMMEDIATE",
     ] {
         assert!(
             !sets_session_local_state(query),
             "{query} is transaction-scoped, not session-local"
+        );
+    }
+}
+
+#[test]
+fn sets_session_local_state_detects_global_local_temp_table() {
+    // PostgreSQL accepts an optional deprecated `GLOBAL`/`LOCAL` qualifier
+    // before `TEMP`/`TEMPORARY` (both still create a session-scoped temp table
+    // — verified against a live database). Without the 4-keyword lookahead
+    // the classifier would miss these and a later `SELECT * FROM t` would hit
+    // the exact #173 `relation does not exist` regression.
+    for query in [
+        "CREATE LOCAL TEMP TABLE t (id int)",
+        "CREATE LOCAL TEMPORARY TABLE t AS SELECT 1 AS id",
+        "CREATE GLOBAL TEMP TABLE t (id int)",
+        "CREATE GLOBAL TEMPORARY TABLE t (id int)",
+    ] {
+        assert!(
+            sets_session_local_state(query),
+            "{query} should count as session-local state (the GLOBAL/LOCAL \
+             qualifier is deprecated noise before TEMP)"
         );
     }
 }
