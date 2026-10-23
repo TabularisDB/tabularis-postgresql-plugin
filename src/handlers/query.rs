@@ -710,8 +710,11 @@ async fn exec_query_on_client(
     // warming `CachedTypeInfo.types` on the shared `InnerClient`. The
     // subsequent `query_typed` then hits that cache (`get_type`'s
     // `client.type_(oid)` returns early) → no `typeinfo_statement` mid-drain
-    // → no deadlock, regardless of result size. This is exactly rc.8's
-    // behavior, which worked.
+    // → no deadlock, regardless of result size. This is equivalent to rc.8's
+    // behavior (rc.8 used the named `query()` path which resolved types in
+    // its prepare's Describe phase; this uses a separate `prepare` + the
+    // unnamed `query_typed`, but the outcome — types resolved before the
+    // data fetch, no mid-stream interleave — is the same), which worked.
     //
     // Gated to direct connections: on a transaction-mode pooler a plain
     // `prepare`'s named statement collides across backend reassignment (the
@@ -721,9 +724,12 @@ async fn exec_query_on_client(
     // `query_typed` below runs anyway — for builtin types `get_type` is always
     // a `Type::from_oid` cache hit (no `typeinfo_statement`, no hang), and a
     // direct prepare failure on a valid result-set query is rare. The
-    // `Statement` is kept alive (not dropped immediately) so its warmed cache
-    // persists into the `query_typed` and its `.columns()` can be reused by
-    // the empty-rows branch below instead of preparing a second time.
+    // `Statement` is kept alive (not dropped immediately) so its `.columns()`
+    // can be reused by the empty-rows branch below instead of preparing a
+    // second time. (The warmed type cache persists on the shared `InnerClient`
+    // regardless of the `Statement`'s lifetime — `Statement::Drop` sends a
+    // server `Close` but does not clear `CachedTypeInfo.types` — so holding
+    // it alive is for `.columns()` reuse, not cache persistence.)
     let prepared = if !is_transaction_pooler {
         pg_client.prepare(&final_query).await.ok()
     } else {
