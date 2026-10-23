@@ -146,8 +146,15 @@ async fn run_batch_in_session(
     // for a reused id can't target a later one. The cancel only needs the
     // token (captured into the action) and the connection params, never the
     // borrowed client.
-    let _cancel_guard =
-        cancel::CancelGuard::register(request_id.as_u64(), &pg_client, conn_params.clone());
+    // Held across the whole batch so a host `cancel(request_id)` can stop the
+    // in-flight shared-client query. Re-armed after each one-shot routing
+    // below (the `!in_transaction` branch) — see there for why it can't be a
+    // single guard.
+    let mut cancel_guard = Some(cancel::CancelGuard::register(
+        request_id.as_u64(),
+        &pg_client,
+        conn_params.clone(),
+    ));
 
     // Applying search_path to a reused connection would run inside the open
     // transaction and change what the rest of it sees.
@@ -197,6 +204,7 @@ async fn run_batch_in_session(
                 // so `query_typed`'s `get_type` is a cache hit (no mid-stream
                 // `typeinfo_statement`, no deadlock). Keeps the SELECT on the
                 // shared connection where transaction-local state is visible.
+                // `cancel_guard` stays registered for this shared client.
                 exec_query_on_client(
                     &pg_client,
                     query,
@@ -212,11 +220,33 @@ async fn run_batch_in_session(
                 // `exec_query_pooled_txn` is its own connection (never
                 // returned to a pool, so no stale client-side type cache
                 // hazard — #164's core property).
-                exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id).await
+                //
+                // Cancel-guard coexistence: `exec_query_pooled_txn` registers
+                // its own `CancelGuard` under the SAME `request_id` we hold
+                // below. `cancel::insert_action` is a `HashMap::insert`
+                // (overwrite), and the one-shot's guard `Drop` removes the
+                // key entirely — so if we kept a single guard across the whole
+                // batch, the one-shot would evict it and every subsequent
+                // shared-client query would lose cancel coverage (#126's
+                // "a late cancel is never a no-op for an in-flight query"
+                // guarantee). Take+drop our guard so the one-shot owns the
+                // map entry while it runs, then re-register for the shared
+                // client before the next iteration.
+                drop(cancel_guard.take());
+                let result =
+                    exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id)
+                        .await;
+                cancel_guard = Some(cancel::CancelGuard::register(
+                    request_id.as_u64(),
+                    &pg_client,
+                    conn_params.clone(),
+                ));
+                result
             }
         } else {
             // Non-result-set (DDL, writes) or direct connection — the
             // unnamed protocol is pooler-safe and needs no pre-resolve.
+            // `cancel_guard` stays registered for this shared client.
             exec_query_on_client(
                 &pg_client,
                 query,
@@ -245,9 +275,12 @@ async fn run_batch_in_session(
             })),
         }
     }
-    // `_cancel_guard` drops here, deregistering the cancel handle before the
+    // `cancel_guard` drops here, deregistering the cancel handle before the
     // connection is re-pinned or released below, so a cancel racing the end
-    // of the batch can't target a query that's already done.
+    // of the batch can't target a query that's already done. It is `Some`
+    // here except after a final one-shot query (which left it `None`); a `None`
+    // drop is a no-op, so the map is clean either way.
+    drop(cancel_guard);
 
     match slot.as_mut() {
         Some(slot) if in_transaction => slot.pin(pg_client),
@@ -371,9 +404,12 @@ async fn exec_query(
     // (#166) — cheaper than the one-shot path (preserves pool reuse) and safe
     // (no backend reassignment to collide with).
     //
-    // Non-result-set statements (DDL, writes) and the batch path
-    // (`run_batch_in_session`, which owns its own transaction) stay on the
-    // shared cached client — `execute_typed` is unnamed and needs no pinning.
+    // Non-result-set statements (DDL, writes) stay on the shared cached
+    // client — `execute_typed` is unnamed and needs no pinning. The batch
+    // path (`run_batch_in_session`) mirrors this routing for its own queries
+    // rather than calling here: a pooler result-set query with no open
+    // transaction routes to `exec_query_pooled_txn`, and one inside an open
+    // transaction pre-resolves on the shared client (see `run_batch_in_session`).
     if conn_params.is_transaction_pooler() && returns_result_set(query) {
         return exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id).await;
     }
@@ -775,16 +811,17 @@ async fn exec_query_on_client(
     };
     let manual_limit = if is_paginated { None } else { limit };
 
-    // Pre-resolve result column types on a *direct* connection (no pooler)
-    // before the data fetch (#166). tokio-postgres's `query_typed` resolves
-    // non-builtin column types (`get_type` → the internal named
-    // `typeinfo_statement`) *inside* its `RowDescription` loop, mid-stream,
-    // over the same channel delivering the query's `DataRow`s. The typeinfo
-    // reply is queued behind the pending rows, but `query_typed` won't read
-    // the rows until `get_type` returns → a deadlock once the row data fills
-    // the bounded `responses` channel + socket buffer (hence the size
-    // threshold — small results pass, large ones hang). This is not
-    // pooler-specific; it deadlocks on any connection.
+    // Pre-resolve result column types before the data fetch (#166 for direct
+    // connections, #169 for session-pinned pooler connections inside an open
+    // transaction). tokio-postgres's `query_typed` resolves non-builtin column
+    // types (`get_type` → the internal named `typeinfo_statement`) *inside*
+    // its `RowDescription` loop, mid-stream, over the same channel delivering
+    // the query's `DataRow`s. The typeinfo reply is queued behind the pending
+    // rows, but `query_typed` won't read the rows until `get_type` returns →
+    // a deadlock once the row data fills the bounded `responses` channel +
+    // socket buffer (hence the size threshold — small results pass, large
+    // ones hang). This is not pooler-specific; it deadlocks on any
+    // connection.
     //
     // `prepare` runs Parse+Describe+Sync with no Execute/no DataRows, so its
     // `get_type` interleave has an empty channel and completes cleanly,
@@ -797,20 +834,31 @@ async fn exec_query_on_client(
     // unnamed `query_typed`, but the outcome — types resolved before the
     // data fetch, no mid-stream interleave — is the same), which worked.
     //
-    // Gated to direct connections: on a transaction-mode pooler a plain
-    // `prepare`'s named statement collides across backend reassignment (the
-    // `s0`→`s1` shift that killed the removed pre-warm, commit ca33b98), so
-    // poolers keep the #164 pinned one-shot path instead. The pre-resolve is
-    // non-fatal on failure: a prepare error is swallowed (`.ok()`) and the
-    // `query_typed` below runs anyway — for builtin types `get_type` is always
-    // a `Type::from_oid` cache hit (no `typeinfo_statement`, no hang), and a
-    // direct prepare failure on a valid result-set query is rare. The
-    // `Statement` is kept alive (not dropped immediately) so its `.columns()`
-    // can be reused by the empty-rows branch below instead of preparing a
-    // second time. (The warmed type cache persists on the shared `InnerClient`
-    // regardless of the `Statement`'s lifetime — `Statement::Drop` sends a
-    // server `Close` but does not clear `CachedTypeInfo.types` — so holding
-    // it alive is for `.columns()` reuse, not cache persistence.)
+    // Gated on `pre_resolve_types`, set by the caller for the two cases where
+    // a plain `prepare` is safe:
+    //  * Direct connections (`!is_transaction_pooler`, the #166 path): no
+    //    backend reassignment to collide with, so a named statement is fine.
+    //  * Session-pinned pooler connections inside an open transaction (the
+    //    #169 batch path, `in_transaction`): the user's `BEGIN` pins the
+    //    backend, so a named statement can't be orphaned by reassignment.
+    // The remaining pooler case — a result-set query with NO open
+    // transaction — can't safely `prepare` on the shared client (the named
+    // statement would collide across the `s0`→`s1` reassignment that killed
+    // the removed pre-warm, commit ca33b98), so `run_batch_in_session` routes
+    // it to the #164 one-shot pinned path instead of setting
+    // `pre_resolve_types`.
+    //
+    // The pre-resolve is non-fatal on failure: a prepare error is swallowed
+    // (`.ok()`) and the `query_typed` below runs anyway — for builtin types
+    // `get_type` is always a `Type::from_oid` cache hit (no
+    // `typeinfo_statement`, no hang), and a prepare failure on a valid
+    // result-set query is rare. The `Statement` is kept alive (not dropped
+    // immediately) so its `.columns()` can be reused by the empty-rows branch
+    // below instead of preparing a second time. (The warmed type cache
+    // persists on the shared `InnerClient` regardless of the `Statement`'s
+    // lifetime — `Statement::Drop` sends a server `Close` but does not clear
+    // `CachedTypeInfo.types` — so holding it alive is for `.columns()` reuse,
+    // not cache persistence.)
     let prepared = if pre_resolve_types {
         pg_client.prepare(&final_query).await.ok()
     } else {
