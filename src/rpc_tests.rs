@@ -1,7 +1,7 @@
 //! Unit tests for `rpc.rs`. Sibling test file per repo convention
 //! (`.rules/rust.md` #4/#5) — loaded via `#[cfg(test)] mod rpc_tests;`.
 
-use super::handle_line;
+use super::{handle_line, peek_method};
 
 /// A non-object JSON-RPC line (array) must produce a `-32600 Invalid Request`
 /// error response, not be silently swallowed as a notification (#135).
@@ -202,5 +202,108 @@ async fn object_with_non_string_method_returns_invalid_request() {
             .and_then(|c| c.as_i64()),
         Some(-32600),
         "a non-string method is an Invalid Request, not a Method Not Found"
+    );
+}
+
+// --- peek_method (#167 routing hint) ----------------------------------------
+//
+// `peek_method` is the routing hint `run_reader` uses to send a line to the
+// cancel lane, lifecycle lane, or general queue before a worker pulls it — so
+// a `cancel` notification is never stuck behind the 4 general workers it's
+// meant to relieve. It returns the method name (Some) for a valid object
+// with a string `method`, None otherwise (parse error / non-object /
+// missing-or-non-string method → general queue, where `handle_line` surfaces
+// the proper error). These tests pin the classification `run_reader` relies on.
+
+#[test]
+fn peek_method_reads_known_methods() {
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"ping","id":1,"params":{}}"#).as_deref(),
+        Some("ping")
+    );
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"test_connection","id":2}"#).as_deref(),
+        Some("test_connection")
+    );
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"initialize","id":3}"#).as_deref(),
+        Some("initialize")
+    );
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"shutdown","id":4}"#).as_deref(),
+        Some("shutdown")
+    );
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"cancel","params":{"id":5}}"#).as_deref(),
+        Some("cancel")
+    );
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"execute_query","id":6,"params":{}}"#).as_deref(),
+        Some("execute_query")
+    );
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"get_tables","id":7}"#).as_deref(),
+        Some("get_tables")
+    );
+}
+
+#[test]
+fn peek_method_reads_a_cancel_notification_with_no_id() {
+    // A fire-and-forget cancel notification (the form the host sends on its
+    // call timeout, #126) has no top-level `id`. `peek_method` must still see
+    // `"cancel"` so `run_reader` routes it to the cancel lane — this is the
+    // relief-valve path #167 depends on.
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","method":"cancel","params":{"id":42}}"#).as_deref(),
+        Some("cancel")
+    );
+}
+
+#[test]
+fn peek_method_returns_none_for_non_object() {
+    // Non-objects route to the general queue, where `handle_line` surfaces
+    // -32600 Invalid Request (#135). The peek must not panic or misclassify.
+    assert_eq!(peek_method("[1,2,3]"), None);
+    assert_eq!(peek_method("42"), None);
+    assert_eq!(peek_method("\"hello\""), None);
+    assert_eq!(peek_method("null"), None);
+    assert_eq!(peek_method("true"), None);
+}
+
+#[test]
+fn peek_method_returns_none_for_parse_error() {
+    // A malformed line routes to the general queue, where `handle_line`
+    // surfaces -32700 parse error.
+    assert_eq!(peek_method("not json"), None);
+    assert_eq!(peek_method(""), None);
+    assert_eq!(peek_method("{"), None);
+}
+
+#[test]
+fn peek_method_returns_none_for_missing_or_non_string_method() {
+    // An object without a string `method` routes to the general queue, where
+    // `handle_line` surfaces -32600 (#137). The peek must not treat a
+    // missing/non-string method as a valid method name.
+    assert_eq!(peek_method(r#"{"jsonrpc":"2.0","id":1}"#), None);
+    assert_eq!(peek_method(r#"{"jsonrpc":"2.0","id":1,"method":42}"#), None);
+    assert_eq!(
+        peek_method(r#"{"jsonrpc":"2.0","id":1,"method":null}"#),
+        None
+    );
+}
+
+#[test]
+fn peek_method_ignores_params_and_other_fields() {
+    // Only `method` matters for routing; params/id/extra fields don't affect it.
+    assert_eq!(
+        peek_method(
+            r#"{"jsonrpc":"2.0","method":"ping","params":{"host":"db","port":5432},"id":99}"#
+        )
+        .as_deref(),
+        Some("ping")
+    );
+    assert_eq!(
+        peek_method(r#"{"method":"execute_query","extra":"ignored","id":1}"#).as_deref(),
+        Some("execute_query")
     );
 }

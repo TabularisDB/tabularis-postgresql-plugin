@@ -124,6 +124,18 @@ async fn run_cancel(token: CancelToken, params: ConnectionParams) {
 /// registered, e.g. a metadata call, which doesn't run through
 /// `CancelGuard`) are a no-op: there is nothing meaningful to report back
 /// either way.
+///
+/// This is the server-side half of cancellation: `pg_cancel_backend` over a
+/// fresh connection. The host owns *when* to give up (its configurable call
+/// timeout); this owns *how* to stop the backend statement (#126). The
+/// worker frees when the server returns `57014` (the common, cooperative
+/// case). A worker-abort mechanism (dropping the in-flight `handle_line`
+/// future on cancel) was considered for the "server ignores cancel" case
+/// (#167) but deliberately not added: it would suppress the cancelled
+/// query's error response that the host reads (the documented `#126`
+/// contract — a cancelled query returns its `57014` response), trading a
+/// rare failure for a contract break. The "server ignores cancel" gap is
+/// left as a documented pre-existing limit matching the builtin.
 pub async fn cancel(request_id: u64) {
     let action = match HANDLES.lock() {
         Ok(mut handles) => handles.remove(&request_id),
