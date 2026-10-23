@@ -293,12 +293,22 @@ async fn exec_query(
     // Transaction-pooler result-set queries take a pinned one-shot path
     // (#160 / #163): tokio-postgres's internal cached named `typeinfo_statement`
     // — fired for non-builtin result column types (custom enums, composites,
-    // extension types like `citext`/Supabase `auth.uid`) — collides with stale
-    // server-side prepared statements across pooler backend reassignment, or
-    // hangs on Supavisor. Pinning the backend with an explicit transaction,
-    // clearing stale statements, pre-resolving column types, then running the
-    // #149-unnamed data fetch on a connection that is *not* returned to the
-    // pool closes that. See `exec_query_pooled_txn`.
+    // extension types like `citext`/Supabase `auth.uid`) — can deadlock when
+    // it's fired mid-stream during `Row` deserialization (the typeinfo reply is
+    // queued behind the query's `DataRow`s, but `query_typed` won't drain them
+    // until `get_type` returns → deadlock once the row data fills the channel
+    // buffer). On a transaction-mode pooler the same interleave additionally
+    // orphans the statement across backend reassignment (`42P05` on PgBouncer,
+    // or a hang on Supavisor). Pinning the backend with an explicit
+    // transaction, clearing stale statements, pre-resolving column types, then
+    // running the #149-unnamed data fetch on a connection that is *not*
+    // returned to the pool closes the pooler case. See `exec_query_pooled_txn`.
+    //
+    // Direct (non-pooler) result-set queries have the same interleave but no
+    // reassignment hazard, so they pre-resolve column types via a plain
+    // `prepare` on the shared cached client inside `exec_query_on_client`
+    // (#166) — cheaper than the one-shot path (preserves pool reuse) and safe
+    // (no backend reassignment to collide with).
     //
     // Non-result-set statements (DDL, writes) and the batch path
     // (`run_batch_in_session`, which owns its own transaction) stay on the
@@ -684,6 +694,42 @@ async fn exec_query_on_client(
     };
     let manual_limit = if is_paginated { None } else { limit };
 
+    // Pre-resolve result column types on a *direct* connection (no pooler)
+    // before the data fetch (#166). tokio-postgres's `query_typed` resolves
+    // non-builtin column types (`get_type` → the internal named
+    // `typeinfo_statement`) *inside* its `RowDescription` loop, mid-stream,
+    // over the same channel delivering the query's `DataRow`s. The typeinfo
+    // reply is queued behind the pending rows, but `query_typed` won't read
+    // the rows until `get_type` returns → a deadlock once the row data fills
+    // the bounded `responses` channel + socket buffer (hence the size
+    // threshold — small results pass, large ones hang). This is not
+    // pooler-specific; it deadlocks on any connection.
+    //
+    // `prepare` runs Parse+Describe+Sync with no Execute/no DataRows, so its
+    // `get_type` interleave has an empty channel and completes cleanly,
+    // warming `CachedTypeInfo.types` on the shared `InnerClient`. The
+    // subsequent `query_typed` then hits that cache (`get_type`'s
+    // `client.type_(oid)` returns early) → no `typeinfo_statement` mid-drain
+    // → no deadlock, regardless of result size. This is exactly rc.8's
+    // behavior, which worked.
+    //
+    // Gated to direct connections: on a transaction-mode pooler a plain
+    // `prepare`'s named statement collides across backend reassignment (the
+    // `s0`→`s1` shift that killed the removed pre-warm, commit ca33b98), so
+    // poolers keep the #164 pinned one-shot path instead. The pre-resolve is
+    // non-fatal on failure: a prepare error is swallowed (`.ok()`) and the
+    // `query_typed` below runs anyway — for builtin types `get_type` is always
+    // a `Type::from_oid` cache hit (no `typeinfo_statement`, no hang), and a
+    // direct prepare failure on a valid result-set query is rare. The
+    // `Statement` is kept alive (not dropped immediately) so its warmed cache
+    // persists into the `query_typed` and its `.columns()` can be reused by
+    // the empty-rows branch below instead of preparing a second time.
+    let prepared = if !is_transaction_pooler {
+        pg_client.prepare(&final_query).await.ok()
+    } else {
+        None
+    };
+
     // Execute query
     // Unnamed-statement protocol (`query_typed`) — pooler-safe under
     // transaction-mode poolers (PgBouncer); see `client`'s module note
@@ -699,31 +745,20 @@ async fn exec_query_on_client(
         .map_err(|e| client::format_query_error(&e, is_transaction_pooler))?;
 
     if rows.is_empty() {
-        // Get columns from the statement if possible. `prepare`'s own
-        // `Parse + Describe + Sync` round-trip is pooler-safe for built-in
-        // column types (the metadata returns before the `ReadyForQuery`
-        // that lets a transaction-mode pooler reassign), and the
-        // `Statement`'s `Drop` sends a fire-and-forget `Close` whose
-        // response is harmlessly discarded (`let _ =` in
-        // `StatementInner::drop`). But for user-defined types (custom
-        // enums/composites), `prepare` internally calls `get_type`, which
-        // triggers tokio-postgres's cached `typeinfo_statement` — a named
-        // statement prepared and executed across separate Syncs, the same
-        // pooler-unsafe pattern this PR eliminates elsewhere. That path is
-        // a tokio-postgres 0.7 limitation (see the module note in
-        // `client.rs`).
-        //
-        // On a transaction-mode pooler connection, skip `prepare()`
-        // entirely and return `columns: []` — the host handles empty
-        // columns gracefully, and avoiding `prepare()` eliminates the
-        // plugin's own named-statement trigger (#157, tabularis#1097).
-        // The remaining trigger (tokio-postgres's internal
-        // `typeinfo_statement` during `Row` deserialization on the
-        // non-empty-rows path) is handled by the error-message rewrite
-        // above + `max_prepared_statements` on the pooler side. On direct
-        // connections, `prepare()` is still used (it's safe there and
-        // gives better column discovery for empty result sets).
-        let columns: Vec<String> = if !is_transaction_pooler {
+        // Get columns from the statement if possible. On a direct connection
+        // the pre-resolve above already prepared `final_query`, so reuse its
+        // `.columns()` instead of preparing a second time. On a transaction-
+        // mode pooler, `prepare()` is skipped (its named statement would
+        // collide across backend reassignment) and `columns: []` is returned
+        // — the host handles empty columns gracefully (#157, tabularis#1097).
+        let columns: Vec<String> = if let Some(stmt) = prepared.as_ref() {
+            stmt.columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect()
+        } else if !is_transaction_pooler {
+            // Pre-resolve didn't run or failed; try once more for column
+            // discovery (the pre-#166 behavior for direct empty result sets).
             if let Ok(stmt) = pg_client.prepare(&final_query).await {
                 stmt.columns()
                     .iter()

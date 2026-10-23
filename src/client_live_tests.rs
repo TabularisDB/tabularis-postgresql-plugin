@@ -431,3 +431,121 @@ async fn pooled_txn_ddl_stays_off_the_pinned_path() {
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression guard for #166: a `SELECT *` on a table with a custom `enum`
+/// column **and wide rows** (enough total bytes to fill tokio-postgres's
+/// bounded `responses` channel + the socket buffer) must return rows on a
+/// *direct* connection (no pooler, Pooler Mode not set), not hang.
+///
+/// The failure mode (#166, the rc.11 gap): tokio-postgres's `query_typed`
+/// resolves non-builtin column types (`get_type` → the internal named
+/// `typeinfo_statement`) *inside* its `RowDescription` loop, mid-stream over
+/// the same channel delivering the query's `DataRow`s. The typeinfo reply is
+/// queued behind the pending rows, but `query_typed` won't drain the rows
+/// until `get_type` returns → a deadlock once the row data fills the buffer
+/// (hence the size threshold — a single tiny row passes on the broken path,
+/// which is why `query_with_nonbuiltin_enum_column_returns_rows` above didn't
+/// catch the rc.11 regression). The fix pre-resolves column types via a
+/// `prepare` on the shared cached client before the data fetch, so the
+/// `query_typed`'s `get_type` is a cache hit and never fires
+/// `typeinfo_statement` mid-drain.
+///
+/// This test is the wide-variant: 600 rows × a 500-byte `pad` column + the
+/// enum column, fetched at `limit` 50 (≈25 KB, enough to fill the buffer).
+/// rc.11 hangs past 120s on this; the fix returns within 30s.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn wide_enum_table_returns_rows_on_direct_connection() {
+    use crate::client;
+    use crate::handlers::query::execute_query;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    let type_name = "plugin_test_166_wide_mood";
+    let table_name = "plugin_test_166_wide_enum_table";
+
+    // Setup: a custom enum type + a *wide* table (600 rows × 500-byte pad +
+    // the enum column). The width is the load-bearing part — it's what makes
+    // the response large enough to fill the channel buffer and trigger the
+    // mid-stream `get_type` deadlock. A narrow enum table (the existing
+    // test) passes on the broken path and can't catch this regression.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+        format!("CREATE TYPE {type_name} AS ENUM ('happy', 'sad')"),
+        format!(
+            "CREATE TABLE {table_name} AS SELECT g AS id, 'happy'::{type_name} AS m, \
+             repeat('x', 500) AS pad FROM generate_series(1, 600) g"
+        ),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    // Direct connection (no `pooler_mode`) + `limit` 50 (≈25 KB — the
+    // hanging case on rc.11). The fix pre-resolves column types via
+    // `prepare` on the shared cached client so `query_typed`'s `get_type` is
+    // a cache hit; without the fix this hangs past 120s.
+    let request_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "query": format!("SELECT * FROM {table_name}"),
+        "limit": 50,
+        "page": 1,
+    });
+
+    // Fail fast instead of hanging: the bug manifests as a stall past 120s,
+    // so a 30s ceiling catches a regression well before the host-style
+    // timeout would, with headroom for a slow podman container.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query(json!(1), &request_params),
+    )
+    .await
+    .expect(
+        "execute_query on a wide enum-typed table hung past 30s on a direct connection — \
+         the #166 regression is present (the prepare pre-resolve is missing or broken)",
+    );
+
+    assert!(
+        response.get("error").is_none(),
+        "execute_query should succeed for a wide enum-typed table on a direct connection; \
+         got: {response}"
+    );
+    let result = response
+        .get("result")
+        .expect("ok_response carries a `result` object");
+    let rows = result
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .expect("`result.rows` is an array");
+    assert!(
+        !rows.is_empty(),
+        "the wide enum-typed table has 600 rows; got empty rows: {result}"
+    );
+    // The enum value must decode correctly through the binary path.
+    assert_eq!(
+        rows[0].as_array().unwrap()[1],
+        json!("happy"),
+        "enum column should decode to \"happy\"; got: {result}"
+    );
+
+    // Teardown.
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table_name}"),
+        format!("DROP TYPE IF EXISTS {type_name}"),
+    ] {
+        let _ = client::execute_typed(&params, &stmt, &[]).await;
+    }
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
