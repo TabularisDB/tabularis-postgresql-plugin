@@ -1334,3 +1334,369 @@ async fn session_set_visible_in_bare_batch_on_pooler() {
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression test for #170 (the 25P02 transaction-abort cascade, the second
+/// consequence of the `.ok()` prepare swallow found during #172's review).
+///
+/// On a transaction-mode pooler, a session-pinned batch inside an open
+/// transaction (`in_transaction=true`) pre-resolves column types via
+/// `prepare` (PR #172). If the user's query has a Parse-time error (e.g.
+/// `SELECT * FROM nonexistent_table` → SQLSTATE 42P01), the swallowed `prepare`
+/// *aborts the transaction server-side*, then `query_typed` fails with 25P02
+/// ("current transaction is aborted") instead of the real 42P01. Worse:
+/// `transaction_effect("SELECT")=None` keeps `in_transaction=true`, the
+/// aborted connection is re-pinned, and the *next* batch also 25P02s until an
+/// explicit ROLLBACK — a confusing cascade that hides the root cause.
+///
+/// The fix (#170): when `prepare` fails *inside an open transaction*,
+/// short-circuit — ROLLBACK and surface the real prepare error (42P01),
+/// never running `query_typed` into the guaranteed 25P02. The caller then
+/// treats the transaction as closed, so the connection is not re-pinned in
+/// aborted state. Batch 3 (`SELECT 1`) proves that: it must succeed, not
+/// 25P02.
+///
+/// Outside an open transaction (`in_transaction=false`) the swallow is
+/// preserved — a 42P05 on a real PgBouncer bare batch is recoverable because
+/// `query_typed` (unnamed) can still succeed. This test only covers the
+/// `in_transaction=true` case; the recoverable-swallow case is exercised by
+/// the #174 `temp_table`/`session_set` tests.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn prepare_error_in_open_transaction_surfaces_real_sqlstate_not_25p02() {
+    use crate::handlers::query::{execute_query_batch, release_session};
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+    let session_id = "test-170-25p02-cascade";
+
+    // Batch 1: BEGIN (opens a transaction, pins the connection to the session,
+    // sets in_transaction=true for the next batch so the SELECT routes to the
+    // pre-resolve-on-shared-client path with pre_resolve_types=true).
+    let begin_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["BEGIN"],
+        "session_id": session_id,
+        "limit": 100,
+        "page": 1,
+    });
+    let begin_resp = execute_query_batch(json!(1), &begin_params).await;
+    assert!(
+        begin_resp.get("error").is_none(),
+        "BEGIN batch should succeed; got: {begin_resp}"
+    );
+
+    // Batch 2: a SELECT against a nonexistent table inside the open
+    // transaction. The prepare (Parse+Describe+Sync) fails with 42P01
+    // ("relation \"...\" does not exist"). On current code the `.ok()` swallow
+    // discards that error, the transaction is now aborted server-side, and
+    // `query_typed` fails with 25P02 — the user sees "current transaction is
+    // aborted", not the real "does not exist". With the fix, the prepare's
+    // 42P01 is surfaced directly.
+    let select_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["SELECT * FROM plugin_test_170_nonexistent_table"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let select_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(2), &select_params),
+    )
+    .await
+    .expect("the 42P01 batch hung past 30s — unexpected; got: ?");
+    assert!(
+        select_resp.get("error").is_none(),
+        "batch should not top-level error; got: {select_resp}"
+    );
+    let results = select_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("session-aware batch returns result.results");
+    assert_eq!(
+        results.len(),
+        1,
+        "one query in the batch; got: {select_resp}"
+    );
+    let first = &results[0];
+    let err_msg = first
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the SELECT should error (nonexistent table); got: {first}");
+
+    // The headline assertion: the real 42P01 surfaces, NOT the 25P02 cascade.
+    assert!(
+        err_msg.contains("does not exist"),
+        "the error should be the real 42P01 (\"does not exist\"), not the 25P02 \
+         transaction-abort cascade; got: {err_msg:?}"
+    );
+    assert!(
+        !err_msg.contains("current transaction is aborted"),
+        "the error must not be the 25P02 cascade (\"current transaction is \
+         aborted\"); got: {err_msg:?}"
+    );
+
+    // Batch 3: a plain `SELECT 1` on the same session. On current code the
+    // aborted connection was re-pinned (in_transaction stayed true), so this
+    // also 25P02s — the cascade. With the fix, the transaction was closed by
+    // the short-circuit's ROLLBACK and in_transaction was forced false, so
+    // this SELECT runs cleanly.
+    let followup_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["SELECT 1 AS one"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let followup_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(3), &followup_params),
+    )
+    .await
+    .expect("the follow-up SELECT hung past 30s — the connection was likely re-pinned in aborted state (#170 cascade)");
+    assert!(
+        followup_resp.get("error").is_none(),
+        "follow-up batch should not top-level error; got: {followup_resp}"
+    );
+    let followup_results = followup_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("follow-up batch returns result.results");
+    let followup_first = &followup_results[0];
+    assert!(
+        followup_first
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "the follow-up SELECT must succeed (the connection was NOT re-pinned in \
+         aborted state); got: {followup_first}"
+    );
+    let followup_rows = followup_first
+        .get("result")
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("follow-up result.rows is an array");
+    assert_eq!(
+        followup_rows[0].as_array().unwrap()[0],
+        json!(1),
+        "follow-up SELECT 1 returns 1; got: {followup_first}"
+    );
+
+    // Release the session (frees the pinned connection). The fix already
+    // ROLLBACK'd the aborted transaction, so release's own ROLLBACK is a
+    // harmless no-op.
+    let _ = release_session(json!(4), &json!({"session_id": session_id})).await;
+
+    // Teardown: evict the pool entry so no state leaks to other tests.
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression test for #170 hole 2: the empty-rows column-discovery branch's
+/// second `prepare` (the second swallow at `exec_query_on_client`) must be
+/// bounded by `POOLED_TXN_TIMEOUT` when the *first* pre-resolve `prepare`
+/// failed, so a cold type cache can't hang the worker past the host's 120s.
+///
+/// This reproduces a bare batch (`session_state_set`, no open transaction) on
+/// a transaction-mode pooler where the SELECT must stay on the shared client
+/// (to see a prior `SET`/temp table) but targets a nonexistent table: the
+/// first `prepare` 42P01s, the swallow preserves it (the recoverable case —
+/// `in_transaction=false`), and `query_typed` runs. Because the table doesn't
+/// exist `query_typed` also 42P01s (returning rows fails), so we land in the
+/// empty-rows branch's column-discovery `else if pre_resolve_types` arm where
+/// the *second* `prepare` runs — now bounded by the timeout per #170, so a
+/// wedged pooler can't pin the worker. The assertion is simply that this
+/// completes well within the 30s fail-fast ceiling (no hang) and surfaces the
+/// real 42P01 (not a 25P02 cascade — there's no open transaction to abort).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn empty_result_column_discovery_after_prepare_failure_does_not_hang() {
+    use crate::handlers::query::execute_query_batch;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // A bare batch (no `session_id`, so no open transaction) on a
+    // transaction-mode pooler. The `SET` makes `session_state_set=true`, so
+    // the SELECT stays on the shared client (`in_transaction=false`,
+    // `pre_resolve_types=true`) — the recoverable-swallow path. The SELECT
+    // targets a nonexistent table, so both prepares 42P01.
+    let batch_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": [
+            "SET extra_float_digits = 3",
+            "SELECT * FROM plugin_test_170_hole2_nonexistent_table",
+        ],
+        "limit": 50,
+        "page": 1,
+    });
+    // The headline assertion: this completes within 30s (no hang). On the
+    // unfixed code the second prepare is unbounded; on a wedged pooler it
+    // could pin the worker to the host's 120s. Against the live direct-PG
+    // container the prepare fails fast (42P01), so this is a guard that the
+    // bounded path stays bounded and surfaces the real error, not a
+    // 25P02 (there's no open transaction to abort).
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &batch_params),
+    )
+    .await
+    .expect("the bare-batch SELECT against a nonexistent table hung past 30s — the #170 hole-2 bound is missing");
+
+    // A bare batch returns a bare `result` array (no session wrapper).
+    let results = resp
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("bare batch returns a result array");
+    // The SET succeeds; the SELECT fails with 42P01.
+    let select_outcome = &results[1];
+    let err_msg = select_outcome
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the SELECT should error (nonexistent table); got: {select_outcome}");
+    assert!(
+        err_msg.contains("does not exist"),
+        "the error should be the real 42P01 (\"does not exist\"); got: {err_msg:?}"
+    );
+    assert!(
+        !err_msg.contains("current transaction is aborted"),
+        "no open transaction here — must not be a 25P02 cascade; got: {err_msg:?}"
+    );
+
+    // Teardown: evict the pool entry.
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression test for #170 on the **direct-connection** batch path inside an
+/// open transaction (the pre-existing surface from #168 the plan said was "also
+/// fixed" but the test-coverage review found untested at the callsite level).
+///
+/// The headline `prepare_error_in_open_transaction_surfaces_real_sqlstate_not_25p02`
+/// test uses `pooler_mode: "transaction"`, which routes through `run_batch_in_session`'s
+/// `if shared_client` arm (`query.rs:244`). A *direct* connection (no `pooler_mode`)
+/// inside a user's `BEGIN` routes through the `else` arm (`query.rs:293`) with
+/// `pre_resolve_types = !is_transaction_pooler() = true` and `in_transaction`
+/// threaded from the batch loop. A prepare failure there aborts the transaction
+/// the same way — this test proves the short-circuit fires on that callsite too,
+/// surfacing the real 42P01 (not 25P02) and not re-pinning the aborted connection.
+///
+/// Uses a bare batch (no `session_id`) so `run_batch_in_session` releases the
+/// connection at batch end (`in_transaction=false` after the short-circuit),
+/// rather than re-pinning it. The follow-up `SELECT 1` would 25P02 on a re-pinned
+/// aborted connection; on a fresh pool connection (the released path) it succeeds.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn prepare_error_in_open_transaction_on_direct_connection_surfaces_real_sqlstate() {
+    use crate::handlers::query::execute_query_batch;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // Bare batch (no `session_id`, no `pooler_mode` → direct connection) with a
+    // `BEGIN` followed by a SELECT against a nonexistent table. The BEGIN opens
+    // a transaction on the shared direct client, so the SELECT routes to the
+    // `else` arm of `run_batch_in_session` with `in_transaction=true` and
+    // `pre_resolve_types=true`. The prepare 42P01s; without the fix the swallow
+    // would cascade to 25P02.
+    let batch_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        // No `pooler_mode` → direct connection, NOT a transaction pooler.
+        "queries": [
+            "BEGIN",
+            "SELECT * FROM plugin_test_170_direct_nonexistent_table",
+        ],
+        "limit": 50,
+        "page": 1,
+    });
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &batch_params),
+    )
+    .await
+    .expect("the bare direct-connection batch hung past 30s — unexpected");
+    assert!(
+        resp.get("error").is_none(),
+        "batch should not top-level error; got: {resp}"
+    );
+    // A bare batch returns a bare `result` array (no session wrapper).
+    let results = resp
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("bare batch returns a result array");
+    assert_eq!(results.len(), 2, "two queries in the batch; got: {resp}");
+
+    // Statement 1: BEGIN succeeds.
+    let begin_outcome = &results[0];
+    assert!(
+        begin_outcome
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "BEGIN should succeed; got: {begin_outcome}"
+    );
+
+    // Statement 2: the SELECT against a nonexistent table. The short-circuit
+    // must fire (in_transaction=true, prepare 42P01) and surface the real 42P01,
+    // not the 25P02 cascade.
+    let select_outcome = &results[1];
+    let err_msg = select_outcome
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the SELECT should error (nonexistent table); got: {select_outcome}");
+    assert!(
+        err_msg.contains("does not exist"),
+        "the error should be the real 42P01 (\"does not exist\"), not the 25P02 \
+         transaction-abort cascade; got: {err_msg:?}"
+    );
+    assert!(
+        !err_msg.contains("current transaction is aborted"),
+        "the error must not be the 25P02 cascade (\"current transaction is \
+         aborted\"); got: {err_msg:?}"
+    );
+
+    // Teardown: evict the pool entry so the aborted-then-ROLLBACK'd connection's
+    // state doesn't leak to other tests on the cached direct-PG connection.
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
