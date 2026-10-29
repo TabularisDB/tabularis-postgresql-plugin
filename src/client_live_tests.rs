@@ -1716,3 +1716,627 @@ async fn prepare_error_in_open_transaction_on_direct_connection_surfaces_real_sq
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression test for #181 — the 25P02 cascade from a `query_typed` *runtime*
+/// error inside an open transaction (the path #170 deliberately left
+/// unchanged; the same cascade class from a different source).
+///
+/// #170 closed the cascade for the **prepare-failure** path: a prepare
+/// Parse-error inside an open transaction aborts it, and #170's short-circuit
+/// surfaces the real error + ROLLBACKs. But a **runtime** error at execute
+/// time (division by zero, a constraint violation surfacing at fetch, a 42P01
+/// on a relation dropped between prepare and fetch) also aborts the
+/// transaction — and #170's `txn_aborted: false` on the `query_typed` error
+/// arm means the caller keeps `in_transaction=true` and re-pins the aborted
+/// connection. The next batch's first statement 25P02s.
+///
+/// This test uses `SELECT 1/0` — syntactically valid, so the pre-resolve
+/// `prepare` *succeeds* (warm cache, `prepare_err=None`), and the 22012
+/// division-by-zero fires at `query_typed` execute. On current code (pre-#181)
+/// the follow-up `SELECT 1` 25P02-cascades; with #181 it succeeds.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn query_typed_runtime_error_in_open_transaction_does_not_cascade() {
+    use crate::handlers::query::{execute_query_batch, release_session};
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+    let session_id = "test-181-runtime-cascade";
+
+    // Batch 1: BEGIN (opens a transaction, pins the connection, sets
+    // in_transaction=true for the next batch).
+    let begin_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["BEGIN"],
+        "session_id": session_id,
+        "limit": 100,
+        "page": 1,
+    });
+    let begin_resp = execute_query_batch(json!(1), &begin_params).await;
+    assert!(
+        begin_resp.get("error").is_none(),
+        "BEGIN batch should succeed; got: {begin_resp}"
+    );
+
+    // Batch 2: SELECT 1/0. The prepare succeeds (syntactically valid →
+    // prepare_err=None → the `else` branch of the `if prepare_err.is_some()`
+    // block in `exec_query_on_client`); the 22012
+    // division-by-zero is a runtime error at execute. Inside the open
+    // transaction, this aborts it server-side. On current code the error
+    // surfaces (the real 22012 — no 25P02 masks it on the *failing*
+    // statement), but `txn_aborted: false` means the connection is re-pinned
+    // in the aborted state. With #181, `txn_aborted: true` forces
+    // in_transaction=false and the connection is released + ROLLBACK'd.
+    let select_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["SELECT 1/0 AS zero"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let select_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(2), &select_params),
+    )
+    .await
+    .expect("the division-by-zero batch hung past 30s — unexpected");
+    assert!(
+        select_resp.get("error").is_none(),
+        "batch should not top-level error; got: {select_resp}"
+    );
+    let results = select_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("session-aware batch returns result.results");
+    assert_eq!(
+        results.len(),
+        1,
+        "one query in the batch; got: {select_resp}"
+    );
+    let first = &results[0];
+    let err_msg = first
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the SELECT 1/0 should error (division by zero); got: {first}");
+
+    // The failing statement surfaces the real 22012 (no 25P02 masks it on
+    // this statement — the cascade is only on the *next* statement).
+    assert!(
+        err_msg.contains("division by zero"),
+        "the error should be the real 22012 (\"division by zero\"); got: {err_msg:?}"
+    );
+
+    // Batch 3: a plain `SELECT 1` on the same session. On current code the
+    // aborted connection was re-pinned (in_transaction stayed true), so this
+    // 25P02-cascades — the user sees "current transaction is aborted" instead
+    // of `1`. With #181, the transaction was closed and the connection
+    // released, so this runs cleanly.
+    let followup_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["SELECT 1 AS one"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let followup_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(3), &followup_params),
+    )
+    .await
+    .expect("the follow-up SELECT hung past 30s — the connection was likely re-pinned in aborted state (#181 cascade)");
+    assert!(
+        followup_resp.get("error").is_none(),
+        "follow-up batch should not top-level error; got: {followup_resp}"
+    );
+    let followup_results = followup_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("follow-up batch returns result.results");
+    let followup_first = &followup_results[0];
+    let followup_err = followup_first.get("error").and_then(|e| e.as_str());
+    assert!(
+        followup_err.is_none(),
+        "the follow-up SELECT must succeed (the connection was NOT re-pinned in \
+         aborted state — the #181 cascade); got: {followup_err:?}"
+    );
+    let followup_rows = followup_first
+        .get("result")
+        .and_then(|r| r.get("rows"))
+        .and_then(|r| r.as_array())
+        .expect("follow-up result.rows is an array");
+    assert_eq!(
+        followup_rows[0].as_array().unwrap()[0],
+        json!(1),
+        "follow-up SELECT 1 returns 1; got: {followup_first}"
+    );
+
+    // Release the session (frees the pinned connection). #181 already
+    // ROLLBACK'd the aborted transaction.
+    let _ = release_session(json!(4), &json!({"session_id": session_id})).await;
+
+    // Teardown: evict the pool entry so no state leaks to other tests.
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression test for #181 on the `execute_typed` (non-result-set) path —
+/// the second of the two error arms #170 left as `txn_aborted: false`. A
+/// failed DDL/write inside an open transaction aborts it server-side; #181
+/// ROLLBACKs and surfaces the real error so the follow-up statement doesn't
+/// 25P02-cascade.
+///
+/// Uses `INSERT INTO ...nonexistent_table` — a non-result-set statement that
+/// 42P01s at execute (the `execute_typed` arm — the `if !returns_result_set`
+/// early-return in `exec_query_on_client`), distinct
+/// from the headline test's `SELECT 1/0` which is a result-set statement
+/// (the `query_typed` arm). Together the two tests cover both #181 arms.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn execute_typed_failure_in_open_transaction_does_not_cascade() {
+    use crate::handlers::query::{execute_query_batch, release_session};
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+    let session_id = "test-181-execute-typed-cascade";
+
+    // Batch 1: BEGIN.
+    let begin_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["BEGIN"],
+        "session_id": session_id,
+        "limit": 100,
+        "page": 1,
+    });
+    let begin_resp = execute_query_batch(json!(1), &begin_params).await;
+    assert!(
+        begin_resp.get("error").is_none(),
+        "BEGIN batch should succeed; got: {begin_resp}"
+    );
+
+    // Batch 2: INSERT into a nonexistent table — a non-result-set statement
+    // that 42P01s at execute (the `execute_typed` arm, not `query_typed`).
+    // Inside the open transaction this aborts it; #181 ROLLBACKs + surfaces
+    // the real 42P01.
+    let insert_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["INSERT INTO plugin_test_181_nonexistent_table VALUES (1)"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let insert_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(2), &insert_params),
+    )
+    .await
+    .expect("the INSERT batch hung past 30s — unexpected");
+    assert!(
+        insert_resp.get("error").is_none(),
+        "batch should not top-level error; got: {insert_resp}"
+    );
+    let results = insert_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("session-aware batch returns result.results");
+    assert_eq!(
+        results.len(),
+        1,
+        "one query in the batch; got: {insert_resp}"
+    );
+    let first = &results[0];
+    let err_msg = first
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the INSERT should error (nonexistent table); got: {first}");
+    assert!(
+        err_msg.contains("does not exist"),
+        "the error should be the real 42P01 (\"does not exist\"); got: {err_msg:?}"
+    );
+    assert!(
+        !err_msg.contains("current transaction is aborted"),
+        "the error must not be the 25P02 cascade; got: {err_msg:?}"
+    );
+    assert!(
+        err_msg.contains("rolled back"),
+        "the error should tell the user the transaction was rolled back; got: {err_msg:?}"
+    );
+
+    // Batch 3: SELECT 1 — must succeed (no 25P02 cascade).
+    let followup_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["SELECT 1 AS one"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let followup_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(3), &followup_params),
+    )
+    .await
+    .expect("the follow-up SELECT hung past 30s — the #181 cascade on the execute_typed path");
+    assert!(
+        followup_resp.get("error").is_none(),
+        "follow-up batch should not top-level error; got: {followup_resp}"
+    );
+    let followup_results = followup_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("follow-up batch returns result.results");
+    let followup_first = &followup_results[0];
+    assert!(
+        followup_first
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "the follow-up SELECT must succeed (the connection was NOT re-pinned in \
+         aborted state — the #181 cascade); got: {followup_first}"
+    );
+
+    let _ = release_session(json!(4), &json!({"session_id": session_id})).await;
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression test for #181 on the **direct-connection** batch path inside an
+/// open transaction (mirroring #170's direct-connection variant). The
+/// headline test uses `pooler_mode: "transaction"`; this one has no
+/// `pooler_mode` (direct connection) but still opens a transaction via a
+/// bare-batch `BEGIN`, exercising the `else` arm of `run_batch_in_session`
+/// with `in_transaction=true` and `pre_resolve_types=true`. A runtime error
+/// (`SELECT 1/0`) must short-circuit the cascade here too.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn query_typed_runtime_error_on_direct_connection_in_txn_does_not_cascade() {
+    use crate::handlers::query::execute_query_batch;
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // Bare batch (no `session_id`, no `pooler_mode` → direct connection) with
+    // BEGIN then SELECT 1/0. The BEGIN opens a transaction on the shared
+    // direct client, so the SELECT routes to the `else` arm with
+    // `in_transaction=true` and `pre_resolve_types=true`. The 22012
+    // division-by-zero fires at execute; #181 ROLLBACKs + forces
+    // `in_transaction=false`, so the connection is released (not re-pinned
+    // aborted) and a follow-up `SELECT 1` succeeds.
+    let batch_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        // No `pooler_mode` → direct connection.
+        "queries": ["BEGIN", "SELECT 1/0 AS zero"],
+        "limit": 50,
+        "page": 1,
+    });
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &batch_params),
+    )
+    .await
+    .expect("the bare direct-connection batch hung past 30s — unexpected");
+    assert!(
+        resp.get("error").is_none(),
+        "batch should not top-level error; got: {resp}"
+    );
+    let results = resp
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("bare batch returns a result array");
+    assert_eq!(results.len(), 2, "two queries in the batch; got: {resp}");
+
+    // Statement 1: BEGIN succeeds.
+    let begin_outcome = &results[0];
+    assert!(
+        begin_outcome
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "BEGIN should succeed; got: {begin_outcome}"
+    );
+
+    // Statement 2: SELECT 1/0 — the real 22012 surfaces, the transaction is
+    // rolled back.
+    let select_outcome = &results[1];
+    let err_msg = select_outcome
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the SELECT 1/0 should error (division by zero); got: {select_outcome}");
+    assert!(
+        err_msg.contains("division by zero"),
+        "the error should be the real 22012 (\"division by zero\"); got: {err_msg:?}"
+    );
+    assert!(
+        err_msg.contains("rolled back"),
+        "the error should tell the user the transaction was rolled back; got: {err_msg:?}"
+    );
+
+    // Follow-up batch: SELECT 1 on the same (now-released) connection. Must
+    // succeed — the aborted transaction was ROLLBACK'd, not re-pinned.
+    let followup_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "queries": ["SELECT 1 AS one"],
+        "limit": 50,
+        "page": 1,
+    });
+    let followup_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(2), &followup_params),
+    )
+    .await
+    .expect("the follow-up SELECT hung past 30s — the #181 cascade on the direct path");
+    let followup_results = followup_resp
+        .get("result")
+        .and_then(|r| r.as_array())
+        .expect("bare batch returns a result array");
+    let followup_first = &followup_results[0];
+    assert!(
+        followup_first
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "the follow-up SELECT must succeed (no 25P02 cascade); got: {followup_first}"
+    );
+
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
+/// Regression guard for the `Closes`/`Chains` gate on #181's two error arms
+/// (`execute_typed` and `query_typed` in `exec_query_on_client`). The gate's
+/// *negative* behavior — a failed `COMMIT`/`ROLLBACK`/`END`/`COMMIT AND CHAIN`
+/// issued via the **batch** path while `in_transaction=true` must NOT receive
+/// the spurious ROLLBACK + "rolled back" notice — is uncovered by any other
+/// test. The existing `commit_that_fails_on_a_deferred_constraint_releases_
+/// the_session` test in `tests/live_db.rs` uses the single-statement
+/// `execute_query` RPC, which passes `in_transaction=false` to
+/// `exec_query_on_client` — so the `Closes`/`Chains` gate is never evaluated
+/// there, and its assertion (`commit["error"].is_string()` only) would still
+/// pass if #181 wrongly appended "rolled back" to a failed COMMIT's error.
+///
+/// This test exercises the gate via the batch path: `["BEGIN", "INSERT
+/// (violating)", "COMMIT"]` as a session-pinned batch on a transaction
+/// pooler, so the COMMIT fails with the deferred-FK violation while
+/// `in_transaction=true` (the `BEGIN` set it). The gate must keep
+/// `txn_aborted=false` for the failed `COMMIT` (a `Closes` verb — already
+/// excluded), so:
+///   - the COMMIT's error carries the real SQLSTATE (foreign key violation),
+///     NOT "current transaction is aborted" (no 25P02 cascade — the `Closes`
+///     path in `in_transaction_after_outcome` already forces
+///     `in_transaction=false`), AND
+///   - the COMMIT's error does NOT contain "rolled back" (the gate excluded
+///     `Closes`, so no spurious ROLLBACK + notice fires for a transaction
+///     the server already rolled back), AND
+///   - the follow-up `SELECT 1` succeeds (the connection was released, not
+///     re-pinned aborted).
+///
+/// If someone deleted the `&& !matches!(transaction_effect(query), Closes |
+/// Chains)` conjunct from either arm, the COMMIT's error here would gain a
+/// spurious "rolled back" suffix and the `!contains("rolled back")` assertion
+/// would fail — catching the regression.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn failed_commit_in_batch_does_not_get_spurious_rolled_back_notice() {
+    use crate::client;
+    use crate::handlers::query::{execute_query_batch, release_session};
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // Setup: a table with a DEFERRABLE INITIALLY DEFERRED self-FK so the
+    // INSERT succeeds but COMMIT fails (the FK check fires at commit).
+    let table = "plugin_test_181_gate_deferred_fk";
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table}"),
+        format!(
+            "CREATE TABLE {table} (id INT PRIMARY KEY, other_id INT \
+             REFERENCES {table}(id) DEFERRABLE INITIALLY DEFERRED)"
+        ),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    let session_id = "test-181-closes-gate";
+
+    // The batch: BEGIN opens a transaction (sets in_transaction=true for the
+    // subsequent statements in this session-pinned batch), the INSERT
+    // succeeds (FK is deferred), then COMMIT fails with the FK violation.
+    // The COMMIT is a `Closes`-effect statement, so the Closes/Chains gate
+    // must keep `txn_aborted=false` for it — no spurious ROLLBACK, no
+    // "rolled back" suffix. The `Closes` path in `in_transaction_after_
+    // outcome` already forces `in_transaction=false` (the server ended the
+    // transaction when COMMIT failed), so there's no 25P02 cascade either.
+    let batch_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": [
+            "BEGIN",
+            format!("INSERT INTO {table} VALUES (1, 999)"),
+            "COMMIT",
+        ],
+        "session_id": session_id,
+        "limit": 100,
+        "page": 1,
+    });
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &batch_params),
+    )
+    .await
+    .expect("the BEGIN/INSERT/COMMIT batch hung past 30s — unexpected");
+    assert!(
+        resp.get("error").is_none(),
+        "batch should not top-level error; got: {resp}"
+    );
+    let results = resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("session-aware batch returns result.results");
+    assert_eq!(results.len(), 3, "three queries in the batch; got: {resp}");
+
+    // Statement 1 (BEGIN) and 2 (INSERT) succeed.
+    assert!(
+        results[0].get("error").and_then(|e| e.as_str()).is_none(),
+        "BEGIN should succeed; got: {}",
+        results[0]
+    );
+    assert!(
+        results[1].get("error").and_then(|e| e.as_str()).is_none(),
+        "the deferred-FK INSERT should succeed (FK check fires at COMMIT); got: {}",
+        results[1]
+    );
+
+    // Statement 3 (COMMIT) fails with the real FK violation — the gate's
+    // negative behavior is what we're guarding.
+    let commit_outcome = &results[2];
+    let err_msg = commit_outcome
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the COMMIT should error (deferred FK violation); got: {commit_outcome}");
+
+    // The COMMIT's error surfaces the real SQLSTATE (foreign key violation),
+    // NOT a 25P02 cascade ("current transaction is aborted"). The `Closes`
+    // path in `in_transaction_after_outcome` already forces
+    // `in_transaction=false`, so the failed COMMIT's reply reports
+    // `in_transaction: false` and the connection is released — no re-pin of
+    // an aborted connection.
+    assert!(
+        err_msg.contains("foreign key") || err_msg.contains("violates"),
+        "the error should be the real FK violation (\"foreign key\" / \"violates\"), \
+         not a 25P02 cascade; got: {err_msg:?}"
+    );
+    assert!(
+        !err_msg.contains("current transaction is aborted"),
+        "the error must not be the 25P02 cascade; got: {err_msg:?}"
+    );
+
+    // The load-bearing negative assertion: the failed COMMIT's error must
+    // NOT contain "rolled back". The Closes/Chains gate excludes `COMMIT`
+    // (a `Closes` verb), so #181's spurious ROLLBACK + "rolled back" notice
+    // must NOT fire — the server already rolled back the transaction when
+    // COMMIT failed; our ROLLBACK would be a no-op and our notice would be
+    // factually wrong (the failing statement WAS the commit, not "a statement
+    // in it"). If the gate's `Closes` conjunct is removed, this assertion
+    // fails.
+    assert!(
+        !err_msg.contains("rolled back"),
+        "the failed COMMIT must NOT get the 'rolled back' notice (the Closes/Chains \
+         gate excludes it — the server already rolled back); got: {err_msg:?}"
+    );
+
+    // Follow-up batch on the same session: SELECT 1 must succeed (the
+    // connection was released, not re-pinned aborted). The `Closes` path set
+    // `in_transaction=false`, so the session slot is empty and a fresh
+    // connection runs the follow-up.
+    let followup_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["SELECT 1 AS one"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let followup_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(2), &followup_params),
+    )
+    .await
+    .expect("the follow-up SELECT hung past 30s — the connection was re-pinned in aborted state");
+    assert!(
+        followup_resp.get("error").is_none(),
+        "follow-up batch should not top-level error; got: {followup_resp}"
+    );
+    let followup_results = followup_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("follow-up batch returns result.results");
+    let followup_first = &followup_results[0];
+    assert!(
+        followup_first
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "the follow-up SELECT must succeed (no 25P02 cascade — the Closes path \
+         released the connection); got: {followup_first}"
+    );
+
+    // Release the session and teardown.
+    let _ = release_session(json!(3), &json!({"session_id": session_id})).await;
+    let _ = client::execute_typed(&params, &format!("DROP TABLE IF EXISTS {table}"), &[]).await;
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
