@@ -609,6 +609,18 @@ fn error_aborts_open_txn_inner(is_db_error: bool, in_transaction: bool) -> bool 
     // error is transport/timeout/client-side — the server's verdict is unknown,
     // so conservatively assume aborted (the rare `FromSql` over-fire, where
     // the txn is actually untouched, is documented in `error_aborted_open_txn`).
+    //
+    // `is_db_error || true` collapses to `true` (so `is_db_error` is a no-op
+    // here): both the DbError and the conservative non-DbError cases return
+    // `true`. The `is_db_error` parameter is kept *deliberately* so the
+    // `error_aborts_open_txn_inner_truth_table` unit test can assert the
+    // intent for all 4 `(is_db_error, in_transaction)` cases — documenting
+    // that both error classes abort when `in_transaction`, not just one.
+    // This reads as a tautology (clippy's `overly_complex_bool_expr` notes
+    // it under `-W clippy::pedantic`, but the default `-D warnings` is clean);
+    // it is NOT a typo for `&&`/`!`. The outer `error_aborted_open_txn` still
+    // threads `e.as_db_error().is_some()` so the discriminator is exercised
+    // end-to-end, even though the inner collapses it.
     is_db_error || true
 }
 
@@ -1337,9 +1349,6 @@ async fn exec_query_on_client(
             // ROLLBACK the now-dead transaction, and signal `txn_aborted`
             // so the caller forces `in_transaction=false` and the aborted
             // connection isn't re-pinned (which would 25P02-cascade the next
-            // batch's first statement). Gate on `transaction_effect(query)
-            // != Closes` so a failed `COMMIT`/`ROLLBACK`/`END` (already
-            // handled by the `Closes` path in `in_transaction_after_outcome`)
             // batch's first statement). Gate on `transaction_effect(query)`
             // being neither `Closes` nor `Chains` so a failed
             // `COMMIT`/`ROLLBACK`/`END`/`COMMIT AND CHAIN` (already handled by
