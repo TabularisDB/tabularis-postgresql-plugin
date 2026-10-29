@@ -558,6 +558,58 @@ fn should_short_circuit_on_prepare_err(in_transaction: bool) -> bool {
     in_transaction
 }
 
+/// Pure inner: classify whether an error aborted the open transaction, given
+/// whether the error is a server `DbError` and whether a transaction is open.
+/// Extracted so the classification is unit-testable without a live
+/// `tokio_postgres::Error` (whose `DbError` can't be constructed without a
+/// real server response — same constraint that drove `pooler_error_lead`'s
+/// extraction in `client.rs`).
+///
+/// Companion to `should_short_circuit_on_prepare_err` (#170): that helper
+/// decides whether to short-circuit *before* `query_typed` runs (a prepare
+/// failure); this one classifies *after* a `query_typed`/`execute_typed`
+/// runtime error (the #181 path). Together they are the two faces of the 25P02
+/// cascade — #170 (prepare) + #181 (runtime).
+fn error_aborts_open_txn_inner(is_db_error: bool, in_transaction: bool) -> bool {
+    if !in_transaction {
+        return false;
+    }
+    // A `DbError` is a server ERROR-class response — every one puts an open
+    // transaction block into the 'E'/failed state (WARNING/NOTICE never arrive
+    // as a query `Error`; they're delivered out-of-band as `AsyncMessage::Notice`,
+    // so every `Error` carrying a `DbError` is ERROR-class). A non-`DbError`
+    // error is transport/timeout/client-side — the server's verdict is unknown,
+    // so conservatively assume aborted (the rare `FromSql` over-fire, where
+    // the txn is actually untouched, is documented in `error_aborted_open_txn`).
+    is_db_error || true
+}
+
+/// Whether a `query_typed`/`execute_typed` error inside an open transaction
+/// aborted the transaction server-side (#181). See
+/// `error_aborts_open_txn_inner` for the pure logic.
+///
+/// A server `DbError` (any ERROR-class response) always aborts an open
+/// transaction. Non-`DbError` errors (transport/timeout) are conservatively
+/// assumed to have aborted it — the server's verdict is unknown and leaving a
+/// possibly-aborted transaction on a pooled connection would poison the pool
+/// for the next borrower.
+///
+/// Residual: `Kind::FromSql` (a client-side row-decode failure) fires *after*
+/// the server returned rows successfully, so the transaction is NOT aborted
+/// by it — but `Kind` is private in tokio-postgres (only `is_closed()` leaks
+/// one variant), so `FromSql` is indistinguishable from `Timeout`/`Closed`/
+/// `Io` via the public API. The conservative `true` over-fires `FromSql`,
+/// issuing a spurious ROLLBACK on a still-valid transaction. This is rare (a
+/// bug in our type conversion, not normal operation) and recoverable (the
+/// user re-issues `BEGIN`); it's the accepted cost of not poisoning the pool
+/// on the more common `Timeout`/`Closed`/`Io` cases. The plugin's query/execute
+/// paths pass `&[]` (no params), so `Kind::ToSql` never fires here at all.
+///
+/// Returns `false` when not `in_transaction` (nothing to abort).
+fn error_aborted_open_txn(e: &tokio_postgres::Error, in_transaction: bool) -> bool {
+    error_aborts_open_txn_inner(e.as_db_error().is_some(), in_transaction)
+}
+
 /// Recompute `in_transaction` after a batch statement, honoring the
 /// `txn_aborted` signal from `exec_query_on_client` (#170). Extracted as a
 /// pure helper so the recompute logic is unit-testable without a live
@@ -932,22 +984,63 @@ async fn exec_query_on_client(
         // Unnamed-statement protocol (`execute_typed`) — pooler-safe under
         // transaction-mode poolers (PgBouncer); see `client`'s module note
         // (tabularis#1097). No params for this branch.
-        let affected = pg_client
-            .execute_typed(query, &[])
-            .await
-            .map_err(|e| client::format_pg_error(&e));
-        let result = affected.map(|affected| {
-            json!({
-                "columns": [],
-                "rows": [],
-                "affected_rows": affected,
-                "truncated": false,
-                "pagination": null,
+        let affected = pg_client.execute_typed(query, &[]).await;
+        // #181: a runtime error (a failed DDL/write, a constraint violation)
+        // inside an open transaction aborts it server-side. Classify on the
+        // raw `tokio_postgres::Error` before formatting, so the caller can
+        // force `in_transaction=false` and the aborted connection isn't
+        // re-pinned (which would 25P02-cascade the next batch's first
+        // statement). Gate on `transaction_effect(query) != Closes` so a
+        // failed `COMMIT`/`ROLLBACK`/`END` — which already ends the
+        // transaction server-side and is handled by the existing `Closes`
+        // path in `in_transaction_after_outcome` — is NOT given a spurious
+        // ROLLBACK + "rolled back" notice (those verbs already rolled back).
+        let txn_aborted = match &affected {
+            Ok(_) => false,
+            Err(e) => {
+                error_aborted_open_txn(e, in_transaction)
+                    && transaction_effect(query) != TransactionEffect::Closes
+            }
+        };
+        if txn_aborted {
+            // Best-effort ROLLBACK; the transaction is aborted, so ROLLBACK is
+            // the one command PostgreSQL still accepts in this state. A
+            // failure here is logged, not fatal — the connection still drops
+            // back to the pool and `RecyclingMethod::Fast` will surface a
+            // stale-state issue on reuse if it ever matters.
+            if let Err(rollback_err) = pg_client.batch_execute("ROLLBACK").await {
+                log::warn!(
+                    "ROLLBACK after an execute_typed error aborted a transaction failed: {rollback_err}"
+                );
+            }
+        }
+        let result = affected
+            .map(|affected| {
+                json!({
+                    "columns": [],
+                    "rows": [],
+                    "affected_rows": affected,
+                    "truncated": false,
+                    "pagination": null,
+                })
             })
-        });
+            .map_err(|e| {
+                let msg = client::format_pg_error(&e);
+                if txn_aborted {
+                    // Tell the user the transaction was rolled back so the
+                    // state change isn't implicit — a multi-statement batch's
+                    // user needs to know earlier writes were discarded.
+                    format!(
+                        "{msg}\n\nThe transaction was rolled back (a statement in it \
+                         failed with an error that aborted the transaction)."
+                    )
+                } else {
+                    msg
+                }
+            });
         return QueryOutcome {
             result,
-            txn_aborted: false,
+            txn_aborted,
         };
     }
 
@@ -1133,12 +1226,21 @@ async fn exec_query_on_client(
     // failed (cold type cache → mid-stream `typeinfo_statement` hang risk,
     // #160/#163/#170). When the prepare succeeded (cache warm) or was skipped,
     // `query_typed` is unbounded-safe.
-    let rows: Result<Vec<tokio_postgres::Row>, String> = if prepare_err.is_some() {
+    // #181: keep the raw `tokio_postgres::Error` here (defer `map_err` to the
+    // single outer error arm below) so we can classify it with
+    // `error_aborted_open_txn` before formatting — a runtime error inside an
+    // open transaction aborted the txn and the caller must not re-pin the
+    // aborted connection. The timed branch's `Ok(Err(e))` arm is only reached
+    // when `!in_transaction` (the short-circuit above returned when
+    // `in_transaction`), so classification there returns `false` (the
+    // `!in_transaction` guard) and the outer arm's behavior is unchanged for
+    // that sub-path.
+    let rows: Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> = if prepare_err.is_some() {
         match tokio::time::timeout(POOLED_TXN_TIMEOUT, pg_client.query_typed(&final_query, &[]))
             .await
         {
             Ok(Ok(rows)) => Ok(rows),
-            Ok(Err(e)) => Err(client::format_query_error(&e, is_transaction_pooler)),
+            Ok(Err(e)) => Err(e),
             Err(_elapsed) => {
                 // The `in_transaction=true` + `prepare_err.is_some()` case was
                 // intercepted by the short-circuit above (which already
@@ -1168,17 +1270,42 @@ async fn exec_query_on_client(
             }
         }
     } else {
-        pg_client
-            .query_typed(&final_query, &[])
-            .await
-            .map_err(|e| client::format_query_error(&e, is_transaction_pooler))
+        pg_client.query_typed(&final_query, &[]).await
     };
     let rows = match rows {
         Ok(rows) => rows,
         Err(e) => {
+            // #181: a `query_typed` runtime error (division by zero, a
+            // constraint violation at fetch, a 42P01 on a relation dropped
+            // between prepare and fetch) inside an open transaction aborts
+            // it server-side. Classify on the raw error before formatting,
+            // ROLLBACK the now-dead transaction, and signal `txn_aborted`
+            // so the caller forces `in_transaction=false` and the aborted
+            // connection isn't re-pinned (which would 25P02-cascade the next
+            // batch's first statement). Gate on `transaction_effect(query)
+            // != Closes` so a failed `COMMIT`/`ROLLBACK`/`END` (already
+            // handled by the `Closes` path in `in_transaction_after_outcome`)
+            // doesn't get a spurious ROLLBACK + "rolled back" notice.
+            let txn_aborted = error_aborted_open_txn(&e, in_transaction)
+                && transaction_effect(query) != TransactionEffect::Closes;
+            if txn_aborted {
+                if let Err(rollback_err) = pg_client.batch_execute("ROLLBACK").await {
+                    log::warn!(
+                        "ROLLBACK after a query_typed error aborted a transaction failed: {rollback_err}"
+                    );
+                }
+            }
+            let msg = client::format_query_error(&e, is_transaction_pooler);
             return QueryOutcome {
-                result: Err(e),
-                txn_aborted: false,
+                result: Err(if txn_aborted {
+                    format!(
+                        "{msg}\n\nThe transaction was rolled back (a statement in it \
+                         failed with an error that aborted the transaction)."
+                    )
+                } else {
+                    msg
+                }),
+                txn_aborted,
             };
         }
     };

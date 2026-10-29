@@ -11,8 +11,9 @@
 //! pagination is applied to a statement.
 
 use super::{
-    build_search_path_sql, in_transaction_after_outcome, raw_explain_output, returns_result_set,
-    sets_session_local_state, should_short_circuit_on_prepare_err, strip_leading_sql_comments,
+    build_search_path_sql, error_aborts_open_txn_inner, in_transaction_after_outcome,
+    raw_explain_output, returns_result_set, sets_session_local_state,
+    should_short_circuit_on_prepare_err, strip_leading_sql_comments,
     supports_trailing_limit_clause, transaction_effect, TransactionEffect,
 };
 
@@ -329,6 +330,56 @@ fn in_transaction_after_outcome_forces_false_when_txn_aborted() {
     assert!(
         in_transaction_after_outcome(None, false, true, false),
         "a failed ordinary statement keeps the prior open state (the pre-#170 behavior)"
+    );
+}
+
+#[test]
+fn error_aborts_open_txn_inner_truth_table() {
+    // #181: the pure inner classification. A server DbError (any ERROR-class
+    // response — WARNING/NOTICE never arrive as a query `Error`, they're
+    // out-of-band `AsyncMessage::Notice`) always aborts an open transaction
+    // block. A non-DbError (transport/timeout) conservatively assumes aborted
+    // when `in_transaction` (server verdict unknown — prefer ending the txn
+    // over poisoning the pool). When not `in_transaction`, nothing to abort.
+    assert!(
+        error_aborts_open_txn_inner(/* is_db_error */ true, /* in_transaction */ true),
+        "a server DbError inside an open txn aborts it"
+    );
+    assert!(
+        !error_aborts_open_txn_inner(true, false),
+        "a server DbError outside a transaction has nothing to abort"
+    );
+    assert!(
+        error_aborts_open_txn_inner(false, true),
+        "a non-DbError (transport/timeout) inside an open txn conservatively aborts"
+    );
+    assert!(
+        !error_aborts_open_txn_inner(false, false),
+        "a non-DbError outside a transaction has nothing to abort"
+    );
+}
+
+#[test]
+fn error_aborted_open_txn_timeout_error_conservative() {
+    // #181: exercise the real `error_aborted_open_txn` on a constructible
+    // non-DbError (`__private_api_timeout` is the one public constructor for a
+    // tokio_postgres::Error that doesn't carry a DbError). This confirms the
+    // outer fn delegates to the inner and that the conservative `true` for
+    // non-DbError fires inside a transaction, `false` outside.
+    let timeout_err = tokio_postgres::Error::__private_api_timeout();
+    assert!(
+        super::error_aborted_open_txn(&timeout_err, true),
+        "a timeout error inside an open txn is conservatively treated as aborting it"
+    );
+    assert!(
+        !super::error_aborted_open_txn(&timeout_err, false),
+        "a timeout error outside a transaction has nothing to abort"
+    );
+    // The error must NOT carry a DbError (that's the whole point of using
+    // __private_api_timeout as the test fixture — it's a non-DbError).
+    assert!(
+        timeout_err.as_db_error().is_none(),
+        "the timeout test fixture must be a non-DbError (else the test isn't exercising the conservative path)"
     );
 }
 
