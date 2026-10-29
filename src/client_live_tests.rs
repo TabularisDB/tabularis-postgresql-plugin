@@ -1768,7 +1768,8 @@ async fn query_typed_runtime_error_in_open_transaction_does_not_cascade() {
     );
 
     // Batch 2: SELECT 1/0. The prepare succeeds (syntactically valid →
-    // prepare_err=None → the else branch at query.rs:1170); the 22012
+    // prepare_err=None → the `else` branch of the `if prepare_err.is_some()`
+    // block in `exec_query_on_client`); the 22012
     // division-by-zero is a runtime error at execute. Inside the open
     // transaction, this aborts it server-side. On current code the error
     // surfaces (the real 22012 — no 25P02 masks it on the *failing*
@@ -1888,7 +1889,8 @@ async fn query_typed_runtime_error_in_open_transaction_does_not_cascade() {
 /// 25P02-cascade.
 ///
 /// Uses `INSERT INTO ...nonexistent_table` — a non-result-set statement that
-/// 42P01s at execute (the `execute_typed` arm at `query.rs:983`), distinct
+/// 42P01s at execute (the `execute_typed` arm — the `if !returns_result_set`
+/// early-return in `exec_query_on_client`), distinct
 /// from the headline test's `SELECT 1/0` which is a result-set statement
 /// (the `query_typed` arm). Together the two tests cover both #181 arms.
 #[tokio::test]

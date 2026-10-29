@@ -522,20 +522,48 @@ async fn exec_query(
 const POOLED_TXN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The outcome of `exec_query_on_client`, carrying a flag the batch caller needs
-/// to decide whether the transaction it was tracking is still open (#170).
+/// to decide whether the transaction it was tracking is still open (#170 + #181).
 ///
-/// `txn_aborted` is `true` only when the pre-resolve `prepare` failed *inside an
-/// open transaction* and the handler short-circuited — ROLLBACK'd the aborted
-/// transaction server-side and returned the prepare's real error instead of
-/// running `query_typed` into a guaranteed 25P02 ("current transaction is
-/// aborted"). The caller (`run_batch_in_session`) treats `txn_aborted=true` as
-/// `Closes`-equivalent: force `in_transaction=false` so the (now-healthy)
-/// connection is not re-pinned as if its transaction were still open.
+/// `txn_aborted` is `true` in two cases (both inside an open transaction, both
+/// after the handler ROLLBACK'd the aborted transaction server-side):
 ///
-/// It is `false` on every other path: success, a prepare failure *outside* a
-/// transaction (the recoverable swallow — a 42P05 on a real PgBouncer bare
-/// batch where `query_typed` may still succeed), a `query_typed`/extraction
-/// error, or a timeout fired outside a transaction.
+/// 1. **#170 — prepare-failure short-circuit:** the pre-resolve `prepare` failed
+///    inside an open transaction (a Parse-time error: 42P01, 42501, syntax
+///    error, …). The handler short-circuits — ROLLBACK + surface the prepare's
+///    real error instead of running `query_typed` into a guaranteed 25P02
+///    ("current transaction is aborted").
+/// 2. **#181 — runtime-error classification:** `query_typed`/`execute_typed`
+///    failed at execute time inside an open transaction (a runtime error:
+///    division by zero, a constraint violation at fetch, a failed DDL/write).
+///    A server `DbError` (any ERROR-class response — WARNING/NOTICE never
+///    arrive as a query `Error`, they're out-of-band `AsyncMessage::Notice`)
+///    always aborts an open transaction; non-`DbError` errors (transport/
+///    timeout) are conservatively assumed to have aborted it. The handler
+///    ROLLBACKs + surfaces the real error + signals `txn_aborted=true`.
+///
+/// In both cases the caller (`run_batch_in_session`) treats `txn_aborted=true`
+/// as `Closes`-equivalent: force `in_transaction=false` so the (now-healthy)
+/// connection is not re-pinned as if its transaction were still open (which
+/// would 25P02-cascade the next batch's first statement). Gated on
+/// `transaction_effect(query)` being neither `Closes` nor `Chains` so a failed
+/// `COMMIT`/`ROLLBACK`/`END`/`COMMIT AND CHAIN` — which already ended the
+/// transaction server-side and is handled by the existing `Closes`/`Chains`
+/// path in `in_transaction_after_outcome` — does NOT get a spurious ROLLBACK +
+/// "rolled back" notice.
+///
+/// `txn_aborted` is `false` on every other path: success; a prepare failure
+/// *outside* a transaction (the recoverable swallow — a 42P05 on a real
+/// PgBouncer bare batch where `query_typed` may still succeed); a
+/// `query_typed`/`execute_typed` error *outside* a transaction (nothing to
+/// abort); or a timeout fired outside a transaction.
+///
+/// **Note on the one-shot path:** `run_pinned_body` calls
+/// `exec_query_on_client` with `in_transaction=true` (it runs inside
+/// `pin_pooled_txn`'s own BEGIN/COMMIT), so a runtime error there CAN set
+/// `txn_aborted=true`. But `run_pinned_body` intentionally ignores the flag
+/// (returns only `outcome.result`) — `pin_pooled_txn` owns the one-shot
+/// client's transaction lifecycle and ROLLBACKs on `Err` regardless. So
+/// `txn_aborted=true` on that path does not flow to a batch caller.
 struct QueryOutcome {
     result: Result<Value, String>,
     txn_aborted: bool,
@@ -611,7 +639,8 @@ fn error_aborted_open_txn(e: &tokio_postgres::Error, in_transaction: bool) -> bo
 }
 
 /// Recompute `in_transaction` after a batch statement, honoring the
-/// `txn_aborted` signal from `exec_query_on_client` (#170). Extracted as a
+/// `txn_aborted` signal from `exec_query_on_client` (#170 prepare-failure
+/// short-circuit + #181 runtime-error classification). Extracted as a
 /// pure helper so the recompute logic is unit-testable without a live
 /// database.
 ///
@@ -793,11 +822,27 @@ async fn run_pinned_body(
     // Decoding + extract_value unchanged. `pre_resolve_types = false` because
     // `run_pinned_body` already pre-resolved via its own `prepare` above.
     // `in_transaction = true` because this runs inside `pin_pooled_txn`'s own
-    // BEGIN/COMMIT wrapper — but since `pre_resolve_types = false`, no prepare
-    // runs in `exec_query_on_client` here, so the #170 short-circuit can't
-    // fire (`prepare_err` is `None`); `txn_aborted` is always `false` on this
-    // path. (`run_pinned_body`'s own `prepare` above already surfaced its
-    // error directly at line 734-736.)
+    // BEGIN/COMMIT wrapper. `pre_resolve_types = false` means no pre-resolve
+    // `prepare` runs in `exec_query_on_client` here, so the #170 prepare-failure
+    // short-circuit can't fire (`prepare_err` is `None`).
+    //
+    // #181's runtime-error classification CAN fire here: `run_pinned_body`'s own
+    // `prepare` above (line ~788) succeeds for a syntactically-valid query like
+    // `SELECT 1/0`, then `query_typed` 22012s at execute → `error_aborted_open_txn`
+    // returns `true` → `txn_aborted = true`, and `exec_query_on_client` issues a
+    // best-effort ROLLBACK. This is *redundant but harmless*: `pin_pooled_txn`
+    // (line ~744-748) already ROLLBACKs on `run_pinned_body`'s `Err` and the
+    // one-shot client drops (closing the connection) regardless. The
+    // `txn_aborted` signal itself is intentionally ignored on this path —
+    // `run_pinned_body` returns only `outcome.result`, and `pin_pinned_txn`
+    // owns the transaction lifecycle (BEGIN/COMMIT/ROLLBACK) for the one-shot
+    // client. So `txn_aborted=true` here does NOT flow to a batch caller's
+    // `in_transaction_after_outcome` (there is no batch caller — this is the
+    // single-query `exec_query_pooled_txn` path).
+    //
+    // (`run_pinned_body`'s own `prepare` above already surfaced a *prepare-time*
+    // error directly at line ~788-790, before `exec_query_on_client` runs; only
+    // a *runtime* error at `query_typed` reaches #181's classification here.)
     let outcome = exec_query_on_client(
         pg_client,
         query,
@@ -819,10 +864,10 @@ async fn run_pinned_body(
         );
     }
 
-    debug_assert!(
-        !outcome.txn_aborted,
-        "run_pinned_body passes pre_resolve_types=false; the #170 short-circuit can't fire"
-    );
+    // `txn_aborted` may be `true` here (a #181 runtime-error classification on
+    // the `query_typed` path), but it's intentionally ignored — `pin_pooled_txn`
+    // owns the one-shot client's transaction lifecycle and ROLLBACKs on this
+    // function's `Err` regardless. Only `outcome.result` propagates.
     outcome.result
 }
 
@@ -963,9 +1008,12 @@ async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), Str
 /// `prepare` before the `query_typed` data fetch (#166/#168). `in_transaction`
 /// is whether this query is running inside an *open* transaction (a
 /// session-pinned batch reusing a prior `BEGIN`, or a bare batch whose earlier
-/// statement was `BEGIN`) — it gates the #170 25P02 short-circuit: a failed
-/// `prepare` inside an open transaction aborts it server-side, so
-/// `query_typed` is guaranteed to 25P02 rather than surface the real error.
+/// statement was `BEGIN`) — it gates both the #170 prepare-failure short-
+/// circuit AND the #181 runtime-error classification: a failed `prepare`
+/// (#170) or a `query_typed`/`execute_typed` runtime error (#181) inside an
+/// open transaction aborts it server-side, so the handler ROLLBACKs + surfaces
+/// the real error + signals `txn_aborted=true` (see `QueryOutcome` and
+/// `error_aborted_open_txn`).
 /// The two flags are independent: a session-pinned pooler connection passes
 /// `is_transaction_pooler = true` (for correct error phrasing) AND
 /// `pre_resolve_types = true` (because the backend is pinned by the user's
@@ -990,16 +1038,23 @@ async fn exec_query_on_client(
         // raw `tokio_postgres::Error` before formatting, so the caller can
         // force `in_transaction=false` and the aborted connection isn't
         // re-pinned (which would 25P02-cascade the next batch's first
-        // statement). Gate on `transaction_effect(query) != Closes` so a
-        // failed `COMMIT`/`ROLLBACK`/`END` — which already ends the
-        // transaction server-side and is handled by the existing `Closes`
-        // path in `in_transaction_after_outcome` — is NOT given a spurious
-        // ROLLBACK + "rolled back" notice (those verbs already rolled back).
+        // statement). Gate on `transaction_effect(query)` being neither `Closes`
+        // nor `Chains` so a failed `COMMIT`/`ROLLBACK`/`END` (`Closes`) AND a
+        // failed `COMMIT AND CHAIN`/`ROLLBACK AND CHAIN`/`ABORT AND CHAIN`
+        // (`Chains` — a failed `Chains` ends the transaction server-side just
+        // like a failed `Closes`, per `in_transaction_after`'s `(Chains, false)
+        // => false` arm) are NOT given a spurious ROLLBACK + "rolled back"
+        // notice. Those verbs already ended the transaction server-side and
+        // are handled by the existing `Closes`/`Chains` path in
+        // `in_transaction_after_outcome`.
         let txn_aborted = match &affected {
             Ok(_) => false,
             Err(e) => {
                 error_aborted_open_txn(e, in_transaction)
-                    && transaction_effect(query) != TransactionEffect::Closes
+                    && !matches!(
+                        transaction_effect(query),
+                        TransactionEffect::Closes | TransactionEffect::Chains
+                    )
             }
         };
         if txn_aborted {
@@ -1285,9 +1340,19 @@ async fn exec_query_on_client(
             // batch's first statement). Gate on `transaction_effect(query)
             // != Closes` so a failed `COMMIT`/`ROLLBACK`/`END` (already
             // handled by the `Closes` path in `in_transaction_after_outcome`)
-            // doesn't get a spurious ROLLBACK + "rolled back" notice.
+            // batch's first statement). Gate on `transaction_effect(query)`
+            // being neither `Closes` nor `Chains` so a failed
+            // `COMMIT`/`ROLLBACK`/`END`/`COMMIT AND CHAIN` (already handled by
+            // the `Closes`/`Chains` path in `in_transaction_after_outcome`)
+            // doesn't get a spurious ROLLBACK + "rolled back" notice. (Result-
+            // set queries reaching this arm are never transaction-control
+            // verbs, so the gate is always-true here — kept for parity with
+            // the `execute_typed` arm and to document the intent.)
             let txn_aborted = error_aborted_open_txn(&e, in_transaction)
-                && transaction_effect(query) != TransactionEffect::Closes;
+                && !matches!(
+                    transaction_effect(query),
+                    TransactionEffect::Closes | TransactionEffect::Chains
+                );
             if txn_aborted {
                 if let Err(rollback_err) = pg_client.batch_execute("ROLLBACK").await {
                     log::warn!(
