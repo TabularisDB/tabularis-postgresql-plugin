@@ -11,9 +11,9 @@
 //! pagination is applied to a statement.
 
 use super::{
-    build_search_path_sql, raw_explain_output, returns_result_set, sets_session_local_state,
-    strip_leading_sql_comments, supports_trailing_limit_clause, transaction_effect,
-    TransactionEffect,
+    build_search_path_sql, in_transaction_after_outcome, raw_explain_output, returns_result_set,
+    sets_session_local_state, should_short_circuit_on_prepare_err, strip_leading_sql_comments,
+    supports_trailing_limit_clause, transaction_effect, TransactionEffect,
 };
 
 #[test]
@@ -279,6 +279,57 @@ fn in_transaction_after_treats_a_failed_commit_as_closing() {
     assert!(!Opens.in_transaction_after(false, false));
     assert!(None.in_transaction_after(false, true));
     assert!(!None.in_transaction_after(true, false));
+}
+
+#[test]
+fn should_short_circuit_on_prepare_err_gates_on_in_transaction() {
+    // #170: a failed pre-resolve `prepare` short-circuits only when it ran
+    // inside an open transaction (the swallow would otherwise cascade into a
+    // 25P02). Outside a transaction the swallow is preserved — a 42P05 on a
+    // real PgBouncer bare batch is recoverable because `query_typed`'s
+    // unnamed protocol can still succeed (#174's `session_state_set` path).
+    assert!(
+        should_short_circuit_on_prepare_err(true),
+        "inside an open transaction → short-circuit (ROLLBACK + surface the real error)"
+    );
+    assert!(
+        !should_short_circuit_on_prepare_err(false),
+        "outside a transaction → preserve the recoverable swallow"
+    );
+}
+
+#[test]
+fn in_transaction_after_outcome_forces_false_when_txn_aborted() {
+    use TransactionEffect::*;
+    // #170: when the handler short-circuited (ROLLBACK'd the aborted
+    // transaction), force `in_transaction=false` regardless of the statement's
+    // `transaction_effect` or prior state — the connection must not be
+    // re-pinned as if its (now-dead) transaction were still open.
+    for effect in [Opens, Closes, Chains, None] {
+        for succeeded in [true, false] {
+            for before in [true, false] {
+                assert!(
+                    !in_transaction_after_outcome(effect, succeeded, before, true),
+                    "txn_aborted=true forces false: effect={effect:?}, succeeded={succeeded}, before={before}"
+                );
+            }
+        }
+    }
+    // Without the abort signal, defer to the normal state machine (proven by
+    // `in_transaction_after_treats_a_failed_commit_as_closing` above); spot-
+    // check a couple of representative cases here.
+    assert!(
+        in_transaction_after_outcome(Opens, true, false, false),
+        "a successful BEGIN opens a transaction"
+    );
+    assert!(
+        !in_transaction_after_outcome(Closes, false, true, false),
+        "a failed COMMIT still closes"
+    );
+    assert!(
+        in_transaction_after_outcome(None, false, true, false),
+        "a failed ordinary statement keeps the prior open state (the pre-#170 behavior)"
+    );
 }
 
 #[test]

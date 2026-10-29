@@ -221,75 +221,94 @@ async fn run_batch_in_session(
         // stay on the shared cached client — the unnamed protocol is
         // pooler-safe and needs no pinning (#149, #168).
         let shared_client = in_transaction || session_state_set;
-        let outcome = if conn_params.is_transaction_pooler() && returns_result_set(query) {
-            if shared_client {
-                // Run on this shared connection (the user's open transaction
-                // pins it, or a prior statement set session-local state the
-                // SELECT must see — #173). Pre-resolve column types via
-                // `prepare` (safe — the backend is pinned by an open
-                // transaction, or there's no pooler reassignment to collide
-                // with on the direct+`pooler_mode=transaction` config) so
-                // `query_typed`'s `get_type` is a cache hit (no mid-stream
-                // `typeinfo_statement`, no deadlock). Keeps the SELECT on
-                // the shared connection where the session/transaction-local
-                // state is visible. `cancel_guard` stays registered for
-                // this shared client.
+        // Both arms of the pooler-result-set branch converge on `QueryOutcome`;
+        // the one-shot path wraps its `Result` with `txn_aborted=false` (it
+        // runs inside its *own* BEGIN/COMMIT and ROLLBACKs internally on error,
+        // so it never leaves the *user's* transaction aborted — #164).
+        let outcome: QueryOutcome =
+            if conn_params.is_transaction_pooler() && returns_result_set(query) {
+                if shared_client {
+                    // Run on this shared connection (the user's open transaction
+                    // pins it, or a prior statement set session-local state the
+                    // SELECT must see — #173). Pre-resolve column types via
+                    // `prepare` (safe — the backend is pinned by an open
+                    // transaction, or there's no pooler reassignment to collide
+                    // with on the direct+`pooler_mode=transaction` config) so
+                    // `query_typed`'s `get_type` is a cache hit (no mid-stream
+                    // `typeinfo_statement`, no deadlock). Keeps the SELECT on
+                    // the shared connection where the session/transaction-local
+                    // state is visible. `cancel_guard` stays registered for
+                    // this shared client. `in_transaction` is threaded so a
+                    // prepare failure inside the open transaction short-circuits
+                    // (#170) rather than cascading into 25P02.
+                    exec_query_on_client(
+                        &pg_client,
+                        query,
+                        limit,
+                        page,
+                        conn_params.is_transaction_pooler(),
+                        /* pre_resolve_types = */ true,
+                        /* in_transaction = */ in_transaction,
+                    )
+                    .await
+                } else {
+                    // No open transaction pins the backend and no prior statement
+                    // set session state. Route to the one-shot pinned path. The
+                    // one-shot client acquired inside `exec_query_pooled_txn` is
+                    // its own connection (never returned to a pool, so no stale
+                    // client-side type cache hazard — #164's core property).
+                    //
+                    // Cancel-guard coexistence: `exec_query_pooled_txn` registers
+                    // its own `CancelGuard` under the SAME `request_id` we hold
+                    // below. `cancel::insert_action` is a `HashMap::insert`
+                    // (overwrite), and the one-shot's guard `Drop` removes the
+                    // key entirely — so if we kept a single guard across the whole
+                    // batch, the one-shot would evict it and every subsequent
+                    // shared-client query would lose cancel coverage (#126's
+                    // "a late cancel is never a no-op for an in-flight query"
+                    // guarantee). Take+drop our guard so the one-shot owns the
+                    // map entry while it runs, then re-register for the shared
+                    // client before the next iteration.
+                    drop(cancel_guard.take());
+                    let result =
+                        exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id)
+                            .await;
+                    cancel_guard = Some(cancel::CancelGuard::register(
+                        request_id.as_u64(),
+                        &pg_client,
+                        conn_params.clone(),
+                    ));
+                    QueryOutcome {
+                        result,
+                        txn_aborted: false,
+                    }
+                }
+            } else {
+                // Non-result-set (DDL, writes) or direct connection — the
+                // unnamed protocol is pooler-safe and needs no pre-resolve.
+                // `cancel_guard` stays registered for this shared client.
+                // `in_transaction` is threaded for the direct-connection batch
+                // path inside a user's `BEGIN` (pre-existing from #168): a
+                // prepare failure there aborts the txn the same way (#170).
                 exec_query_on_client(
                     &pg_client,
                     query,
                     limit,
                     page,
                     conn_params.is_transaction_pooler(),
-                    /* pre_resolve_types = */ true,
+                    !conn_params.is_transaction_pooler(),
+                    /* in_transaction = */ in_transaction,
                 )
                 .await
-            } else {
-                // No open transaction pins the backend and no prior statement
-                // set session state. Route to the one-shot pinned path. The
-                // one-shot client acquired inside `exec_query_pooled_txn` is
-                // its own connection (never returned to a pool, so no stale
-                // client-side type cache hazard — #164's core property).
-                //
-                // Cancel-guard coexistence: `exec_query_pooled_txn` registers
-                // its own `CancelGuard` under the SAME `request_id` we hold
-                // below. `cancel::insert_action` is a `HashMap::insert`
-                // (overwrite), and the one-shot's guard `Drop` removes the
-                // key entirely — so if we kept a single guard across the whole
-                // batch, the one-shot would evict it and every subsequent
-                // shared-client query would lose cancel coverage (#126's
-                // "a late cancel is never a no-op for an in-flight query"
-                // guarantee). Take+drop our guard so the one-shot owns the
-                // map entry while it runs, then re-register for the shared
-                // client before the next iteration.
-                drop(cancel_guard.take());
-                let result =
-                    exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id)
-                        .await;
-                cancel_guard = Some(cancel::CancelGuard::register(
-                    request_id.as_u64(),
-                    &pg_client,
-                    conn_params.clone(),
-                ));
-                result
-            }
-        } else {
-            // Non-result-set (DDL, writes) or direct connection — the
-            // unnamed protocol is pooler-safe and needs no pre-resolve.
-            // `cancel_guard` stays registered for this shared client.
-            exec_query_on_client(
-                &pg_client,
-                query,
-                limit,
-                page,
-                conn_params.is_transaction_pooler(),
-                !conn_params.is_transaction_pooler(),
-            )
-            .await
-        };
+            };
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        in_transaction =
-            transaction_effect(query).in_transaction_after(outcome.is_ok(), in_transaction);
+        in_transaction = in_transaction_after_outcome(
+            transaction_effect(query),
+            outcome.result.is_ok(),
+            in_transaction,
+            outcome.txn_aborted,
+        );
         // Track session-local state set by a non-result-set statement so a
         // later result-set SELECT in this bare batch routes to the shared
         // client above instead of the one-shot (#173). A `SET`/`CREATE TEMP
@@ -300,11 +319,11 @@ async fn run_batch_in_session(
         // rejected established no session state, so it must not steer a later
         // SELECT onto the shared client (which, outside a transaction on a
         // real pooler, runs an unpinned `prepare`).
-        if outcome.is_ok() && sets_session_local_state(query) {
+        if outcome.result.is_ok() && sets_session_local_state(query) {
             session_state_set = true;
         }
 
-        match outcome {
+        match outcome.result {
             Ok(result) => results.push(json!({
                 "result": result,
                 "error": null,
@@ -472,24 +491,95 @@ async fn exec_query(
         apply_search_path(&pg_client, s).await?;
     }
 
-    exec_query_on_client(
+    let outcome = exec_query_on_client(
         &pg_client,
         query,
         limit,
         page,
         conn_params.is_transaction_pooler(),
         !conn_params.is_transaction_pooler(),
+        /* in_transaction = */
+        false, // single-query path has no session, never an open txn
     )
-    .await
+    .await;
+    // `txn_aborted` can only be true inside an open transaction, which this
+    // single-query path never has. Unwrap to the inner `Result`.
+    debug_assert!(
+        !outcome.txn_aborted,
+        "single-query path is never in a transaction; txn_aborted must be false"
+    );
+    outcome.result
 }
 
-/// Bounded lifetime of the transaction-pooler pinned path. Kept below the
-/// host's plugin-call timeout (120s) so a wedged pooler connection surfaces
-/// as an actionable error here instead of the opaque "timed out after 120s"
-/// the host would otherwise emit. Long enough that a legitimately slow query
-/// on a healthy pooler isn't cut short, short enough that a Supavisor-style
-/// stall never reaches the host timeout (#160 / #163).
+/// Bounded lifetime of the transaction-pooler pinned path *and* the
+/// `query_typed`/column-discovery paths in `exec_query_on_client` when the
+/// pre-resolve `prepare` failed (#170). Kept below the host's plugin-call
+/// timeout (120s) so a wedged pooler connection surfaces as an actionable
+/// error here instead of the opaque "timed out after 120s" the host would
+/// otherwise emit. Long enough that a legitimately slow query on a healthy
+/// pooler isn't cut short, short enough that a Supavisor-style stall never
+/// reaches the host timeout (#160 / #163).
 const POOLED_TXN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The outcome of `exec_query_on_client`, carrying a flag the batch caller needs
+/// to decide whether the transaction it was tracking is still open (#170).
+///
+/// `txn_aborted` is `true` only when the pre-resolve `prepare` failed *inside an
+/// open transaction* and the handler short-circuited — ROLLBACK'd the aborted
+/// transaction server-side and returned the prepare's real error instead of
+/// running `query_typed` into a guaranteed 25P02 ("current transaction is
+/// aborted"). The caller (`run_batch_in_session`) treats `txn_aborted=true` as
+/// `Closes`-equivalent: force `in_transaction=false` so the (now-healthy)
+/// connection is not re-pinned as if its transaction were still open.
+///
+/// It is `false` on every other path: success, a prepare failure *outside* a
+/// transaction (the recoverable swallow — a 42P05 on a real PgBouncer bare
+/// batch where `query_typed` may still succeed), a `query_typed`/extraction
+/// error, or a timeout fired outside a transaction.
+struct QueryOutcome {
+    result: Result<Value, String>,
+    txn_aborted: bool,
+}
+
+/// Whether a failed pre-resolve `prepare` should short-circuit (ROLLBACK +
+/// surface the real error) instead of swallowing and running `query_typed`
+/// (#170). Extracted as a pure helper so the decision is unit-testable without
+/// a live database.
+///
+/// The swallow is *not always wrong*: outside an open transaction a prepare
+/// failure can be recoverable — e.g. a 42P05 on a real PgBouncer bare batch
+/// where `query_typed`'s unnamed protocol sidesteps the lost named statement
+/// and still succeeds (#174's `session_state_set` path). Inside an open
+/// transaction, a prepare Parse-time error (42P01, 42501, …) aborts the
+/// transaction server-side, so `query_typed` is guaranteed to fail with 25P02
+/// instead of the real error — the cascade #170 fixes. The `in_transaction`
+/// gate is what separates those two cases.
+fn should_short_circuit_on_prepare_err(in_transaction: bool) -> bool {
+    in_transaction
+}
+
+/// Recompute `in_transaction` after a batch statement, honoring the
+/// `txn_aborted` signal from `exec_query_on_client` (#170). Extracted as a
+/// pure helper so the recompute logic is unit-testable without a live
+/// database.
+///
+/// When `txn_aborted=true`, the handler already ROLLBACK'd the aborted
+/// transaction — force `false` regardless of the statement's
+/// `transaction_effect`, so the connection is released rather than re-pinned
+/// as if its (now-dead) transaction were still open. Otherwise defer to the
+/// normal state machine: a failed `COMMIT` still closes (`Closes` arm), a
+/// failed ordinary statement keeps the prior state (`None` arm).
+fn in_transaction_after_outcome(
+    effect: TransactionEffect,
+    succeeded: bool,
+    before: bool,
+    txn_aborted: bool,
+) -> bool {
+    if txn_aborted {
+        return false;
+    }
+    effect.in_transaction_after(succeeded, before)
+}
 
 /// Run a result-set query on a transaction-mode pooler through an explicit
 /// pinned transaction on a one-shot client (#160 / #163).
@@ -650,13 +740,20 @@ async fn run_pinned_body(
     // Data fetch: unnamed protocol (#149's pooler-safe path). Binary Row
     // Decoding + extract_value unchanged. `pre_resolve_types = false` because
     // `run_pinned_body` already pre-resolved via its own `prepare` above.
-    let result = exec_query_on_client(
+    // `in_transaction = true` because this runs inside `pin_pooled_txn`'s own
+    // BEGIN/COMMIT wrapper — but since `pre_resolve_types = false`, no prepare
+    // runs in `exec_query_on_client` here, so the #170 short-circuit can't
+    // fire (`prepare_err` is `None`); `txn_aborted` is always `false` on this
+    // path. (`run_pinned_body`'s own `prepare` above already surfaced its
+    // error directly at line 734-736.)
+    let outcome = exec_query_on_client(
         pg_client,
         query,
         limit,
         page,
         is_transaction_pooler,
         /* pre_resolve_types = */ false,
+        /* in_transaction = */ true,
     )
     .await;
 
@@ -670,7 +767,11 @@ async fn run_pinned_body(
         );
     }
 
-    result
+    debug_assert!(
+        !outcome.txn_aborted,
+        "run_pinned_body passes pre_resolve_types=false; the #170 short-circuit can't fire"
+    );
+    outcome.result
 }
 
 /// Read the connection's base `search_path` and set it locally (`SET LOCAL`)
@@ -807,8 +908,13 @@ async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), Str
 /// `is_transaction_pooler` selects error-message phrasing (definitive when
 /// the host declared a transaction pooler, conditional when it didn't).
 /// `pre_resolve_types` controls whether column types are pre-resolved via
-/// `prepare` before the `query_typed` data fetch (#166/#168). The two are
-/// independent: a session-pinned pooler connection passes
+/// `prepare` before the `query_typed` data fetch (#166/#168). `in_transaction`
+/// is whether this query is running inside an *open* transaction (a
+/// session-pinned batch reusing a prior `BEGIN`, or a bare batch whose earlier
+/// statement was `BEGIN`) — it gates the #170 25P02 short-circuit: a failed
+/// `prepare` inside an open transaction aborts it server-side, so
+/// `query_typed` is guaranteed to 25P02 rather than surface the real error.
+/// The two flags are independent: a session-pinned pooler connection passes
 /// `is_transaction_pooler = true` (for correct error phrasing) AND
 /// `pre_resolve_types = true` (because the backend is pinned by the user's
 /// open transaction, so the `prepare` is safe) — see `run_batch_in_session`.
@@ -819,7 +925,8 @@ async fn exec_query_on_client(
     page: u32,
     is_transaction_pooler: bool,
     pre_resolve_types: bool,
-) -> Result<Value, String> {
+    in_transaction: bool,
+) -> QueryOutcome {
     // Check if the statement returns a result set
     if !returns_result_set(query) {
         // Unnamed-statement protocol (`execute_typed`) — pooler-safe under
@@ -828,14 +935,20 @@ async fn exec_query_on_client(
         let affected = pg_client
             .execute_typed(query, &[])
             .await
-            .map_err(|e| client::format_pg_error(&e))?;
-        return Ok(json!({
-            "columns": [],
-            "rows": [],
-            "affected_rows": affected,
-            "truncated": false,
-            "pagination": null,
-        }));
+            .map_err(|e| client::format_pg_error(&e));
+        let result = affected.map(|affected| {
+            json!({
+                "columns": [],
+                "rows": [],
+                "affected_rows": affected,
+                "truncated": false,
+                "pagination": null,
+            })
+        });
+        return QueryOutcome {
+            result,
+            txn_aborted: false,
+        };
     }
 
     // Only statements whose PostgreSQL syntax actually accepts a trailing
@@ -898,22 +1011,113 @@ async fn exec_query_on_client(
     //    pooler case with NO prior session state still routes to the #164
     //    one-shot pinned path (see `run_batch_in_session`), not here.
     //
-    // The pre-resolve is non-fatal on failure: a prepare error is swallowed
-    // (`.ok()`) and the `query_typed` below runs anyway — for builtin types
-    // `get_type` is always a `Type::from_oid` cache hit (no
-    // `typeinfo_statement`, no hang), and a prepare failure on a valid
-    // result-set query is rare. The `Statement` is kept alive (not dropped
-    // immediately) so its `.columns()` can be reused by the empty-rows branch
-    // below instead of preparing a second time. (The warmed type cache
-    // persists on the shared `InnerClient` regardless of the `Statement`'s
-    // lifetime — `Statement::Drop` sends a server `Close` but does not clear
-    // `CachedTypeInfo.types` — so holding it alive is for `.columns()` reuse,
-    // not cache persistence.)
-    let prepared = if pre_resolve_types {
-        pg_client.prepare(&final_query).await.ok()
+    // The pre-resolve's failure handling is gated on `in_transaction` (#170):
+    //
+    //  * Inside an open transaction (`in_transaction=true`): a prepare
+    //    Parse-time error (42P01 relation does not exist, 42501 permission
+    //    denied, syntax error, …) *aborts the transaction server-side*. Running
+    //    `query_typed` next would fail with 25P02 ("current transaction is
+    //    aborted") instead of the real, actionable error — a confusing cascade
+    //    that, because `transaction_effect("SELECT")=None` keeps the batch
+    //    caller's `in_transaction=true`, also re-pins the aborted connection
+    //    and 25P02s every subsequent batch until an explicit ROLLBACK. So a
+    //    prepare failure here short-circuits: best-effort ROLLBACK, surface the
+    //    prepare's real error via `format_query_error`, and signal
+    //    `txn_aborted=true` so the caller forces `in_transaction=false` and
+    //    releases the connection instead of re-pinning it.
+    //
+    //  * Outside an open transaction (`in_transaction=false`): a prepare
+    //    failure is *recoverable*. The canonical case is a 42P05 on a real
+    //    PgBouncer bare batch (the `session_state_set` #173 path) where the
+    //    pooler reassigned the backend during the prepare's `typeinfo_statement`
+    //    round-trip — `query_typed`'s unnamed protocol sidesteps the lost named
+    //    statement and can still succeed. So the swallow is preserved here:
+    //    `query_typed` runs anyway, and for builtin types `get_type` is always
+    //    a `Type::from_oid` cache hit (no `typeinfo_statement`, no hang). A
+    //    prepare failure on a valid result-set query is rare, and when it does
+    //    happen outside a transaction the worst case is the real error
+    //    surfacing from `query_typed` rather than a 25P02 cascade.
+    //
+    // `query_typed` is bounded by `POOLED_TXN_TIMEOUT` *only when the
+    // pre-resolve failed* — that's the path that can hang (cold type cache →
+    // `get_type` fires `typeinfo_statement` mid-stream → the #160/#163
+    // deadlock). When the prepare succeeded (cache warm) or was skipped,
+    // `query_typed` is unbounded-safe, matching the pooler-pinned path's
+    // contract and today's behavior. This bounds the hang (consequence A of
+    // #170) without tightening the direct path for the common case.
+    //
+    // The `Statement` is kept alive (not dropped immediately) so its
+    // `.columns()` can be reused by the empty-rows branch below instead of
+    // preparing a second time. (The warmed type cache persists on the shared
+    // `InnerClient` regardless of the `Statement`'s lifetime — `Statement::Drop`
+    // sends a server `Close` but does not clear `CachedTypeInfo.types` — so
+    // holding it alive is for `.columns()` reuse, not cache persistence.)
+    let mut prepared: Option<tokio_postgres::Statement> = None;
+    let prepare_err: Option<tokio_postgres::Error> = if pre_resolve_types {
+        match pg_client.prepare(&final_query).await {
+            Ok(stmt) => {
+                prepared = Some(stmt);
+                None
+            }
+            Err(e) => Some(e),
+        }
     } else {
         None
     };
+
+    // #170: short-circuit on a prepare failure *inside an open transaction*.
+    //
+    // The prepare already aborted the transaction server-side (any hard ERROR
+    // during Parse/Describe/Sync puts the txn block into `inError`/`INFAILED`).
+    // Running `query_typed` next would fail with 25P02 ("current transaction is
+    // aborted") and hide the real, actionable error — and because
+    // `transaction_effect("SELECT")=None` keeps the batch caller's
+    // `in_transaction=true`, the aborted connection would be re-pinned and
+    // every subsequent batch 25P02s until an explicit ROLLBACK (the cascade).
+    //
+    // The ROLLBACK here is deliberate and not a regression of psql semantics.
+    // The transaction is *already dead* — the pending writes in it are
+    // discardable either way (psql would discard them when the user issues the
+    // ROLLBACK the aborted state forces; we discard them now). Ending the
+    // transaction lets the remaining statements in the batch run cleanly
+    // (autocommit) instead of 25P02ing, and surfaces the real error. We tell
+    // the user the transaction was rolled back in the error message so the
+    // state change isn't silent.
+    //
+    // A SAVEPOINT can't help here: the prepare aborted the *outer* transaction,
+    // not a savepoint, so there's nothing to roll back *to* that would leave the
+    // earlier writes intact. The alternative — keeping `in_transaction=true`
+    // and letting the user ROLLBACK explicitly — is the 25P02 cascade this fix
+    // exists to close.
+    if let Some(e) = prepare_err.as_ref() {
+        if should_short_circuit_on_prepare_err(in_transaction) {
+            // Best-effort ROLLBACK; the transaction is aborted, so ROLLBACK is
+            // the one command PostgreSQL still accepts in this state. A
+            // failure here is logged, not fatal — the connection still drops
+            // back to the pool and `RecyclingMethod::Fast` will surface a
+            // stale-state issue on reuse if it ever matters.
+            if let Err(rollback_err) = pg_client.batch_execute("ROLLBACK").await {
+                log::warn!(
+                    "ROLLBACK after a prepare failure aborted a transaction failed: {rollback_err}"
+                );
+            }
+            // Surface the prepare's real SQLSTATE (e.g. 42P01) and tell the
+            // user the transaction was rolled back, so the state change isn't
+            // implicit — a multi-statement batch's user needs to know earlier
+            // writes were discarded.
+            return QueryOutcome {
+                result: Err(format!(
+                    "{}\n\nThe transaction was rolled back (a statement in it \
+                     failed with an error that aborted the transaction).",
+                    client::format_query_error(e, is_transaction_pooler),
+                )),
+                txn_aborted: true,
+            };
+        }
+        // else: outside a transaction — preserve the recoverable swallow
+        // (42P05 on a real PgBouncer bare batch). Fall through to
+        // `query_typed`, bounded below.
+    }
 
     // Execute query
     // Unnamed-statement protocol (`query_typed`) — pooler-safe under
@@ -924,10 +1128,60 @@ async fn exec_query_on_client(
     // from tokio-postgres's internal `typeinfo_statement` (fired by
     // non-builtin column types) is rewritten with actionable guidance via
     // `format_query_error` (#157).
-    let rows = pg_client
-        .query_typed(&final_query, &[])
-        .await
-        .map_err(|e| client::format_query_error(&e, is_transaction_pooler))?;
+    //
+    // Bounded by `POOLED_TXN_TIMEOUT` only when the pre-resolve `prepare`
+    // failed (cold type cache → mid-stream `typeinfo_statement` hang risk,
+    // #160/#163/#170). When the prepare succeeded (cache warm) or was skipped,
+    // `query_typed` is unbounded-safe.
+    let rows: Result<Vec<tokio_postgres::Row>, String> = if prepare_err.is_some() {
+        match tokio::time::timeout(POOLED_TXN_TIMEOUT, pg_client.query_typed(&final_query, &[]))
+            .await
+        {
+            Ok(Ok(rows)) => Ok(rows),
+            Ok(Err(e)) => Err(client::format_query_error(&e, is_transaction_pooler)),
+            Err(_elapsed) => {
+                // The `in_transaction=true` + `prepare_err.is_some()` case was
+                // intercepted by the short-circuit above (which already
+                // ROLLBACK'd and returned), so this arm is only reached with
+                // `in_transaction=false`. There's no open transaction to
+                // roll back; `txn_aborted` is `false`. The dropped inner
+                // `query_typed` future is reclaimed by tokio-postgres's
+                // connection task paging through the abandoned response to
+                // `ReadyForQuery`, so the connection returns to idle and the
+                // pool reclaims it normally.
+                debug_assert!(
+                    !in_transaction,
+                    "the short-circuit above returns when in_transaction; \
+                     this timeout arm is only reached with in_transaction=false"
+                );
+                return QueryOutcome {
+                    result: Err(format!(
+                        "Query timed out after {}s. The pre-resolve `prepare` failed and the \
+                         subsequent data fetch did not complete within the plugin's bound; the \
+                         connection has been released. Re-run the query, or if it reproduces, \
+                         check whether the result column types (enums, composites, extension \
+                         types) are resolvable on this connection.",
+                        POOLED_TXN_TIMEOUT.as_secs()
+                    )),
+                    txn_aborted: false,
+                };
+            }
+        }
+    } else {
+        pg_client
+            .query_typed(&final_query, &[])
+            .await
+            .map_err(|e| client::format_query_error(&e, is_transaction_pooler))
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            return QueryOutcome {
+                result: Err(e),
+                txn_aborted: false,
+            };
+        }
+    };
 
     if rows.is_empty() {
         // Get columns from the statement if possible. When the pre-resolve
@@ -939,6 +1193,16 @@ async fn exec_query_on_client(
         // (the one-shot path handles its own pre-resolve), return `columns:
         // []` — the host handles empty columns gracefully (#157,
         // tabularis#1097).
+        //
+        // #170: when the pre-resolve `prepare` failed (`prepare_err.is_some()`),
+        // the type cache may still be cold; bound this column-discovery prepare
+        // with the same `POOLED_TXN_TIMEOUT` so a wedged pooler can't pin the
+        // worker past the host's 120s. (This path is only reached when
+        // `in_transaction=false` — the `in_transaction=true` prepare-failure
+        // case short-circuited above — so a timeout here does not abort an
+        // open transaction; `txn_aborted` stays `false`.) A timeout is treated
+        // as "columns unavailable" (`vec![]`), matching the existing failure
+        // shape.
         let columns: Vec<String> = if let Some(stmt) = prepared.as_ref() {
             stmt.columns()
                 .iter()
@@ -947,7 +1211,15 @@ async fn exec_query_on_client(
         } else if pre_resolve_types {
             // Pre-resolve was attempted but failed; try once more for column
             // discovery (the pre-#166 behavior for direct empty result sets).
-            if let Ok(stmt) = pg_client.prepare(&final_query).await {
+            let discovery = if prepare_err.is_some() {
+                tokio::time::timeout(POOLED_TXN_TIMEOUT, pg_client.prepare(&final_query))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            } else {
+                pg_client.prepare(&final_query).await.ok()
+            };
+            if let Some(stmt) = discovery {
                 stmt.columns()
                     .iter()
                     .map(|c| c.name().to_string())
@@ -970,13 +1242,16 @@ async fn exec_query_on_client(
             None
         };
 
-        return Ok(json!({
-            "columns": columns,
-            "rows": [],
-            "affected_rows": 0,
-            "truncated": false,
-            "pagination": pagination,
-        }));
+        return QueryOutcome {
+            result: Ok(json!({
+                "columns": columns,
+                "rows": [],
+                "affected_rows": 0,
+                "truncated": false,
+                "pagination": pagination,
+            })),
+            txn_aborted: false,
+        };
     }
 
     // Extract columns from first row
@@ -1021,13 +1296,16 @@ async fn exec_query_on_client(
         None
     };
 
-    Ok(json!({
-        "columns": columns,
-        "rows": json_rows,
-        "affected_rows": 0,
-        "truncated": truncated,
-        "pagination": pagination,
-    }))
+    QueryOutcome {
+        result: Ok(json!({
+            "columns": columns,
+            "rows": json_rows,
+            "affected_rows": 0,
+            "truncated": truncated,
+            "pagination": pagination,
+        })),
+        txn_aborted: false,
+    }
 }
 
 /// What a statement does to the surrounding transaction.
