@@ -2138,3 +2138,205 @@ async fn query_typed_runtime_error_on_direct_connection_in_txn_does_not_cascade(
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression guard for the `Closes`/`Chains` gate on #181's two error arms
+/// (`execute_typed` and `query_typed` in `exec_query_on_client`). The gate's
+/// *negative* behavior — a failed `COMMIT`/`ROLLBACK`/`END`/`COMMIT AND CHAIN`
+/// issued via the **batch** path while `in_transaction=true` must NOT receive
+/// the spurious ROLLBACK + "rolled back" notice — is uncovered by any other
+/// test. The existing `commit_that_fails_on_a_deferred_constraint_releases_
+/// the_session` test in `tests/live_db.rs` uses the single-statement
+/// `execute_query` RPC, which passes `in_transaction=false` to
+/// `exec_query_on_client` — so the `Closes`/`Chains` gate is never evaluated
+/// there, and its assertion (`commit["error"].is_string()` only) would still
+/// pass if #181 wrongly appended "rolled back" to a failed COMMIT's error.
+///
+/// This test exercises the gate via the batch path: `["BEGIN", "INSERT
+/// (violating)", "COMMIT"]` as a session-pinned batch on a transaction
+/// pooler, so the COMMIT fails with the deferred-FK violation while
+/// `in_transaction=true` (the `BEGIN` set it). The gate must keep
+/// `txn_aborted=false` for the failed `COMMIT` (a `Closes` verb — already
+/// excluded), so:
+///   - the COMMIT's error carries the real SQLSTATE (foreign key violation),
+///     NOT "current transaction is aborted" (no 25P02 cascade — the `Closes`
+///     path in `in_transaction_after_outcome` already forces
+///     `in_transaction=false`), AND
+///   - the COMMIT's error does NOT contain "rolled back" (the gate excluded
+///     `Closes`, so no spurious ROLLBACK + notice fires for a transaction
+///     the server already rolled back), AND
+///   - the follow-up `SELECT 1` succeeds (the connection was released, not
+///     re-pinned aborted).
+///
+/// If someone deleted the `&& !matches!(transaction_effect(query), Closes |
+/// Chains)` conjunct from either arm, the COMMIT's error here would gain a
+/// spurious "rolled back" suffix and the `!contains("rolled back")` assertion
+/// would fail — catching the regression.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn failed_commit_in_batch_does_not_get_spurious_rolled_back_notice() {
+    use crate::client;
+    use crate::handlers::query::{execute_query_batch, release_session};
+    use serde_json::json;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let params = live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 (and optionally PG_PLUGIN_TEST_PORT/USER/DB) to run live tests");
+
+    // Setup: a table with a DEFERRABLE INITIALLY DEFERRED self-FK so the
+    // INSERT succeeds but COMMIT fails (the FK check fires at commit).
+    let table = "plugin_test_181_gate_deferred_fk";
+    for stmt in [
+        format!("DROP TABLE IF EXISTS {table}"),
+        format!(
+            "CREATE TABLE {table} (id INT PRIMARY KEY, other_id INT \
+             REFERENCES {table}(id) DEFERRABLE INITIALLY DEFERRED)"
+        ),
+    ] {
+        client::execute_typed(&params, &stmt, &[])
+            .await
+            .unwrap_or_else(|e| panic!("setup statement failed ({stmt}): {e}"));
+    }
+
+    let session_id = "test-181-closes-gate";
+
+    // The batch: BEGIN opens a transaction (sets in_transaction=true for the
+    // subsequent statements in this session-pinned batch), the INSERT
+    // succeeds (FK is deferred), then COMMIT fails with the FK violation.
+    // The COMMIT is a `Closes`-effect statement, so the Closes/Chains gate
+    // must keep `txn_aborted=false` for it — no spurious ROLLBACK, no
+    // "rolled back" suffix. The `Closes` path in `in_transaction_after_
+    // outcome` already forces `in_transaction=false` (the server ended the
+    // transaction when COMMIT failed), so there's no 25P02 cascade either.
+    let batch_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": [
+            "BEGIN",
+            format!("INSERT INTO {table} VALUES (1, 999)"),
+            "COMMIT",
+        ],
+        "session_id": session_id,
+        "limit": 100,
+        "page": 1,
+    });
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(1), &batch_params),
+    )
+    .await
+    .expect("the BEGIN/INSERT/COMMIT batch hung past 30s — unexpected");
+    assert!(
+        resp.get("error").is_none(),
+        "batch should not top-level error; got: {resp}"
+    );
+    let results = resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("session-aware batch returns result.results");
+    assert_eq!(results.len(), 3, "three queries in the batch; got: {resp}");
+
+    // Statement 1 (BEGIN) and 2 (INSERT) succeed.
+    assert!(
+        results[0].get("error").and_then(|e| e.as_str()).is_none(),
+        "BEGIN should succeed; got: {}",
+        results[0]
+    );
+    assert!(
+        results[1].get("error").and_then(|e| e.as_str()).is_none(),
+        "the deferred-FK INSERT should succeed (FK check fires at COMMIT); got: {}",
+        results[1]
+    );
+
+    // Statement 3 (COMMIT) fails with the real FK violation — the gate's
+    // negative behavior is what we're guarding.
+    let commit_outcome = &results[2];
+    let err_msg = commit_outcome
+        .get("error")
+        .and_then(|e| e.as_str())
+        .expect("the COMMIT should error (deferred FK violation); got: {commit_outcome}");
+
+    // The COMMIT's error surfaces the real SQLSTATE (foreign key violation),
+    // NOT a 25P02 cascade ("current transaction is aborted"). The `Closes`
+    // path in `in_transaction_after_outcome` already forces
+    // `in_transaction=false`, so the failed COMMIT's reply reports
+    // `in_transaction: false` and the connection is released — no re-pin of
+    // an aborted connection.
+    assert!(
+        err_msg.contains("foreign key") || err_msg.contains("violates"),
+        "the error should be the real FK violation (\"foreign key\" / \"violates\"), \
+         not a 25P02 cascade; got: {err_msg:?}"
+    );
+    assert!(
+        !err_msg.contains("current transaction is aborted"),
+        "the error must not be the 25P02 cascade; got: {err_msg:?}"
+    );
+
+    // The load-bearing negative assertion: the failed COMMIT's error must
+    // NOT contain "rolled back". The Closes/Chains gate excludes `COMMIT`
+    // (a `Closes` verb), so #181's spurious ROLLBACK + "rolled back" notice
+    // must NOT fire — the server already rolled back the transaction when
+    // COMMIT failed; our ROLLBACK would be a no-op and our notice would be
+    // factually wrong (the failing statement WAS the commit, not "a statement
+    // in it"). If the gate's `Closes` conjunct is removed, this assertion
+    // fails.
+    assert!(
+        !err_msg.contains("rolled back"),
+        "the failed COMMIT must NOT get the 'rolled back' notice (the Closes/Chains \
+         gate excludes it — the server already rolled back); got: {err_msg:?}"
+    );
+
+    // Follow-up batch on the same session: SELECT 1 must succeed (the
+    // connection was released, not re-pinned aborted). The `Closes` path set
+    // `in_transaction=false`, so the session slot is empty and a fresh
+    // connection runs the follow-up.
+    let followup_params = json!({
+        "driver": "postgresql",
+        "host": params.host,
+        "port": params.port,
+        "database": params.database,
+        "username": params.username,
+        "password": params.password,
+        "pooler_mode": "transaction",
+        "queries": ["SELECT 1 AS one"],
+        "session_id": session_id,
+        "limit": 50,
+        "page": 1,
+    });
+    let followup_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        execute_query_batch(json!(2), &followup_params),
+    )
+    .await
+    .expect("the follow-up SELECT hung past 30s — the connection was re-pinned in aborted state");
+    assert!(
+        followup_resp.get("error").is_none(),
+        "follow-up batch should not top-level error; got: {followup_resp}"
+    );
+    let followup_results = followup_resp
+        .get("result")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .expect("follow-up batch returns result.results");
+    let followup_first = &followup_results[0];
+    assert!(
+        followup_first
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_none(),
+        "the follow-up SELECT must succeed (no 25P02 cascade — the Closes path \
+         released the connection); got: {followup_first}"
+    );
+
+    // Release the session and teardown.
+    let _ = release_session(json!(3), &json!({"session_id": session_id})).await;
+    let _ = client::execute_typed(&params, &format!("DROP TABLE IF EXISTS {table}"), &[]).await;
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
