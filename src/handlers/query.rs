@@ -1066,9 +1066,29 @@ async fn exec_query_on_client(
     };
 
     // #170: short-circuit on a prepare failure *inside an open transaction*.
-    // The prepare already aborted the transaction server-side; running
-    // `query_typed` would 25P02 instead of surfacing the real error. ROLLBACK
-    // the now-dead transaction and return the prepare's real error.
+    //
+    // The prepare already aborted the transaction server-side (any hard ERROR
+    // during Parse/Describe/Sync puts the txn block into `inError`/`INFAILED`).
+    // Running `query_typed` next would fail with 25P02 ("current transaction is
+    // aborted") and hide the real, actionable error — and because
+    // `transaction_effect("SELECT")=None` keeps the batch caller's
+    // `in_transaction=true`, the aborted connection would be re-pinned and
+    // every subsequent batch 25P02s until an explicit ROLLBACK (the cascade).
+    //
+    // The ROLLBACK here is deliberate and not a regression of psql semantics.
+    // The transaction is *already dead* — the pending writes in it are
+    // discardable either way (psql would discard them when the user issues the
+    // ROLLBACK the aborted state forces; we discard them now). Ending the
+    // transaction lets the remaining statements in the batch run cleanly
+    // (autocommit) instead of 25P02ing, and surfaces the real error. We tell
+    // the user the transaction was rolled back in the error message so the
+    // state change isn't silent.
+    //
+    // A SAVEPOINT can't help here: the prepare aborted the *outer* transaction,
+    // not a savepoint, so there's nothing to roll back *to* that would leave the
+    // earlier writes intact. The alternative — keeping `in_transaction=true`
+    // and letting the user ROLLBACK explicitly — is the 25P02 cascade this fix
+    // exists to close.
     if let Some(e) = prepare_err.as_ref() {
         if should_short_circuit_on_prepare_err(in_transaction) {
             // Best-effort ROLLBACK; the transaction is aborted, so ROLLBACK is
@@ -1081,8 +1101,16 @@ async fn exec_query_on_client(
                     "ROLLBACK after a prepare failure aborted a transaction failed: {rollback_err}"
                 );
             }
+            // Surface the prepare's real SQLSTATE (e.g. 42P01) and tell the
+            // user the transaction was rolled back, so the state change isn't
+            // implicit — a multi-statement batch's user needs to know earlier
+            // writes were discarded.
             return QueryOutcome {
-                result: Err(client::format_query_error(e, is_transaction_pooler)),
+                result: Err(format!(
+                    "{}\n\nThe transaction was rolled back (a statement in it \
+                     failed with an error that aborted the transaction).",
+                    client::format_query_error(e, is_transaction_pooler),
+                )),
                 txn_aborted: true,
             };
         }

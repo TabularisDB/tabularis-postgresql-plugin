@@ -1451,6 +1451,14 @@ async fn prepare_error_in_open_transaction_surfaces_real_sqlstate_not_25p02() {
         "the error must not be the 25P02 cascade (\"current transaction is \
          aborted\"); got: {err_msg:?}"
     );
+    // The fix ROLLBACKs the aborted transaction and must tell the user so the
+    // state change isn't silent (the user's earlier writes in the transaction
+    // were discarded). Without this, a multi-statement batch's user wouldn't
+    // know the transaction was ended.
+    assert!(
+        err_msg.contains("rolled back"),
+        "the error should tell the user the transaction was rolled back; got: {err_msg:?}"
+    );
 
     // Batch 3: a plain `SELECT 1` on the same session. On current code the
     // aborted connection was re-pinned (in_transaction stayed true), so this
@@ -1693,6 +1701,14 @@ async fn prepare_error_in_open_transaction_on_direct_connection_surfaces_real_sq
         !err_msg.contains("current transaction is aborted"),
         "the error must not be the 25P02 cascade (\"current transaction is \
          aborted\"); got: {err_msg:?}"
+    );
+    // The fix ROLLBACKs the aborted transaction and must tell the user so the
+    // state change isn't silent (the user's earlier writes in the transaction
+    // were discarded). Without this, a multi-statement batch's user wouldn't
+    // know the transaction was ended.
+    assert!(
+        err_msg.contains("rolled back"),
+        "the error should tell the user the transaction was rolled back; got: {err_msg:?}"
     );
 
     // Teardown: evict the pool entry so the aborted-then-ROLLBACK'd connection's
