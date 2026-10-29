@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.13] - 2026-10-29
+
+### Fixed
+
+- A `prepare` failure inside an open transaction no longer cascades to a
+  confusing 25P02 ("current transaction is aborted") on every subsequent
+  statement in the same session (#170, #180). The pre-resolve `prepare` in
+  `exec_query_on_client` swallowed its error via `.ok()` and ran
+  `query_typed` unconditionally; a Parse-time error (e.g. `SELECT * FROM
+  missing_table` → 42P01) inside an open transaction aborted the
+  transaction server-side, so `query_typed` failed with 25P02 instead of the
+  real error — and because `transaction_effect("SELECT")=None` kept the
+  batch caller's `in_transaction=true`, the aborted connection was re-pinned
+  and every subsequent batch 25P02-cascaded until an explicit `ROLLBACK`.
+  The fix gates the swallow on `in_transaction`: inside an open transaction
+  it short-circuits (best-effort ROLLBACK + surface the prepare's real
+  SQLSTATE + signal `txn_aborted=true` so the caller forces
+  `in_transaction=false` and releases the connection); outside a
+  transaction the recoverable swallow is preserved (a 42P05 on a real
+  PgBouncer bare batch where `query_typed`'s unnamed protocol can still
+  succeed). The error message tells the user the transaction was rolled
+  back so the state change isn't silent.
+
+- A `query_typed` / `execute_typed` runtime error inside an open
+  transaction no longer re-pins the aborted connection and 25P02-cascades
+  the next statement (#181, #184). The sibling of #170 from a different
+  source: a runtime error at execute time (division by zero, a constraint
+  violation at fetch, a failed DDL/write, a 42P01 on a relation dropped
+  between prepare and fetch) also aborts the transaction, but #170
+  deliberately left those two error arms returning `txn_aborted: false`.
+  The fix classifies on the error's `as_db_error()` (a server `DbError` is
+  any ERROR-class response — WARNING/NOTICE never arrive as a query
+  `Error`, they're delivered out-of-band as `AsyncMessage::Notice`, so
+  every `DbError` aborts an open transaction); non-`DbError` errors
+  (transport/timeout) are conservatively assumed to have aborted it. Both
+  error arms now ROLLBACK + surface the real error + signal
+  `txn_aborted=true`, gated on `transaction_effect(query)` being neither
+  `Closes` nor `Chains` so a failed `COMMIT`/`ROLLBACK`/`END`/`COMMIT AND
+  CHAIN` — which already ended the transaction server-side and is handled
+  by the existing `Closes`/`Chains` path — does not get a spurious ROLLBACK
+  and "rolled back" notice. Closes the 25P02 cascade end-to-end (#170
+  prepare-failure + #181 runtime-error = the two faces).
+
+### Dependencies
+
+- `uuid` bumped from 1.28.0 to 1.29.0 (#182). Additive only — adds
+  versioned constructors to `NonNilUuid`; the existing `Uuid` API the
+  plugin uses (`parse`, `from_sql`, `to_string`) is untouched. Semver-
+  compatible with the existing `uuid = "1.20"` constraint.
+
+- `tokio` bumped from 1.53.3 to 1.54.1 (#183). The 1.54.1 patch reverts
+  the only `time`-subsystem change from 1.54.0 (a timer regression), so
+  `tokio::time::timeout` behavior is back to 1.53.3-equivalent — the
+  bound the #170/#181 fixes rely on. All other 1.54.0 changes are
+  additive or internal; none touch the APIs the plugin uses
+  (`time::timeout`, `sync::Mutex`, `spawn`, `#[tokio::test]`). MSRV
+  bumped to 1.85.
+
+### Docs
+
+- Centered the PostgreSQL banner and converted it to PNG; fixed a stale
+  Tabularis logo URL (#179).
+
 ## [1.0.0-rc.12] - 2026-10-23
 
 ### Fixed
