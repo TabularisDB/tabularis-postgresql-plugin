@@ -74,6 +74,7 @@
     "sql_dialect": "postgres",
     "alter_primary_key": true,
     "alter_column": true,
+    "column_comments": true,
     "create_foreign_keys": true,
     "manage_tables": true,
     "supports_ssl": true,

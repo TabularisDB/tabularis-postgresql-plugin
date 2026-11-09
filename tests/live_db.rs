@@ -30,6 +30,86 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 use serde_json::{json, Value};
 
+#[test]
+fn column_comments_round_trip_through_the_plugin() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let table = format!("live_comments_{}", uuid::Uuid::new_v4().simple());
+    plugin.call_ok("execute_query", json!({"params": params, "query": format!("CREATE TABLE public.\"{table}\" (id SERIAL PRIMARY KEY, email TEXT NOT NULL DEFAULT 'unknown' UNIQUE)")}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let baseline = plugin.call_ok(
+            "get_columns",
+            json!({"params": params, "table": table, "schema": "public"}),
+        );
+        let original = json!({"name": "email", "data_type": "TEXT", "is_nullable": false, "is_pk": false,
+            "is_auto_increment": false, "default_value": "'unknown'::text"});
+        let mut old = original.clone();
+        for text in [Some("Customer's email\\path\n日本語"), Some("new"), None] {
+            let mut new = original.clone();
+            new["comment"] = json!(text);
+            let sql = plugin.call_ok(
+                "get_alter_column_sql",
+                json!({"table": table, "schema": "public", "old_column": old, "new_column": new}),
+            );
+            assert_eq!(sql.as_array().unwrap().len(), 1);
+            for statement in sql.as_array().unwrap() {
+                plugin.call_ok(
+                    "execute_query",
+                    json!({"params": params, "query": statement}),
+                );
+            }
+            let mut columns = plugin.call_ok(
+                "get_columns",
+                json!({"params": params, "table": table, "schema": "public"}),
+            );
+            let email = columns
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|c| c["name"] == "email")
+                .unwrap();
+            assert_eq!(email.get("comment").unwrap_or(&Value::Null), &json!(text));
+            email.as_object_mut().unwrap().remove("comment");
+            assert_eq!(columns, baseline);
+            old = new;
+        }
+        let mut added = original;
+        added["name"] = json!("notes");
+        added["comment"] = json!("New column's note");
+        let sql = plugin.call_ok(
+            "get_add_column_sql",
+            json!({"table": table, "column": added}),
+        );
+        assert_eq!(sql.as_array().unwrap().len(), 2);
+        for statement in sql.as_array().unwrap() {
+            plugin.call_ok(
+                "execute_query",
+                json!({"params": params, "query": statement}),
+            );
+        }
+        let columns = plugin.call_ok(
+            "get_columns",
+            json!({"params": params, "table": table, "schema": "public"}),
+        );
+        assert_eq!(
+            columns
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "notes")
+                .unwrap()["comment"],
+            "New column's note"
+        );
+    }));
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": format!("DROP TABLE public.\"{table}\"")}),
+    );
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
