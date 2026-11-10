@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [1.0.0-rc.14] - 2026-11-10
+
+### Added
+
+- Column comments are now supported through the driver `column_comments`
+  capability (#187). Add Column appends `COMMENT ON COLUMN`; Modify Column
+  adds, replaces, or clears a comment without restating unchanged column
+  attributes (type, nullability, default), and a rename plus comment targets
+  the new column name. Comment text is emitted as a PostgreSQL escape string
+  (`E'...'`), so apostrophes, backslashes, Unicode, and line breaks survive
+  intact and identical to the built-in driver — including under
+  `standard_conforming_strings = off`. Clearing a comment emits
+  `COMMENT ON COLUMN ... IS NULL`. The optional `comment` field on a column
+  definition carries forward older host payloads unchanged (`#[serde(default)]`).
+  Byte-for-byte parity with the built-in driver's implementation (companion
+  to host issue tabularis#1448).
+
+### Dependencies
+
+- `log` 0.4.34 → 0.4.35 (#186). An upstream no-op patch: the 0.4.35 release
+  contains no source changes (it reworks `log`'s own CI/CD pipeline), so
+  runtime behavior is identical. `log` writes only to stderr and is never
+  on the JSON-RPC response path.
+
 ## [1.0.0-rc.13] - 2026-10-29
 
 ### Fixed
