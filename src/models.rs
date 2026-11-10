@@ -90,6 +90,8 @@ pub struct ColumnDefinition {
     pub is_pk: bool,
     pub is_auto_increment: bool,
     pub default_value: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 /// Mirrors `crate::models::RoutineCallArg` on the host — one argument of a

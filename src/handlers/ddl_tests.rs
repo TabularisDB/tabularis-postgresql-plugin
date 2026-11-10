@@ -8,6 +8,70 @@ use super::{
 };
 use crate::models::ColumnDefinition;
 
+#[tokio::test]
+async fn column_comments_are_supported_by_the_rpc_contract() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../.tabularium")).unwrap();
+    assert_eq!(manifest["capabilities"]["column_comments"], true);
+    let definition = serde_json::json!({
+        "name": "email", "data_type": "TEXT", "is_nullable": false,
+        "is_pk": false, "is_auto_increment": false, "default_value": "'unknown'"
+    });
+    for (old, new, literal) in [
+        (
+            None,
+            Some("O'Brien\\path\n日本語"),
+            "E'O''Brien\\\\path\n日本語'",
+        ),
+        (Some("old"), Some("new"), "E'new'"),
+        (Some("old"), None, "NULL"),
+    ] {
+        let mut old_column = definition.clone();
+        old_column["comment"] = serde_json::json!(old);
+        let mut new_column = definition.clone();
+        new_column["comment"] = serde_json::json!(new);
+        let result = super::get_alter_column_sql(serde_json::json!(1), &serde_json::json!({
+            "table": "customers", "schema": "sales", "old_column": old_column, "new_column": new_column
+        })).await;
+        assert_eq!(
+            result["result"],
+            serde_json::json!([format!(
+                "COMMENT ON COLUMN \"sales\".\"customers\".\"email\" IS {literal}"
+            )])
+        );
+    }
+    let mut added = definition;
+    added["comment"] = serde_json::json!("Contact");
+    let result = super::get_add_column_sql(
+        serde_json::json!(1),
+        &serde_json::json!({
+            "table": "customers", "column": added
+        }),
+    )
+    .await;
+    assert_eq!(result["result"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        result["result"][1],
+        "COMMENT ON COLUMN \"public\".\"customers\".\"email\" IS E'Contact'"
+    );
+}
+
+#[test]
+fn unchanged_comments_are_not_rewritten_and_renames_use_the_new_name() {
+    let mut old = column("email", "TEXT");
+    old.comment = Some("existing".into());
+    let mut new = old.clone();
+    new.name = "contact\"address".into();
+    let renamed = build_alter_column_sql("customers", &old, &new, "sales").unwrap();
+    assert_eq!(renamed.len(), 1);
+    new.comment = Some("new".into());
+    let updated = build_alter_column_sql("customers", &old, &new, "sales").unwrap();
+    assert_eq!(
+        updated[1],
+        "COMMENT ON COLUMN \"sales\".\"customers\".\"contact\"\"address\" IS E'new'"
+    );
+}
+
 fn column(name: &str, data_type: &str) -> ColumnDefinition {
     ColumnDefinition {
         name: name.to_string(),
@@ -16,6 +80,7 @@ fn column(name: &str, data_type: &str) -> ColumnDefinition {
         is_pk: false,
         is_auto_increment: false,
         default_value: None,
+        comment: None,
     }
 }
 
@@ -32,6 +97,7 @@ mod create_table {
                 is_pk: true,
                 is_auto_increment: true,
                 default_value: None,
+                comment: None,
             },
             column("name", "TEXT"),
         ];
@@ -50,6 +116,7 @@ mod create_table {
             is_pk: true,
             is_auto_increment: true,
             default_value: Some("1".to_string()),
+            comment: None,
         }];
         let sql = build_create_table_sql("t", &columns, "public");
         // is_auto_increment suppresses both NOT NULL and DEFAULT even though
@@ -67,6 +134,7 @@ mod create_table {
             is_pk: true,
             is_auto_increment: true,
             default_value: None,
+            comment: None,
         }];
         let sql = build_create_table_sql("t", &columns, "public");
         assert!(sql.contains("\"id\" BIGSERIAL"));
@@ -81,6 +149,7 @@ mod create_table {
             is_pk: false,
             is_auto_increment: false,
             default_value: None,
+            comment: None,
         }];
         let sql = build_create_table_sql("t", &columns, "public");
         assert!(sql.contains("\"name\" TEXT NOT NULL"));
@@ -95,6 +164,7 @@ mod create_table {
             is_pk: false,
             is_auto_increment: false,
             default_value: Some("'unknown@example.com'".to_string()),
+            comment: None,
         }];
         let sql = build_create_table_sql("t", &columns, "public");
         assert!(sql.contains("DEFAULT 'unknown@example.com'"));
@@ -120,6 +190,7 @@ mod add_column {
             is_pk: false,
             is_auto_increment: false,
             default_value: Some("0".to_string()),
+            comment: None,
         };
         let sql = build_add_column_sql("all_types", &col, "test_schema");
         assert!(sql

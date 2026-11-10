@@ -70,6 +70,9 @@ both drivers against the same live database and compares every response.
 - **DDL Generation** — `CREATE TABLE`, `ADD COLUMN`, `ALTER COLUMN` (including
   implicit-cast-compatible `TYPE` changes), `CREATE INDEX`, `ADD CONSTRAINT
   FOREIGN KEY`, plus the corresponding drops.
+- **Column Comments** — The `column_comments` capability enables descriptions in
+  Add/Modify Column. Comment edits generate `COMMENT ON COLUMN`; clearing a
+  description removes it with `IS NULL`, without restating the column definition.
 - **View & Trigger Lifecycle** — Create/alter/drop views, create/drop triggers,
   refresh materialized views.
 - **BLOB Support** — Export a `bytea` column to a file or preview it as a

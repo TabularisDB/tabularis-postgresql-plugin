@@ -10,6 +10,9 @@
 
 use serde_json::Value;
 
+#[path = "column_comments.rs"]
+mod column_comments;
+
 use crate::client;
 use crate::models::{inner_params, ColumnDefinition, ConnectionParams};
 use crate::rpc::{error_response, ok_response};
@@ -46,10 +49,17 @@ pub async fn get_add_column_sql(id: Value, params: &Value) -> Value {
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     match column {
-        Some(column) => ok_response(
-            id,
-            Value::from(vec![build_add_column_sql(table, &column, schema)]),
-        ),
+        Some(column) => {
+            let mut statements = vec![build_add_column_sql(table, &column, schema)];
+            if let Some(comment) = column.comment.as_deref().filter(|value| !value.is_empty()) {
+                statements.push(column_comments::comment_sql(
+                    &qualified(schema, table),
+                    &column.name,
+                    Some(comment),
+                ));
+            }
+            ok_response(id, Value::from(statements))
+        }
         None => error_response(id, -32602, "Invalid params: missing or malformed 'column'"),
     }
 }
@@ -352,6 +362,13 @@ fn build_alter_column_sql(
         }
     }
 
+    if old_column.comment.as_deref().unwrap_or("") != new_column.comment.as_deref().unwrap_or("") {
+        stmts.push(column_comments::comment_sql(
+            &tbl,
+            &new_column.name,
+            new_column.comment.as_deref(),
+        ));
+    }
     if stmts.is_empty() {
         return Err("No changes detected".to_string());
     }
