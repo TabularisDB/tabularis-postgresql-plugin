@@ -427,6 +427,9 @@ fn row_to_foreign_key(r: &tokio_postgres::Row) -> Value {
     let column_name: String = r.try_get("column_name").unwrap_or_default();
     let ref_table: String = r.try_get("foreign_table_name").unwrap_or_default();
     let ref_column: String = r.try_get("foreign_column_name").unwrap_or_default();
+    // The referenced table can live in another schema than the source table;
+    // without this the host qualifies `ref_table` with the source schema.
+    let ref_schema: Option<String> = r.try_get("foreign_schema_name").ok().flatten();
     let on_update: Option<String> = r.try_get("update_rule").ok().flatten();
     let on_delete: Option<String> = r.try_get("delete_rule").ok().flatten();
     // WITH ORDINALITY yields the position within conkey/confkey — the true
@@ -448,6 +451,12 @@ fn row_to_foreign_key(r: &tokio_postgres::Row) -> Value {
         "on_delete": on_delete,
         "on_update": on_update,
     });
+
+    if let Some(schema) = ref_schema {
+        fk.as_object_mut()
+            .unwrap()
+            .insert("ref_schema".to_string(), json!(schema));
+    }
 
     if let Some(seq) = seq_in_fk {
         fk.as_object_mut()
