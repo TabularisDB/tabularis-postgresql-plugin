@@ -134,6 +134,7 @@ pub async fn handle_line(line: &str) -> Option<Value> {
 
         // Query execution
         "execute_query" => handlers::query::execute_query(id, &params).await,
+        "execute_read_only_query" => handlers::query::execute_read_only_query(id, &params).await,
         "execute_query_batch" => handlers::query::execute_query_batch(id, &params).await,
         "release_session" => handlers::query::release_session(id, &params).await,
         "explain_query" => handlers::query::explain_query(id, &params).await,
