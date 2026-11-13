@@ -1258,3 +1258,13 @@ mod client_tests;
 #[cfg(test)]
 #[path = "client_live_tests.rs"]
 mod client_live_tests;
+
+/// Evict the target pool before DROP DATABASE; never terminate other clients.
+pub(crate) fn close_database_pool(params: &ConnectionParams) -> Result<(), String> {
+    let key = connection_key(params);
+    let mut pools = POOLS.lock().map_err(|e| e.to_string())?;
+    if let Some(pool) = pools.remove(&key) {
+        pool.close();
+    }
+    Ok(())
+}

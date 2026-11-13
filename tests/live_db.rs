@@ -2712,3 +2712,76 @@ fn get_materialized_view_definition_rejects_a_regular_view() {
         }),
     );
 }
+
+#[test]
+fn database_operations_use_the_explicit_target_even_when_a_uri_names_another_database() {
+    let mut plugin = Plugin::spawn();
+    let admin = conn_params();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let base = format!("operations_base_{suffix}");
+    let target = format!("operations_target_{suffix}");
+    for name in [&base, &target] {
+        plugin.call_ok(
+            "execute_query",
+            json!({"params":admin,"query":format!("CREATE DATABASE \"{name}\"")}),
+        );
+    }
+    let mut base_params = admin.clone();
+    base_params["database"] = json!(base);
+    let mut target_params = admin.clone();
+    target_params["database"] = json!(target);
+    for params in [&base_params, &target_params] {
+        for query in [
+            "CREATE TABLE marker (id INTEGER)",
+            "INSERT INTO marker VALUES (1)",
+        ] {
+            plugin.call_ok("execute_query", json!({"params":params,"query":query}));
+        }
+    }
+    let mut uri_params = target_params.clone();
+    uri_params["connection_string"] = json!(format!(
+        "host={} port={} user={} password={} dbname={}",
+        admin["host"].as_str().unwrap(),
+        admin["port"],
+        admin["username"].as_str().unwrap(),
+        admin["password"].as_str().unwrap(),
+        base
+    ));
+    plugin.call_ok(
+        "database_operation",
+        json!({"params":uri_params,"operation":"truncate"}),
+    );
+    let target_rows = plugin.call_ok(
+        "execute_query",
+        json!({"params":target_params,"query":"SELECT * FROM marker"}),
+    );
+    assert!(target_rows["rows"].as_array().unwrap().is_empty());
+    let base_rows = plugin.call_ok(
+        "execute_query",
+        json!({"params":base_params,"query":"SELECT * FROM marker"}),
+    );
+    assert_eq!(base_rows["rows"].as_array().unwrap().len(), 1);
+    plugin.call_ok(
+        "database_operation",
+        json!({"params":uri_params,"operation":"empty"}),
+    );
+    let tables = plugin.call_ok(
+        "get_tables",
+        json!({"params":target_params,"schema":"public"}),
+    );
+    assert!(tables.as_array().unwrap().is_empty());
+    plugin.call_ok(
+        "database_operation",
+        json!({"params":uri_params,"operation":"drop"}),
+    );
+    // The marker in the other database survives every operation.
+    let base_rows = plugin.call_ok(
+        "execute_query",
+        json!({"params":base_params,"query":"SELECT * FROM marker"}),
+    );
+    assert_eq!(base_rows["rows"].as_array().unwrap().len(), 1);
+    plugin.call_ok(
+        "database_operation",
+        json!({"params":base_params,"operation":"drop"}),
+    );
+}

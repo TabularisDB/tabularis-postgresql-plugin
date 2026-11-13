@@ -300,3 +300,15 @@ classification actually changes, not on every edit to the title text.
 ## License
 
 Apache-2.0.
+
+### Whole-database operations
+
+The plugin declares independent `empty_database`, `truncate_database`, and
+`drop_database` capabilities for Tabularis's **More Database Operations** menu.
+Empty removes user objects while preserving the database and schema ownership,
+permissions and comments. Truncate clears all local user tables across schemas
+and resets identities without dropping objects; foreign tables are rejected.
+Both operations use a transaction. Drop connects through `postgres` and refuses
+protected databases or databases still used by other sessions; it never forcibly
+terminates unrelated clients. The explicit browsed database overrides the database
+embedded in a legacy connection string. Read-only requests are rejected.
