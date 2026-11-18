@@ -2640,6 +2640,47 @@ fn get_materialized_view_definition_returns_ddl_not_not_implemented() {
     );
 }
 
+/// A foreign key into another schema reports that schema as `ref_schema`
+/// from both `get_foreign_keys` and `get_all_foreign_keys_batch`, so the
+/// host doesn't qualify `ref_table` with the source schema.
+#[test]
+fn foreign_keys_report_the_referenced_schema_for_cross_schema_references() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+
+    for query in [
+        "DROP SCHEMA IF EXISTS live_db_fk_ref CASCADE",
+        "DROP SCHEMA IF EXISTS live_db_fk_src CASCADE",
+        "CREATE SCHEMA live_db_fk_ref",
+        "CREATE SCHEMA live_db_fk_src",
+        "CREATE TABLE live_db_fk_ref.parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE live_db_fk_src.child \
+         (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES live_db_fk_ref.parent(id))",
+    ] {
+        plugin.call_ok("execute_query", json!({"params": params, "query": query}));
+    }
+
+    let fks = plugin.call_ok(
+        "get_foreign_keys",
+        json!({"params": params, "table": "child", "schema": "live_db_fk_src"}),
+    );
+    assert_eq!(fks[0]["ref_table"], json!("parent"));
+    assert_eq!(fks[0]["ref_schema"], json!("live_db_fk_ref"));
+
+    let batch = plugin.call_ok(
+        "get_all_foreign_keys_batch",
+        json!({"params": params, "schema": "live_db_fk_src"}),
+    );
+    assert_eq!(batch["child"][0]["ref_schema"], json!("live_db_fk_ref"));
+
+    for query in [
+        "DROP SCHEMA IF EXISTS live_db_fk_src CASCADE",
+        "DROP SCHEMA IF EXISTS live_db_fk_ref CASCADE",
+    ] {
+        plugin.call_ok("execute_query", json!({"params": params, "query": query}));
+    }
+}
+
 /// A nonexistent materialized view surfaces a clean error, not a silent
 /// success or a crash — the `($1::text)::regclass` cast raises a PostgreSQL
 /// error that maps to a -32603 response. Mirrors the existing

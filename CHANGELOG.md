@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `get_foreign_keys` and `get_all_foreign_keys_batch` now return `ref_schema`,
+  the schema of the referenced table. A foreign key into another schema
+  (`billing.carry_forwards.organization_id → core.organizations.id`) no longer
+  makes the Related Records panel query `billing.organizations`. Byte-for-byte
+  parity with the built-in driver (companion to the tabularis host change).
+
 ## [1.0.0-rc.14] - 2026-11-10
 
 ### Added
