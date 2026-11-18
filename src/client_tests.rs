@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
     get_pool_client, load_client_cert_from_pem, load_roots_from_pem, pooler_error_lead,
-    resolve_ssl_mode, with_text_types, NoCertVerifier, VerifyCaCertVerifier, POOLS,
+    resolve_ssl_mode, uses_tls, with_text_types, NoCertVerifier, VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use crate::settings;
@@ -1069,6 +1069,80 @@ fn resolve_ssl_mode_leaves_unset_or_unknown_values_unmapped() {
     assert_eq!(resolve_ssl_mode(Some("bogus")), None);
 }
 
+// Coverage for #192: `needs_tls` returned false for `prefer`/`allow`/unset,
+// so `build_pool_impl` wired `NoTls` for them. With `cfg.ssl_mode = Prefer`
+// (the unset/default, and the explicit `prefer`/`allow` mapping) plus a
+// `NoTls` connector, tokio_postgres's `connect_tls` took its
+// `Prefer if !tls.can_connect` arm — and `NoTls::can_connect` is always false
+// — so it skipped the SSL request entirely: pure plaintext, never asking the
+// server for TLS. Servers that require SSL (`hostssl` / cloud-managed
+// Postgres / k8s port-forwards) reject that with
+// `no pg_hba.conf entry for host ... no encryption`. The fix inverts the
+// predicate to `uses_tls`: only `disable` is plaintext; every other mode
+// (including unset, which the builtin normalizes to `prefer`) wires a
+// TLS-capable connector so the SSL request is actually sent.
+
+#[test]
+fn uses_tls_is_false_only_for_disable() {
+    assert!(!uses_tls(&params_with_ssl("disable")));
+}
+
+#[test]
+fn uses_tls_is_true_for_require_verify_ca_verify_full() {
+    assert!(uses_tls(&params_with_ssl("require")));
+    assert!(uses_tls(&params_with_ssl("verify-ca")));
+    assert!(uses_tls(&params_with_ssl("verify-full")));
+}
+
+#[test]
+fn uses_tls_is_true_for_prefer_allow_and_unset() {
+    // The #192 regression: these three must use TLS so tokio_postgres sends
+    // the SSLRequest and can negotiate (or fall back) rather than being
+    // forced to plaintext by a NoTls connector whose can_connect is false.
+    assert!(uses_tls(&params_with_ssl("prefer")));
+    assert!(uses_tls(&params_with_ssl("allow")));
+    let mut unset = params_with_ssl("prefer");
+    unset.ssl_mode = None;
+    assert!(
+        uses_tls(&unset),
+        "unset ssl_mode must use TLS (builtin treats unset as prefer)"
+    );
+}
+
+#[test]
+fn uses_tls_is_true_for_an_unrecognized_mode() {
+    // An unknown ssl_mode is left unmapped by resolve_ssl_mode (tokio_postgres
+    // keeps its Prefer default), and uses_tls must still wire a TLS connector
+    // so the connection attempts TLS rather than being forced to plaintext.
+    // Matching the builtin: only an explicit `disable` opts out of TLS.
+    assert!(uses_tls(&params_with_ssl("bogus")));
+}
+
+// The #192 fix also closes a second parity gap: `prefer`/`allow`/unset
+// previously fell through `build_tls_connector` to `with_platform_verifier()`
+// (which validates the server cert against the OS trust store), but the
+// builtin uses `NoCertVerifier` (no validation) for `prefer`/`allow`/`require`.
+// The three now share the `NoCertVerifier` branch with `require`.
+//
+// We can't assert the verifier type directly — rustls's `ClientConfig.verifier`
+// field is `pub(super)`, private to external crates — and distinguishing
+// NoCertVerifier from a platform verifier behaviorally requires an actual TLS
+// handshake. That live proof is the load-bearing guard this repo uses
+// (matching #132/#160's live-test placement); here we lock in the connector
+// still builds for all three non-validating modes without a CA, the structural
+// precondition the fix relies on.
+
+#[test]
+fn build_tls_connector_prefer_allow_unset_build_without_a_ca() {
+    build_tls_connector(&params_with_ssl("prefer"))
+        .expect("prefer must build a connector without ssl_ca");
+    build_tls_connector(&params_with_ssl("allow"))
+        .expect("allow must build a connector without ssl_ca");
+    let mut unset = params_with_ssl("prefer");
+    unset.ssl_mode = None;
+    build_tls_connector(&unset).expect("unset must build a connector without ssl_ca");
+}
+
 // Coverage for #44: build_tls_connector's `require` branch fell through to
 // with_platform_verifier(), which DOES validate the server cert against the
 // OS trust store — contradicting the function's own doc comment ("require
@@ -1113,10 +1187,11 @@ fn build_tls_connector_require_builds_successfully_with_no_ssl_ca() {
 // Coverage for #90: `require`/`verify-ca` lazily install the rustls
 // CryptoProvider as a side effect of `NoCertVerifier::new()` /
 // `VerifyCaCertVerifier::new()`, but `verify-full` (both branches below)
-// and the prefer/allow/disable fallthrough build a `ClientConfig`/
-// `WebPkiServerVerifier` directly, with no such side effect. In rustls
-// 0.23 with only the `ring` feature enabled (no auto-install), the first
-// TLS operation in the *process* to reach `ClientConfig::builder()` (or
+// builds a `ClientConfig`/`WebPkiServerVerifier` directly, with no such side
+// effect. (`prefer`/`allow`/unset now go through `NoCertVerifier::new()` too
+// after #192, and `disable` never reaches `build_tls_connector` at all.) In
+// rustls 0.23 with only the `ring` feature enabled (no auto-install), the
+// first TLS operation in the *process* to reach `ClientConfig::builder()` (or
 // `WebPkiServerVerifier::builder()`, or `with_platform_verifier()`) panics
 // with "no process-level CryptoProvider available" unless something
 // installed a provider first. `build_tls_connector` now calls
@@ -1124,8 +1199,8 @@ fn build_tls_connector_require_builds_successfully_with_no_ssl_ca() {
 // branches build successfully regardless of call order — these tests
 // don't (and structurally can't, since the shared test binary runs many
 // tests in one process and a `Once` is process-global) prove the panic
-// would occur without the fix; they lock in that all four
-// previously-under-verified branches still succeed with it.
+// would occur without the fix; they lock in that the previously-under-
+// verified `verify-full` branches still succeed with it.
 #[test]
 fn build_tls_connector_verify_full_with_ca_builds_successfully() {
     let ca_path = write_temp_file(FIXTURE_CA_CERT_PEM);
@@ -1151,9 +1226,9 @@ fn build_tls_connector_verify_full_without_ca_builds_successfully() {
 
 #[test]
 fn build_tls_connector_prefer_mode_builds_successfully() {
-    // The plain fallthrough branch: ssl_mode outside
-    // require/verify-ca/verify-full goes straight to
-    // with_platform_verifier() with no verifier constructor run first.
+    // `prefer` now shares the NoCertVerifier branch with `require`/`allow`/
+    // unset (#192), instead of falling through to with_platform_verifier().
+    // The connector must still build without panicking.
     let params = params_with_ssl("prefer");
     build_tls_connector(&params).expect("prefer mode must build a connector without panicking");
 }
