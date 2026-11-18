@@ -92,13 +92,13 @@ impl Drop for CancelGuard {
 
 /// Send `pg_cancel_backend` for `token`'s connection, using the same
 /// TLS-vs-plaintext choice the original pool made for `params` (see
-/// `client::needs_tls`/`client::make_tls_connect`). Errors are logged and
+/// `client::uses_tls`/`client::make_tls_connect`). Errors are logged and
 /// swallowed: this runs from a fire-and-forget notification handler with no
 /// response channel back to the host, and the server never reports whether
 /// a cancellation attempt actually landed anyway (see
 /// `tokio_postgres::CancelToken::cancel_query`'s own doc comment).
 async fn run_cancel(token: CancelToken, params: ConnectionParams) {
-    let result = if client::needs_tls(&params) {
+    let result = if client::uses_tls(&params) {
         match client::make_tls_connect(&params) {
             Ok(tls) => token.cancel_query(tls).await,
             Err(e) => {
