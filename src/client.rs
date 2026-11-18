@@ -608,9 +608,12 @@ pub fn cleanup_idle_pools() {
 /// needed at all. Callers must check [`uses_tls`] first and use the plaintext
 /// `NoTls` connector directly when it's `false` (only `disable`, matching
 /// the pool's own two-branch `if uses_tls(params) { .. } else { .. }` shape in
-/// `build_pool` below); `build_tls_connector` always returns a usable rustls
-/// `ClientConfig`, so wiring it up for `disable` would make the cancel
-/// connection attempt a TLS handshake the pool itself made in plaintext.
+/// `build_pool` below); `build_tls_connector` returns a usable rustls
+/// `ClientConfig` for every mode `uses_tls` lets through (it can `Err` on a
+/// misconfigured `verify-ca` without `ssl_ca`, but that connection would have
+/// failed at pool creation before a `CancelToken` existed to cancel), so
+/// wiring it up for `disable` would make the cancel connection attempt a TLS
+/// handshake the pool itself made in plaintext.
 pub(crate) fn make_tls_connect(params: &ConnectionParams) -> Result<MakeRustlsConnect, String> {
     let tls_config = build_tls_connector(params)?;
     Ok(MakeRustlsConnect::new(tls_config))
@@ -717,9 +720,14 @@ async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Res
             .map_err(|e| format!("Pool creation failed (TLS): {e}"))
     } else {
         // `disable` is the only plaintext path: `uses_tls` is false solely for
-        // it, so NoTls here matches both tokio_postgres's SslMode::Disable
-        // (which skips the SSL request unconditionally) and the builtin's
-        // build_postgres_tls_connector, which also wires NoTls for `disable`.
+        // it, so `NoTls` here matches tokio_postgres's `SslMode::Disable`
+        // (set by `resolve_ssl_mode`), which `connect_tls` short-circuits to a
+        // raw plaintext stream before any connector runs. The builtin driver
+        // achieves the same plaintext result differently — it still builds a
+        // rustls `NoCertVerifier` connector but sets `cfg.ssl_mode(Disable)`,
+        // and lets tokio_postgres's `connect_tls` skip the handshake; this
+        // plugin swaps the connector type to `NoTls` instead. Either way the
+        // wire behavior is identical: no SSLRequest sent.
         if !skip_preflight {
             if let Some(script) = script {
                 preflight_startup_script(&cfg, NoTls, script).await?;
@@ -888,11 +896,26 @@ where
     outcome.map_err(startup_script_error)
 }
 
+/// Normalize an `ssl_mode` string the way the builtin driver does
+/// (`pool_manager.rs::normalized_ssl_mode`): trim, then ASCII-lowercase.
+/// Used by [`uses_tls`] and [`build_tls_connector`] so that `ssl_mode`
+/// values from the host are matched case- and whitespace-insensitively,
+/// matching the builtin's `normalized_ssl_mode` + `non_empty_ssl_mode`
+/// (`pool_manager.rs:130-137`). A trimmed-empty string (e.g. `"   "`) is
+/// treated as unset (`None`), matching the builtin's `non_empty_ssl_mode`.
+fn normalize_ssl_mode(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
 /// Whether the connection uses TLS at all. Only `disable` connects in
 /// plaintext; every other mode — including `prefer`/`allow` and unset
 /// (which the builtin treats as `prefer`) — wires a TLS-capable connector so
 /// tokio_postgres can at least *attempt* the `SSLRequest` handshake and fall
 /// back to plaintext only when the server genuinely offers no TLS.
+///
+/// The comparison is case- and whitespace-insensitive (via
+/// [`normalize_ssl_mode`]) so `"DISABLE"` / `" disable "` route to plaintext
+/// just like `"disable"`, matching the builtin's `normalized_ssl_mode`.
 ///
 /// Returning `false` for `prefer` was the #192 bug: the pool handed
 /// tokio_postgres `SslMode::Prefer` together with the `NoTls` connector, and
@@ -909,7 +932,13 @@ where
 /// into `cancel_query`, so the cancel path has the same `Prefer + NoTls →
 /// plaintext` failure mode and must branch identically.
 pub(crate) fn uses_tls(params: &ConnectionParams) -> bool {
-    params.ssl_mode.as_deref() != Some("disable")
+    params
+        .ssl_mode
+        .as_deref()
+        .map(normalize_ssl_mode)
+        .filter(|s| !s.is_empty())
+        .as_deref()
+        != Some("disable")
 }
 
 /// Map this plugin's `ssl_mode` strings to `deadpool_postgres::SslMode`,
@@ -921,7 +950,11 @@ pub(crate) fn uses_tls(params: &ConnectionParams) -> bool {
 /// Certificate/hostname verification is unaffected — that's handled
 /// separately by `build_tls_connector`.
 fn resolve_ssl_mode(ssl_mode: Option<&str>) -> Option<SslMode> {
-    match ssl_mode {
+    // Normalize (trim + lowercase, treating trimmed-empty as unset) so the
+    // named-arm matches are case- and whitespace-insensitive, matching the
+    // builtin's `normalized_ssl_mode` + `non_empty_ssl_mode`.
+    let normalized: Option<String> = ssl_mode.map(normalize_ssl_mode).filter(|s| !s.is_empty());
+    match normalized.as_deref() {
         Some("disable") => Some(SslMode::Disable),
         Some("allow" | "prefer") => Some(SslMode::Prefer),
         Some("require" | "verify-ca" | "verify-full") => Some(SslMode::Require),
@@ -936,13 +969,15 @@ fn resolve_ssl_mode(ssl_mode: Option<&str>) -> Option<SslMode> {
 /// or `with_platform_verifier()`) panics with "no process-level
 /// CryptoProvider available" unless something installed one first.
 /// `NoCertVerifier::new()`/`VerifyCaCertVerifier::new()` below install it
-/// lazily as a side effect, but only on the `require`/`verify-ca` branches —
-/// the `verify-full` and fallthrough (`prefer`/`allow`/`disable`) branches
-/// build a `ClientConfig` without going through either constructor, so
-/// calling this unconditionally at the top of `build_tls_connector` makes
-/// provider installation independent of which branch runs first. Matches
-/// the builtin driver's `ensure_rustls_crypto_provider`
-/// (`src-tauri/src/pool_manager.rs`).
+/// lazily as a side effect. After #192, `prefer`/`allow`/unset reach
+/// `build_tls_connector` (and thus `NoCertVerifier::new()`) too; only
+/// `disable` never reaches `build_tls_connector` at all (`uses_tls` is
+/// false, so the pool wires `NoTls` directly). The `verify-full` branches
+/// build a `ClientConfig`/`WebPkiServerVerifier` directly, with no such
+/// side effect, so calling this unconditionally at the top of
+/// `build_tls_connector` makes provider installation independent of which
+/// branch runs first. Matches the builtin driver's
+/// `ensure_rustls_crypto_provider` (`src-tauri/src/pool_manager.rs`).
 fn ensure_rustls_crypto_provider() {
     use std::sync::Once;
     static INSTALL: Once = Once::new();
@@ -963,10 +998,23 @@ fn ensure_rustls_crypto_provider() {
 /// When `ssl_cert`/`ssl_key` are both supplied, presents them as a client
 /// certificate for servers requiring mTLS (e.g. Google Cloud SQL) —
 /// matches the builtin driver's `build_postgres_tls_connector` client-auth
-/// handling.
+/// handling. Unrecognized `ssl_mode` values are rejected with a clear
+/// error (matching the builtin's `parse_postgres_ssl_mode`), rather than
+/// silently falling through to platform cert validation.
 fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig, String> {
     ensure_rustls_crypto_provider();
     use rustls_platform_verifier::BuilderVerifierExt;
+
+    // Normalize once: trim + lowercase + treat trimmed-empty as unset, so all
+    // subsequent mode comparisons are case/whitespace-insensitive (matching the
+    // builtin's `normalized_ssl_mode` + `non_empty_ssl_mode`,
+    // `pool_manager.rs:130-137`).
+    let normalized = params
+        .ssl_mode
+        .as_deref()
+        .map(normalize_ssl_mode)
+        .filter(|s| !s.is_empty());
+    let ssl_mode: Option<&str> = normalized.as_deref();
 
     let user_ca = params.ssl_ca.as_deref().filter(|s| !s.trim().is_empty());
     let user_cert = params.ssl_cert.as_deref().filter(|s| !s.trim().is_empty());
@@ -989,7 +1037,7 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
         (None, None) => None,
     };
 
-    if params.ssl_mode.as_deref() == Some("verify-ca") && user_ca.is_none() {
+    if ssl_mode == Some("verify-ca") && user_ca.is_none() {
         return Err(
             "verify-ca mode requires an explicit CA file via ssl_ca. Platform \
              root certificates are not used for this mode — for automatic \
@@ -998,83 +1046,77 @@ fn build_tls_connector(params: &ConnectionParams) -> Result<rustls::ClientConfig
         );
     }
 
-    let needs_cert_validation = matches!(
-        params.ssl_mode.as_deref(),
-        Some("verify-ca" | "verify-full")
-    );
-
-    if needs_cert_validation {
-        if let Some(ca_path) = user_ca {
+    match ssl_mode {
+        Some("verify-ca") => {
+            let ca_path = user_ca.expect("checked above: verify-ca requires ssl_ca");
             let roots = load_roots_from_pem(ca_path)?;
-            if params.ssl_mode.as_deref() == Some("verify-ca") {
-                let verifier = VerifyCaCertVerifier::new(roots)?;
-                let builder = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
-                return match client_auth {
-                    Some((certs, key)) => builder
-                        .with_client_auth_cert(certs, key)
-                        .map_err(|e| format!("Failed to configure client certificate: {e}")),
-                    None => Ok(builder.with_no_client_auth()),
-                };
-            }
-            let verifier =
-                rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots))
-                    .build()
-                    .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
+            let verifier = VerifyCaCertVerifier::new(roots)?;
             let builder = rustls::ClientConfig::builder()
                 .dangerous()
-                .with_custom_certificate_verifier(verifier);
-            return match client_auth {
+                .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
+            match client_auth {
                 Some((certs, key)) => builder
                     .with_client_auth_cert(certs, key)
                     .map_err(|e| format!("Failed to configure client certificate: {e}")),
                 None => Ok(builder.with_no_client_auth()),
-            };
+            }
         }
-    }
-
-    // `require`/`prefer`/`allow`/unset force (or attempt) TLS without any
-    // certificate validation, matching the builtin driver's
-    // `build_postgres_tls_connector`, which uses `NoCertVerifier` for all
-    // non-validating modes — `require`, `allow`, `prefer` (and unset, which
-    // the builtin normalizes to `prefer`). Previously this branch only
-    // handled `require`; `prefer`/`allow`/unset fell through to
-    // `with_platform_verifier()`, which *does* validate the chain against
-    // the OS trust store — a silent parity divergence (and, for #192, the
-    // reason a `prefer` connection that should have just attempted TLS
-    // instead rejected self-signed/local-CA servers the builtin accepts).
-    // `verify-full`-without-CA below is the only remaining platform-verifier
-    // path, since `verify-full` is the documented way to opt into platform
-    // trust. `disable` never reaches `build_tls_connector` at all
-    // (`uses_tls` is false for it, so the pool wires `NoTls` directly).
-    if matches!(
-        params.ssl_mode.as_deref(),
-        None | Some("require" | "prefer" | "allow")
-    ) {
-        let verifier = NoCertVerifier::new();
-        let builder = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
-        return match client_auth {
-            Some((certs, key)) => builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| format!("Failed to configure client certificate: {e}")),
-            None => Ok(builder.with_no_client_auth()),
-        };
-    }
-
-    // `verify-full` without an explicit CA: the only mode that uses the
-    // platform trust store for full chain+hostname validation. `verify-ca`
-    // is handled above (and requires an explicit CA).
-    let builder = rustls::ClientConfig::builder()
-        .with_platform_verifier()
-        .map_err(|e| format!("Failed to build platform TLS verifier: {e}"))?;
-    match client_auth {
-        Some((certs, key)) => builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| format!("Failed to configure client certificate: {e}")),
-        None => Ok(builder.with_no_client_auth()),
+        Some("verify-full") => {
+            // With an explicit CA: validate chain+hostname against it.
+            // Without: use the platform trust store (full validation).
+            let builder = if let Some(ca_path) = user_ca {
+                let roots = load_roots_from_pem(ca_path)?;
+                let verifier =
+                    rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots))
+                        .build()
+                        .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+            } else {
+                rustls::ClientConfig::builder()
+                    .with_platform_verifier()
+                    .map_err(|e| format!("Failed to build platform TLS verifier: {e}"))?
+            };
+            match client_auth {
+                Some((certs, key)) => builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| format!("Failed to configure client certificate: {e}")),
+                None => Ok(builder.with_no_client_auth()),
+            }
+        }
+        // `require`/`prefer`/`allow`/unset: TLS without any certificate
+        // validation — `NoCertVerifier`, matching the builtin driver's
+        // `build_postgres_tls_connector`. `prefer`/`allow` attempt TLS and
+        // fall back to plaintext only if the server offers no TLS;
+        // `require` forces TLS. Before #192, `prefer`/`allow`/unset fell
+        // through to `with_platform_verifier()` (full cert validation), a
+        // silent parity divergence that rejected self-signed/local-CA servers
+        // the builtin accepts.
+        None | Some("require" | "prefer" | "allow") => {
+            let verifier = NoCertVerifier::new();
+            let builder = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(verifier));
+            match client_auth {
+                Some((certs, key)) => builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| format!("Failed to configure client certificate: {e}")),
+                None => Ok(builder.with_no_client_auth()),
+            }
+        }
+        // An unrecognized `ssl_mode` (e.g. a typo like "reqire") is a config
+        // error, not a silent fallback. The builtin's `parse_postgres_ssl_mode`
+        // rejects unknown values with `unknown_ssl_mode_message`
+        // (`pool_manager.rs:123-128`); match that. Before this guard, an
+        // unrecognized value fell through to `with_platform_verifier()`,
+        // silently applying verify-full cert validation to a typo — breaking
+        // self-signed-cert connections with a misleading cert error instead
+        // of naming the bad `ssl_mode`.
+        Some(other) => Err(format!(
+            "Unknown SSL mode \"{other}\". Accepted values: \
+             disable, allow, prefer, require, verify-ca, verify-full."
+        )),
     }
 }
 

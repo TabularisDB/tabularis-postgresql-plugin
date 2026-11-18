@@ -1127,10 +1127,14 @@ fn uses_tls_is_true_for_an_unrecognized_mode() {
 // We can't assert the verifier type directly — rustls's `ClientConfig.verifier`
 // field is `pub(super)`, private to external crates — and distinguishing
 // NoCertVerifier from a platform verifier behaviorally requires an actual TLS
-// handshake. That live proof is the load-bearing guard this repo uses
-// (matching #132/#160's live-test placement); here we lock in the connector
-// still builds for all three non-validating modes without a CA, the structural
-// precondition the fix relies on.
+// handshake. The load-bearing live proof that prefer/unset actually negotiate
+// TLS (not plaintext) lives in `client_live_tests::prefer_unset_negotiates_tls
+// _not_plaintext` (uses `pg_stat_ssl`). Here we lock in the structural
+// precondition: the connector still builds for all three non-validating modes
+// without a CA. The non-vacuous guard against a revert of the NoCertVerifier
+// arm is `build_tls_connector_rejects_an_unrecognized_ssl_mode` below (an
+// unrecognized mode that reached the old platform-verifier fallthrough would
+// build, not error — that test fails on a revert).
 
 #[test]
 fn build_tls_connector_prefer_allow_unset_build_without_a_ca() {
@@ -1141,6 +1145,75 @@ fn build_tls_connector_prefer_allow_unset_build_without_a_ca() {
     let mut unset = params_with_ssl("prefer");
     unset.ssl_mode = None;
     build_tls_connector(&unset).expect("unset must build a connector without ssl_ca");
+}
+
+// Coverage for the unrecognized-ssl_mode finding from the #195 ensemble
+// review: a typo'd or unrecognized ssl_mode must produce a clear config error,
+// not silently fall through to with_platform_verifier (verify-full behavior).
+// Before this guard, "bogus" matched neither the NoCertVerifier arm nor the
+// cert-validation block and reached the platform-verifier fallthrough,
+// silently enforcing full chain+hostname validation against the OS trust
+// store — breaking self-signed-cert connections with a misleading cert error
+// instead of naming the bad ssl_mode. The builtin rejects unknown modes via
+// `parse_postgres_ssl_mode`'s `_ => Err(unknown_ssl_mode_message(...))` arm.
+
+#[test]
+fn build_tls_connector_rejects_an_unrecognized_ssl_mode() {
+    let err = build_tls_connector(&params_with_ssl("bogus"))
+        .expect_err("an unrecognized ssl_mode must be rejected, not silently used");
+    assert!(
+        err.contains("Unknown SSL mode") && err.contains("bogus"),
+        "error must name the unrecognized mode; got: {err}"
+    );
+    assert!(
+        err.contains("verify-ca") && err.contains("verify-full"),
+        "error must list the accepted values; got: {err}"
+    );
+}
+
+#[test]
+fn build_tls_connector_rejects_a_typo_of_require() {
+    // A plausible typo: missing the 'u' in "require". Must error, not silently
+    // fall through to platform-verifier TLS (which would break a connection
+    // that previously worked in plaintext, with a misleading cert error).
+    let err = build_tls_connector(&params_with_ssl("reqire"))
+        .expect_err("a typo of require must be rejected");
+    assert!(
+        err.contains("Unknown SSL mode"),
+        "expected unknown-ssl_mode error; got: {err}"
+    );
+}
+
+// Normalization (trim + lowercase, matching the builtin's normalized_ssl_mode
+// + non_empty_ssl_mode): case and whitespace variants must route the same way
+// as their canonical form. These close the edge-case findings from the #195
+// review (case-sensitivity, whitespace, empty-string).
+
+#[test]
+fn uses_tls_is_false_for_case_and_whitespace_variants_of_disable() {
+    assert!(!uses_tls(&params_with_ssl("DISABLE")));
+    assert!(!uses_tls(&params_with_ssl("Disable")));
+    assert!(!uses_tls(&params_with_ssl(" disable ")));
+    assert!(!uses_tls(&params_with_ssl("\tdisable\n")));
+}
+
+#[test]
+fn uses_tls_treats_trimmed_empty_as_unset_not_disable() {
+    // An empty/whitespace ssl_mode is treated as unset (prefer), not disable —
+    // matching the builtin's non_empty_ssl_mode, which filters trimmed-empty
+    // to None. So it must use TLS, not plaintext.
+    assert!(uses_tls(&params_with_ssl("")));
+    assert!(uses_tls(&params_with_ssl("   ")));
+}
+
+#[test]
+fn build_tls_connector_accepts_case_and_whitespace_variants_of_prefer() {
+    // The normalized match arm must accept uppercase/whitespace variants,
+    // not just the canonical lowercase "prefer".
+    build_tls_connector(&params_with_ssl("PREFER"))
+        .expect("PREFER must build (normalized to prefer)");
+    build_tls_connector(&params_with_ssl(" Prefer "))
+        .expect("\" Prefer \" must build (normalized to prefer)");
 }
 
 // Coverage for #44: build_tls_connector's `require` branch fell through to
@@ -1234,9 +1307,19 @@ fn build_tls_connector_prefer_mode_builds_successfully() {
 }
 
 #[test]
-fn build_tls_connector_disable_mode_builds_successfully() {
+fn build_tls_connector_disable_mode_does_not_build_a_tls_connector() {
+    // `disable` never reaches `build_tls_connector` in production — `uses_tls`
+    // is false for it, so the pool wires `NoTls` directly. The function
+    // rejects it as an unrecognized-for-this-path mode rather than silently
+    // building a TLS connector the pool would never use. This guards against
+    // a future refactor that routes `disable` here by accident.
     let params = params_with_ssl("disable");
-    build_tls_connector(&params).expect("disable mode must build a connector without panicking");
+    let err = build_tls_connector(&params)
+        .expect_err("disable must not build a TLS connector — it uses NoTls");
+    assert!(
+        err.contains("Unknown SSL mode") && err.contains("disable"),
+        "expected an unknown-ssl_mode error for disable, got: {err}"
+    );
 }
 
 // Coverage for #46: verify-ca without an explicit ssl_ca silently fell
