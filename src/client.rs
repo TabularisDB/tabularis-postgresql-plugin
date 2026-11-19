@@ -389,12 +389,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Identifies a connection target for pool-cache purposes.
-/// Matches on host:port:database:user:startup_script, plus every TLS param
-/// (ssl_mode/ssl_ca/ssl_cert/ssl_key) — otherwise two connections differing
-/// only in TLS configuration would incorrectly share a pool and its
-/// already-negotiated TLS setup. Matches the builtin's `build_connection_key`
-/// TLS-param keying in `src-tauri/src/pool_manager.rs`, minus the
-/// per-connection_id refinement that plugin doesn't need yet.
+/// Matches on the endpoint (`socket:{path}` for a Unix socket, or
+/// `host:port` for TCP) plus database:user:startup_script and every TLS
+/// param (ssl_mode/ssl_ca/ssl_cert/ssl_key) — otherwise two connections
+/// differing only in TLS configuration, or in transport (socket vs TCP to
+/// the same database), would incorrectly share a pool. Matches the builtin's
+/// `build_connection_key` TLS-param keying in
+/// `src-tauri/src/pool_manager.rs`, minus the per-connection_id refinement
+/// that plugin doesn't need yet.
 ///
 /// The password is folded in as a SHA-256 hex digest (never plaintext) so a
 /// connection built with a wrong password can't be reused for a later request
@@ -439,9 +441,33 @@ fn connection_key(params: &ConnectionParams) -> String {
         params.ssl_key.as_deref().unwrap_or(""),
     );
 
-    // When connection_string is set, build_pool parses host/port/db/user/
-    // password from the string and ignores those discrete fields — but still
-    // reads TLS params and startup_script from the discrete fields. The key
+    // A Unix socket takes precedence over both the discrete host/port and the
+    // connection_string — matching `build_pool_impl`'s order (the socket
+    // branch returns before the connection_string match). Keying the socket
+    // here too keeps the key and the pool builder in agreement: a socket
+    // connection's key includes `socket:{path}`, so two requests sharing a
+    // connection_string but differing in socket path get distinct pools
+    // (preventing pool-cache collision — the #198 review's top finding).
+    if let Some(socket) = params.local_socket_path() {
+        let socket_endpoint = format!("socket:{socket}");
+        let base = format!(
+            "{}:{}:{}:{}",
+            socket_endpoint,
+            params.database.as_deref().unwrap_or(""),
+            params.username.as_deref().unwrap_or(""),
+            tls_and_script,
+        );
+        return match params.password.as_deref().filter(|s| !s.is_empty()) {
+            Some(pw) => {
+                let hex = sha256_hex(pw.as_bytes());
+                format!("{base}:pw:{hex}")
+            }
+            None => base,
+        };
+    }
+
+    // No socket — connection_string takes precedence over the discrete
+    // host/port/db/user fields (matching build_pool_impl's order). The key
     // mirrors that: the connection string hash replaces the host/port/db/user
     // base, TLS params and startup_script remain. The raw (untrimmed) string
     // is hashed — matching build_pool's `from_str` input verbatim — so two
@@ -457,20 +483,15 @@ fn connection_key(params: &ConnectionParams) -> String {
         return format!("cs:{hex}:{tls_and_script}");
     }
 
-    // No connection_string — key on the discrete host/port (or the Unix
-    // socket) plus database/user, plus the TLS params and startup_script
-    // (already in tls_and_script). A Unix socket replaces host:port as the
-    // endpoint (keyed `socket:{path}`) so socket connections don't share a
-    // pool with TCP connections to the same database. Matches the builtin's
-    // `build_connection_key` endpoint match (`pool_manager.rs:194-201`).
-    let endpoint = match params.local_socket_path() {
-        Some(socket) => format!("socket:{socket}"),
-        None => format!(
-            "{}:{}",
-            params.host.as_deref().unwrap_or(""),
-            params.port.unwrap_or(5432)
-        ),
-    };
+    // No socket, no connection_string — key on the discrete host/port plus
+    // database/user, plus the TLS params and startup_script (already in
+    // tls_and_script). Matches the builtin's `build_connection_key` endpoint
+    // (`pool_manager.rs:194-201`).
+    let endpoint = format!(
+        "{}:{}",
+        params.host.as_deref().unwrap_or(""),
+        params.port.unwrap_or(5432)
+    );
     let base = format!(
         "{}:{}:{}:{}",
         endpoint,
@@ -567,11 +588,11 @@ pub(crate) async fn get_pool_client(
 
 /// Acquire a one-shot client from a **transient** pool that is never inserted
 /// into the global `POOLS` cache. The `pool` local is dropped at the end of
-/// this function (only the `Object` is returned), so the underlying TCP
-/// connection simply closes when the caller later drops the `Object`:
-/// `Object`'s `Drop` upgrades a `WeakPool`; when the pool itself is already
-/// gone the upgrade fails and the inner connection is dropped, never returned
-/// to any pool.
+/// this function (only the `Object` is returned), so the underlying connection
+/// (TCP or Unix socket — see `build_pool`'s `unix_socket_path` override)
+/// simply closes when the caller later drops the `Object`: `Object`'s `Drop`
+/// upgrades a `WeakPool`; when the pool itself is already gone the upgrade
+/// fails and the inner connection is dropped, never returned to any pool.
 ///
 /// This exists for the transaction-pooler result-set path (#160 / #163): it
 /// runs `DEALLOCATE ALL`, which clears server-side prepared statements but
@@ -631,9 +652,13 @@ pub(crate) fn make_tls_connect(params: &ConnectionParams) -> Result<MakeRustlsCo
 
 /// Build a deadpool-postgres pool for the given connection parameters.
 ///
-/// When `connection_string` is set, it takes precedence over the discrete
-/// host/port/database/username/password fields — matching the README's
-/// documented behavior ("as an alternative to the discrete fields above").
+/// When `unix_socket_path` is set (and no tunnel is active — the host strips
+/// it to `None` at every tunnel activation site), the socket takes precedence
+/// over both the discrete host/port fields and `connection_string`, dialing
+/// the socket with TLS forced off (#197). Otherwise, when `connection_string`
+/// is set, it takes precedence over the discrete host/port/database/username/
+/// password fields — matching the README's documented behavior ("as an
+/// alternative to the discrete fields above").
 ///
 /// Pool max size comes from the `poolMaxSize` setting received in the
 /// `initialize` RPC (default 10 — the built-in `postgres` driver's pin,
@@ -789,23 +814,16 @@ async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Res
     }
 }
 
-/// Build a deadpool pool that dials a Unix socket instead of TCP. Deadpool's
-/// `Config` struct has no `host_path` field (its `get_pg_config` only calls
-/// `cfg.host(host_str)` for TCP), so for the socket case we build a
-/// `tokio_postgres::Config` directly with `.host_path(dir)` and construct the
-/// pool via `Manager::from_config` — exactly what `Config::builder(NoTls)`
-/// does internally (`deadpool-postgres` `config.rs:187-191`), just with our
-/// own `pg_config`. TLS is forced off (a socket peer cannot negotiate it).
-/// Runs the same preflight + `post_create` hooks (startup_script +
-/// base_search_path) as the NoTls branch. `#[cfg(unix)]`-only; the
-/// `#[cfg(not(unix))]` case is rejected in `build_pool_impl` before reaching
-/// here. See #197.
+/// Build the `tokio_postgres::Config` for a Unix-socket connection. Extracted
+/// from [`build_socket_pool`] so a unit test can assert the config dials a
+/// `Host::Unix` path (not a TCP `host`) and forces `SslMode::Disable` — the
+/// load-bearing socket-dialing decisions that would otherwise only be
+/// exercised by the `#[ignore]`d live test (#198 review). `#[cfg(unix)]`-only.
 #[cfg(unix)]
-async fn build_socket_pool(
+pub(crate) fn build_socket_pg_config(
     params: &ConnectionParams,
     socket: &str,
-    skip_preflight: bool,
-) -> Result<Pool, String> {
+) -> tokio_postgres::Config {
     let (dir, port) = split_postgres_socket_path(socket, params.port.unwrap_or(5432));
     let mut pg_config = tokio_postgres::Config::new();
     pg_config
@@ -818,6 +836,28 @@ async fn build_socket_pool(
         // leaves the machine: force it off so `prefer`-style defaults don't
         // stall the handshake. Matches the builtin's socket branch.
         .ssl_mode(tokio_postgres::config::SslMode::Disable);
+    pg_config
+}
+
+/// Build a deadpool pool that dials a Unix socket instead of TCP. Deadpool's
+/// `Config` struct has no `host_path` field (its `get_pg_config` only calls
+/// `cfg.host(host_str)` for TCP), so for the socket case we build a
+/// `tokio_postgres::Config` directly with `.host_path(dir)` (via
+/// [`build_socket_pg_config`]) and construct the pool via
+/// `Manager::from_config` — exactly what `Config::builder(NoTls)` does
+/// internally (`deadpool-postgres` `config.rs:187-191`), just with our own
+/// `pg_config`. TLS is forced off (a socket peer cannot negotiate it). Runs
+/// the same preflight + `post_create` hooks (startup_script +
+/// base_search_path) as the NoTls branch. `#[cfg(unix)]`-only; the
+/// `#[cfg(not(unix))]` case is rejected in `build_pool_impl` before reaching
+/// here. See #197.
+#[cfg(unix)]
+async fn build_socket_pool(
+    params: &ConnectionParams,
+    socket: &str,
+    skip_preflight: bool,
+) -> Result<Pool, String> {
+    let pg_config = build_socket_pg_config(params, socket);
 
     let script = params
         .startup_script
@@ -1013,7 +1053,18 @@ where
 /// `cancel::run_cancel` (#126) can pick the same `NoTls`-vs-TLS branch here
 /// as `build_pool` does, rather than assuming every cancel connection needs
 /// TLS.
+///
+/// Returns `false` when a Unix socket is set (`local_socket_path()` is
+/// `Some`) — the socket branch in `build_pool_impl` forces `SslMode::Disable`
+/// (TLS cannot run over a socket), so the cancel path must match or it would
+/// try to build a TLS connector for a mode like `verify-ca` and fail,
+/// silently dropping the cancel (#198 review). Mirrors the builtin's
+/// `build_postgres_tls_connector` forcing `Disable` when
+/// `local_unix_socket_path().is_some()`.
 pub(crate) fn needs_tls(params: &ConnectionParams) -> bool {
+    if params.local_socket_path().is_some() {
+        return false;
+    }
     matches!(
         params.ssl_mode.as_deref(),
         Some("require" | "verify-ca" | "verify-full")

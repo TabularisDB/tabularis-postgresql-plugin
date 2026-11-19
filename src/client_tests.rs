@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
-    get_pool_client, load_client_cert_from_pem, load_roots_from_pem, pooler_error_lead,
+    get_pool_client, load_client_cert_from_pem, load_roots_from_pem, needs_tls, pooler_error_lead,
     resolve_ssl_mode, split_postgres_socket_path, with_text_types, NoCertVerifier,
     VerifyCaCertVerifier, POOLS,
 };
@@ -1409,18 +1409,20 @@ fn split_postgres_socket_path_does_not_match_a_non_pgsql_filename() {
 
 #[test]
 fn connection_key_distinguishes_socket_from_tcp_for_the_same_database() {
+    // Same host:port on both — the distinction can ONLY come from the socket
+    // endpoint. If the socket keying were reverted (falling back to host:port),
+    // both keys would be identical and this test would fail. (The earlier
+    // version of this test used different host:port values, which made it
+    // vacuous — it passed even with the socket keying reverted. #198 review.)
     let tcp = params("localhost", 5432, "db", "user");
     let mut sock = tcp.clone();
     sock.unix_socket_path = Some("/var/run/postgresql".to_string());
-    // Give the socket connection a bogus host:port to prove the key ignores
-    // them when a socket is set (matching build_pool_impl's socket override).
-    sock.host = Some("ignored.invalid".to_string());
-    sock.port = Some(1);
+    // Same host:port as tcp — the socket must override it in the key.
     assert_ne!(
         connection_key(&tcp),
         connection_key(&sock),
-        "a socket connection and a TCP connection to the same database must \
-         not share a pool — the socket overrides host:port in the key"
+        "a socket connection and a TCP connection with the same host:port + database \
+         must not share a pool — the socket endpoint must distinguish them"
     );
 }
 
@@ -1465,5 +1467,148 @@ fn connection_key_treats_a_blank_socket_path_as_absent() {
         connection_key(&with_blank),
         connection_key(&without),
         "a blank socket path must be treated as absent (falls back to host:port)"
+    );
+}
+
+// Coverage for the #198 review's test-coverage finding: build_socket_pool's
+// .host_path(&dir) call (the load-bearing Unix-socket-dialing call) had no
+// CI-runnable test. Extracted build_socket_pg_config so a unit test can
+// assert the config dials a Host::Unix path (not a TCP host) and forces
+// SslMode::Disable — without a live socket.
+
+#[cfg(unix)]
+#[test]
+fn build_socket_pg_config_dials_a_unix_socket_not_tcp() {
+    use tokio_postgres::config::Host;
+
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/var/run/postgresql/.s.PGSQL.5432".to_string());
+    let config = super::build_socket_pg_config(&params, "/var/run/postgresql/.s.PGSQL.5432");
+
+    // The host list must contain a Unix socket path, not a TCP hostname.
+    // If .host_path were typo'd to .host, this would be Host::Tcp instead.
+    let hosts = config.get_hosts();
+    assert_eq!(hosts.len(), 1, "exactly one host (the socket dir)");
+    match &hosts[0] {
+        Host::Unix(path) => {
+            assert_eq!(
+                path,
+                std::path::Path::new("/var/run/postgresql"),
+                "host_path must point at the socket directory, not the .s.PGSQL file"
+            );
+        }
+        Host::Tcp(h) => panic!("expected Host::Unix, got Host::Tcp({h}) — .host_path was not used"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn build_socket_pg_config_extracts_port_from_spgsql_filename() {
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/tmp/.s.PGSQL.54320".to_string());
+    let config = super::build_socket_pg_config(&params, "/tmp/.s.PGSQL.54320");
+    let ports = config.get_ports();
+    assert_eq!(
+        ports,
+        vec![54320],
+        "port must be extracted from .s.PGSQL.54320, not params.port=1"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn build_socket_pg_config_forces_ssl_mode_disable() {
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/var/run/postgresql".to_string());
+    // Even if the user set ssl_mode=require, the socket config must force Disable.
+    params.ssl_mode = Some("require".to_string());
+    let config = super::build_socket_pg_config(&params, "/var/run/postgresql");
+    assert_eq!(
+        config.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Disable,
+        "socket config must force SslMode::Disable regardless of params.ssl_mode"
+    );
+}
+
+// Coverage for the #198 review's cancel-path finding: needs_tls must return
+// false when a Unix socket is set, even if ssl_mode is verify-ca/require/etc.
+// The socket branch forces SslMode::Disable, so the cancel path must match or
+// it would try to build a TLS connector and fail, silently dropping the cancel.
+
+#[test]
+fn needs_tls_returns_false_when_a_socket_is_set_regardless_of_ssl_mode() {
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/var/run/postgresql".to_string());
+
+    for mode in [
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "verify-full",
+    ] {
+        params.ssl_mode = Some(mode.to_string());
+        assert!(
+            !needs_tls(&params),
+            "needs_tls must return false for ssl_mode={mode} when a socket is set (socket forces Disable)"
+        );
+    }
+}
+
+#[test]
+fn needs_tls_returns_true_for_tls_modes_when_no_socket() {
+    let params = params("localhost", 5432, "db", "user");
+    let mut p = params.clone();
+    p.ssl_mode = Some("require".to_string());
+    assert!(needs_tls(&p));
+    p.ssl_mode = Some("verify-ca".to_string());
+    assert!(needs_tls(&p));
+    p.ssl_mode = Some("verify-full".to_string());
+    assert!(needs_tls(&p));
+}
+
+// Coverage for the #198 review's precedence-mismatch finding: connection_key
+// must key on the socket even when connection_string is also set (matching
+// build_pool_impl's order — socket first). Before the fix, connection_key
+// checked connection_string first and ignored the socket, so two requests
+// sharing a connection_string but differing in socket path collided on one
+// cached pool.
+
+#[test]
+fn connection_key_includes_socket_even_when_connection_string_is_set() {
+    // Two connections with the SAME connection_string but DIFFERENT socket
+    // paths. If the socket is ignored in the key (the pre-fix bug), both
+    // produce cs:{same hash} and collide. After the fix, the socket takes
+    // precedence and each gets its own socket:{path} key.
+    let conn_str = "postgres://user@localhost:5432/db";
+    let mut a = params("ignored.invalid", 1, "db", "user");
+    a.connection_string = Some(conn_str.to_string());
+    a.unix_socket_path = Some("/var/run/postgresql".to_string());
+
+    let mut b = params("ignored.invalid", 1, "db", "user");
+    b.connection_string = Some(conn_str.to_string());
+    b.unix_socket_path = Some("/tmp".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "two connections sharing a connection_string but with different socket paths \
+         must get distinct keys — the socket takes precedence over connection_string \
+         (matching build_pool_impl's order)"
+    );
+}
+
+#[test]
+fn connection_key_socket_precedence_keys_on_socket_not_connection_string() {
+    // A socket connection's key must start with "socket:" (not "cs:"), even
+    // when connection_string is set — proving the socket won the precedence.
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.connection_string = Some("postgres://user@localhost:5432/db".to_string());
+    params.unix_socket_path = Some("/var/run/postgresql".to_string());
+    let key = connection_key(&params);
+    assert!(
+        key.starts_with("socket:"),
+        "socket connection's key must start with 'socket:' even when connection_string is set; got: {key}"
     );
 }
