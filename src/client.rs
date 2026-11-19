@@ -457,12 +457,23 @@ fn connection_key(params: &ConnectionParams) -> String {
         return format!("cs:{hex}:{tls_and_script}");
     }
 
-    // No connection_string — key on the discrete host/port/db/user fields,
-    // plus the TLS params and startup_script (already in tls_and_script).
+    // No connection_string — key on the discrete host/port (or the Unix
+    // socket) plus database/user, plus the TLS params and startup_script
+    // (already in tls_and_script). A Unix socket replaces host:port as the
+    // endpoint (keyed `socket:{path}`) so socket connections don't share a
+    // pool with TCP connections to the same database. Matches the builtin's
+    // `build_connection_key` endpoint match (`pool_manager.rs:194-201`).
+    let endpoint = match params.local_socket_path() {
+        Some(socket) => format!("socket:{socket}"),
+        None => format!(
+            "{}:{}",
+            params.host.as_deref().unwrap_or(""),
+            params.port.unwrap_or(5432)
+        ),
+    };
     let base = format!(
-        "{}:{}:{}:{}:{}",
-        params.host.as_deref().unwrap_or(""),
-        params.port.unwrap_or(5432),
+        "{}:{}:{}:{}",
+        endpoint,
         params.database.as_deref().unwrap_or(""),
         params.username.as_deref().unwrap_or(""),
         tls_and_script,
@@ -649,7 +660,45 @@ async fn build_oneshot_pool(params: &ConnectionParams) -> Result<Pool, String> {
     build_pool_impl(params, true).await
 }
 
+/// Split a user-entered PostgreSQL socket path into what tokio_postgres
+/// wants: the *directory* holding the socket plus the port that names it.
+/// Users point at the socket file (`/var/run/postgresql/.s.PGSQL.5432`),
+/// matching the SSH forward field; a path whose last component is not
+/// `.s.PGSQL.<port>` is taken as the directory itself, paired with
+/// `default_port`. Ports the builtin's `split_postgres_socket_path`
+/// (`tabularis`'s `pool_manager.rs` at `012cd844^`, line 667-680) verbatim.
+pub(crate) fn split_postgres_socket_path(path: &str, default_port: u16) -> (String, u16) {
+    if let Some((dir, file)) = path.rsplit_once('/') {
+        if let Some(port) = file
+            .strip_prefix(".s.PGSQL.")
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            let dir = if dir.is_empty() { "/" } else { dir };
+            return (dir.to_string(), port);
+        }
+    }
+    (path.to_string(), default_port)
+}
+
 async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Result<Pool, String> {
+    // A local Unix socket overrides host/port entirely — TLS cannot run over
+    // a socket, so this branch always wires NoTls and forces ssl_mode Disable.
+    // The host strips `unix_socket_path` to `None` at every tunnel activation
+    // site (SSH/K8s/SSM), so a present non-empty value here means "no tunnel is
+    // active, dial this socket locally." Matches the builtin's
+    // `build_postgres_configurations` socket branch (`pool_manager.rs` at
+    // `012cd844^`, line 692-711). See #197.
+    #[cfg(unix)]
+    if let Some(socket) = params.local_socket_path() {
+        return build_socket_pool(params, socket, skip_preflight).await;
+    }
+    #[cfg(not(unix))]
+    if params.local_socket_path().is_some() {
+        return Err("Unix socket connections are not supported on Windows. \
+             Connect with host and port instead."
+            .to_string());
+    }
+
     let mut cfg = Config::new();
 
     match params
@@ -738,6 +787,80 @@ async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Res
             .build()
             .map_err(|e| format!("Pool creation failed: {e}"))
     }
+}
+
+/// Build a deadpool pool that dials a Unix socket instead of TCP. Deadpool's
+/// `Config` struct has no `host_path` field (its `get_pg_config` only calls
+/// `cfg.host(host_str)` for TCP), so for the socket case we build a
+/// `tokio_postgres::Config` directly with `.host_path(dir)` and construct the
+/// pool via `Manager::from_config` — exactly what `Config::builder(NoTls)`
+/// does internally (`deadpool-postgres` `config.rs:187-191`), just with our
+/// own `pg_config`. TLS is forced off (a socket peer cannot negotiate it).
+/// Runs the same preflight + `post_create` hooks (startup_script +
+/// base_search_path) as the NoTls branch. `#[cfg(unix)]`-only; the
+/// `#[cfg(not(unix))]` case is rejected in `build_pool_impl` before reaching
+/// here. See #197.
+#[cfg(unix)]
+async fn build_socket_pool(
+    params: &ConnectionParams,
+    socket: &str,
+    skip_preflight: bool,
+) -> Result<Pool, String> {
+    let (dir, port) = split_postgres_socket_path(socket, params.port.unwrap_or(5432));
+    let mut pg_config = tokio_postgres::Config::new();
+    pg_config
+        .user(params.username.as_deref().unwrap_or_default())
+        .password(params.password.as_deref().unwrap_or_default())
+        .dbname(params.database.as_deref().unwrap_or_default())
+        .host_path(&dir)
+        .port(port)
+        // TLS cannot be negotiated over a Unix socket, and the traffic never
+        // leaves the machine: force it off so `prefer`-style defaults don't
+        // stall the handshake. Matches the builtin's socket branch.
+        .ssl_mode(tokio_postgres::config::SslMode::Disable);
+
+    let script = params
+        .startup_script
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if !skip_preflight {
+        if let Some(script) = script {
+            let timeout = Duration::from_millis(STARTUP_SCRIPT_TIMEOUT_MS);
+            tokio::time::timeout(
+                timeout,
+                run_startup_script_preflight(pg_config.clone(), NoTls, script),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "Timed out running PostgreSQL startup script after {} ms",
+                    timeout.as_millis()
+                )
+            })??;
+        }
+    }
+
+    let manager = deadpool_postgres::Manager::from_config(
+        pg_config,
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        },
+    );
+    let mut builder = Pool::builder(manager)
+        .runtime(Runtime::Tokio1)
+        .max_size(crate::settings::pool_max_size());
+    if let Some(script) = script {
+        builder = builder.post_create(startup_script_hook(script));
+    }
+    // See the NoTls branch: snapshot the base search_path after any startup
+    // script so `apply_search_path` prepends onto a stable base (#51).
+    builder = builder.post_create(base_search_path_hook());
+    builder
+        .build()
+        .map_err(|e| format!("Pool creation failed (socket): {e}"))
 }
 
 /// Format a startup-script execution failure so the surfaced error clearly

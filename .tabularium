@@ -78,6 +78,7 @@
     "create_foreign_keys": true,
     "manage_tables": true,
     "supports_ssl": true,
+    "unix_socket": true,
     "explain": true,
     "readonly": false,
     "no_connection_required": false,

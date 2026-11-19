@@ -6,7 +6,8 @@ use tokio::sync::Mutex;
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
     get_pool_client, load_client_cert_from_pem, load_roots_from_pem, pooler_error_lead,
-    resolve_ssl_mode, with_text_types, NoCertVerifier, VerifyCaCertVerifier, POOLS,
+    resolve_ssl_mode, split_postgres_socket_path, with_text_types, NoCertVerifier,
+    VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use crate::settings;
@@ -36,6 +37,7 @@ fn params(host: &str, port: u16, db: &str, user: &str) -> ConnectionParams {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        unix_socket_path: None,
         pooler_mode: None,
     }
 }
@@ -805,6 +807,7 @@ fn params_with_ssl(ssl_mode: &str) -> ConnectionParams {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        unix_socket_path: None,
         pooler_mode: None,
     }
 }
@@ -1337,5 +1340,130 @@ fn pooler_error_lead_conditional_when_pooler_not_declared() {
     assert!(
         lead.contains("Supabase/Supavisor"),
         "conditional lead should name the pooler flavors users hit (#163): {lead:?}"
+    );
+}
+
+// Coverage for #197: `split_postgres_socket_path` ports the builtin's
+// `split_postgres_socket_path` (`pool_manager.rs` at `012cd844^`, line 667-
+// 680) verbatim — recognizing the `.s.PGSQL.<port>` socket-file shape vs a
+// bare directory path.
+
+#[test]
+fn split_postgres_socket_path_recognizes_the_socket_file_shape() {
+    // `/var/run/postgresql/.s.PGSQL.5432` -> dir + port from the filename.
+    assert_eq!(
+        split_postgres_socket_path("/var/run/postgresql/.s.PGSQL.5432", 5432),
+        ("/var/run/postgresql".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_recognizes_a_custom_port_in_the_filename() {
+    assert_eq!(
+        split_postgres_socket_path("/tmp/.s.PGSQL.54320", 5432),
+        ("/tmp".to_string(), 54320)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_treats_a_bare_directory_as_dir_plus_default_port() {
+    // A path whose last component isn't `.s.PGSQL.<port>` is the directory
+    // itself, paired with the default port.
+    assert_eq!(
+        split_postgres_socket_path("/var/run/postgresql", 5432),
+        ("/var/run/postgresql".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_handles_root_dir_when_socket_is_at_root() {
+    // `/.s.PGSQL.5432` -> dir is `/` (not empty), port 5432.
+    assert_eq!(
+        split_postgres_socket_path("/.s.PGSQL.5432", 5432),
+        ("/".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_passes_through_a_path_with_no_slash() {
+    // No `/` in the path -> the whole thing is the directory.
+    assert_eq!(
+        split_postgres_socket_path("relative_dir", 5432),
+        ("relative_dir".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_does_not_match_a_non_pgsql_filename() {
+    // A filename that isn't `.s.PGSQL.<port>` is not a socket file — the
+    // whole path is treated as the directory with the default port.
+    assert_eq!(
+        split_postgres_socket_path("/var/run/postgresql/postgres.sock", 5432),
+        ("/var/run/postgresql/postgres.sock".to_string(), 5432)
+    );
+}
+
+// Coverage for #197: the pool cache key must distinguish a Unix-socket
+// connection from a TCP connection to the same database, and two socket
+// connections to the same path must share a key.
+
+#[test]
+fn connection_key_distinguishes_socket_from_tcp_for_the_same_database() {
+    let tcp = params("localhost", 5432, "db", "user");
+    let mut sock = tcp.clone();
+    sock.unix_socket_path = Some("/var/run/postgresql".to_string());
+    // Give the socket connection a bogus host:port to prove the key ignores
+    // them when a socket is set (matching build_pool_impl's socket override).
+    sock.host = Some("ignored.invalid".to_string());
+    sock.port = Some(1);
+    assert_ne!(
+        connection_key(&tcp),
+        connection_key(&sock),
+        "a socket connection and a TCP connection to the same database must \
+         not share a pool — the socket overrides host:port in the key"
+    );
+}
+
+#[test]
+fn connection_key_socket_key_ignores_host_and_port() {
+    // Two socket connections to the same path but different (bogus) host/port
+    // must share a key — the socket overrides host:port, so the key should
+    // not depend on them.
+    let mut a = params("ignored.invalid", 1, "db", "user");
+    a.unix_socket_path = Some("/var/run/postgresql".to_string());
+    let mut b = params("also.invalid", 9999, "db", "user");
+    b.unix_socket_path = Some("/var/run/postgresql".to_string());
+    assert_eq!(
+        connection_key(&a),
+        connection_key(&b),
+        "same socket + database must share a key regardless of host/port \
+         (the socket overrides them)"
+    );
+}
+
+#[test]
+fn connection_key_distinguishes_different_socket_paths() {
+    let mut a = params("ignored.invalid", 1, "db", "user");
+    a.unix_socket_path = Some("/var/run/postgresql".to_string());
+    let mut b = params("ignored.invalid", 1, "db", "user");
+    b.unix_socket_path = Some("/tmp".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different socket paths must produce distinct keys"
+    );
+}
+
+#[test]
+fn connection_key_treats_a_blank_socket_path_as_absent() {
+    // A whitespace-only socket path is treated as unset (local_socket_path
+    // filters it), so the key falls back to host:port.
+    let mut with_blank = params("localhost", 5432, "db", "user");
+    with_blank.unix_socket_path = Some("   ".to_string());
+    let without = params("localhost", 5432, "db", "user");
+    assert_eq!(
+        connection_key(&with_blank),
+        connection_key(&without),
+        "a blank socket path must be treated as absent (falls back to host:port)"
     );
 }
