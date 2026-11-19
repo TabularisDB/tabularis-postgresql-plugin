@@ -22,7 +22,7 @@ async fn execute(request: &Value) -> Result<(), String> {
     let mut params = original_params.clone();
     // A browsed target must override the database embedded in a legacy URI.
     // Retain the URI's endpoint and credentials, exactly as client.rs parses them.
-    if let Some(uri) = params
+    let uri_targets_database = if let Some(uri) = params
         .connection_string
         .as_deref()
         .filter(|uri| !uri.trim().is_empty())
@@ -41,7 +41,10 @@ async fn execute(request: &Value) -> Result<(), String> {
             .get_password()
             .map(|password| String::from_utf8_lossy(password).into_owned());
         params.connection_string = None;
-    }
+        parsed.get_dbname() == params.database.as_deref()
+    } else {
+        false
+    };
     let database = params.database.as_deref().unwrap_or("");
     if database.is_empty()
         || database.contains('\0')
@@ -59,7 +62,7 @@ async fn execute(request: &Value) -> Result<(), String> {
         "empty" => include_str!("database_empty.sql"),
         "truncate" => include_str!("database_truncate.sql"),
         "drop" => {
-            if original_params.database == params.database {
+            if uri_targets_database {
                 client::close_database_pool(&original_params)?;
             }
             client::close_database_pool(&params)?;
@@ -79,7 +82,7 @@ async fn execute(request: &Value) -> Result<(), String> {
     };
     let mut client = client::get_pool_client(&params).await?;
     let actual: String = client
-        .query_one("SELECT current_database()", &[])
+        .query_typed_one("SELECT current_database()", &[])
         .await
         .map_err(|e| client::format_pg_error(&e))?
         .get(0);

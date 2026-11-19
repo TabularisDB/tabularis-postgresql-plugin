@@ -2756,11 +2756,11 @@ fn database_operations_use_the_explicit_target_even_when_a_uri_names_another_dat
         json!({"params":target_params,"query":"SELECT * FROM marker"}),
     );
     assert!(target_rows["rows"].as_array().unwrap().is_empty());
-    let base_rows = plugin.call_ok(
+    let base_marker = plugin.call_ok(
         "execute_query",
-        json!({"params":base_params,"query":"SELECT * FROM marker"}),
+        json!({"params":uri_params,"query":"SELECT id, pg_backend_pid() FROM marker"}),
     );
-    assert_eq!(base_rows["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(base_marker["rows"][0][0], 1);
     plugin.call_ok(
         "database_operation",
         json!({"params":uri_params,"operation":"empty"}),
@@ -2774,14 +2774,19 @@ fn database_operations_use_the_explicit_target_even_when_a_uri_names_another_dat
         "database_operation",
         json!({"params":uri_params,"operation":"drop"}),
     );
-    // The marker in the other database survives every operation.
+    // The marker and its pooled connection survive every operation.
     let base_rows = plugin.call_ok(
         "execute_query",
-        json!({"params":base_params,"query":"SELECT * FROM marker"}),
+        json!({"params":uri_params,"query":"SELECT id, pg_backend_pid() FROM marker"}),
     );
-    assert_eq!(base_rows["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        base_rows["rows"], base_marker["rows"],
+        "the original database's pool should retain the same backend"
+    );
+    // Both the discrete and connection-string pools point to base this time.
+    uri_params["database"] = json!(base);
     plugin.call_ok(
         "database_operation",
-        json!({"params":base_params,"operation":"drop"}),
+        json!({"params":uri_params,"operation":"drop"}),
     );
 }

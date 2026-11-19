@@ -46,6 +46,7 @@ both drivers against the same live database and compares every response.
   - [Manual Installation (alternative)](#manual-installation-alternative)
 - [How It Works](#how-it-works)
 - [Supported Operations](#supported-operations)
+  - [Whole-database operations](#whole-database-operations)
 - [Building from Source](#building-from-source)
 - [Development](#development)
 - [Changelog](#changelog)
@@ -195,6 +196,18 @@ instead of reconnecting.
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
 | `save_blob_to_file` / `fetch_blob_as_data_url` | BLOB (`bytea`) export and preview |
 
+### Whole-database operations
+
+The plugin declares independent `empty_database`, `truncate_database`, and
+`drop_database` capabilities for Tabularis's **More Database Operations** menu.
+Empty removes user objects while preserving the database and schema ownership,
+permissions and comments. Truncate clears all local user tables across schemas
+and resets identities without dropping objects; foreign tables are rejected.
+Both operations use a transaction. Drop connects through `postgres` and refuses
+protected databases or databases still used by other sessions; it never forcibly
+terminates unrelated clients. The explicit browsed database overrides the database
+embedded in a legacy connection string. Read-only requests are rejected.
+
 ## Building from Source
 
 ### Prerequisites
@@ -300,15 +313,3 @@ classification actually changes, not on every edit to the title text.
 ## License
 
 Apache-2.0.
-
-### Whole-database operations
-
-The plugin declares independent `empty_database`, `truncate_database`, and
-`drop_database` capabilities for Tabularis's **More Database Operations** menu.
-Empty removes user objects while preserving the database and schema ownership,
-permissions and comments. Truncate clears all local user tables across schemas
-and resets identities without dropping objects; foreign tables are rejected.
-Both operations use a transaction. Drop connects through `postgres` and refuses
-protected databases or databases still used by other sessions; it never forcibly
-terminates unrelated clients. The explicit browsed database overrides the database
-embedded in a legacy connection string. Read-only requests are rejected.
