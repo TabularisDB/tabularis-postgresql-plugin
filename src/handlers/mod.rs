@@ -7,3 +7,5 @@ pub mod ddl;
 pub mod metadata;
 pub mod query;
 pub mod routines;
+
+pub mod database_operations;
