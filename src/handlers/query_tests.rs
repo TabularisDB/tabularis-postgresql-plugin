@@ -12,10 +12,12 @@
 
 use super::{
     build_search_path_sql, error_aborts_open_txn_inner, in_transaction_after_outcome,
-    raw_explain_output, returns_result_set, sets_session_local_state,
+    raw_explain_output, reads_only, returns_result_set, sets_session_local_state,
     should_short_circuit_on_prepare_err, strip_leading_sql_comments,
-    supports_trailing_limit_clause, transaction_effect, TransactionEffect,
+    supports_trailing_limit_clause, transaction_effect, travels_with_search_path,
+    TransactionEffect, PREPEND_SEARCH_PATH_SQL,
 };
+use crate::models::ConnectionParams;
 
 #[test]
 fn strip_leading_sql_comments_skips_line_comments() {
@@ -732,4 +734,104 @@ fn sets_session_local_state_ignores_set_inside_string_literal() {
     assert!(!sets_session_local_state(
         "SELECT 'SET extra_float_digits = 3'"
     ));
+}
+
+#[test]
+fn reads_only_accepts_statements_that_read() {
+    for sql in [
+        "SELECT * FROM \"public\".\"items\" LIMIT 501 OFFSET 0",
+        "  -- note\nselect 1",
+        "/* c */ WITH x AS (SELECT 1) SELECT * FROM x",
+        "TABLE items",
+        "VALUES (1), (2)",
+        "SHOW search_path",
+    ] {
+        assert!(reads_only(sql), "{sql}");
+    }
+}
+
+#[test]
+fn reads_only_refuses_statements_that_write() {
+    for sql in [
+        "INSERT INTO t VALUES (1) RETURNING *",
+        "UPDATE t SET a = 1",
+        "DELETE FROM t",
+        "CREATE TABLE t (id int)",
+        "CALL refill()",
+        "EXPLAIN ANALYZE DELETE FROM t",
+        "BEGIN",
+        "",
+    ] {
+        assert!(!reads_only(sql), "{sql}");
+    }
+}
+
+#[test]
+fn reads_only_refuses_a_read_that_carries_a_write() {
+    for sql in [
+        "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
+        "WITH put AS (insert into t values (1) returning *) SELECT * FROM put",
+        "SELECT * INTO copy_of_t FROM t",
+        "SELECT * FROM t FOR UPDATE",
+        "WITH m AS (MERGE INTO t USING s ON true WHEN MATCHED THEN DO NOTHING RETURNING *) SELECT 1",
+    ] {
+        assert!(!reads_only(sql), "{sql}");
+    }
+}
+
+#[test]
+fn reads_only_refuses_a_write_keyword_it_cannot_place() {
+    // A string or a comment that names a write is not one, but telling them
+    // apart is not worth being wrong: the statement waits for its path.
+    assert!(!reads_only("SELECT 'delete' AS word"));
+    assert!(!reads_only("SELECT 1 /* update later */"));
+}
+
+#[test]
+fn reads_only_takes_a_longer_word_for_what_it_is() {
+    assert!(reads_only("SELECT updated_at, deleted, inserted_by FROM t"));
+}
+
+fn params_with_pooler_mode(mode: Option<&str>) -> ConnectionParams {
+    ConnectionParams::from_value(&serde_json::json!({
+        "host": "localhost",
+        "port": 5432,
+        "username": "postgres",
+        "database": "db",
+        "pooler_mode": mode,
+    }))
+}
+
+#[test]
+fn a_read_on_a_direct_connection_travels_with_its_search_path() {
+    assert!(travels_with_search_path(
+        &params_with_pooler_mode(None),
+        "SELECT 1"
+    ));
+}
+
+#[test]
+fn a_write_waits_for_its_search_path() {
+    assert!(!travels_with_search_path(
+        &params_with_pooler_mode(None),
+        "DELETE FROM t"
+    ));
+}
+
+#[test]
+fn nothing_travels_with_its_search_path_through_a_transaction_pooler() {
+    assert!(!travels_with_search_path(
+        &params_with_pooler_mode(Some("transaction")),
+        "SELECT 1"
+    ));
+}
+
+#[test]
+fn prepend_search_path_statement_binds_the_schema_and_the_base_setting() {
+    // Two parameters: the schema, quoted by the server, and the GUC that
+    // holds the base path. A schema spliced into the text would need quoting
+    // here instead.
+    assert!(PREPEND_SEARCH_PATH_SQL.contains("quote_ident($1)"));
+    assert!(PREPEND_SEARCH_PATH_SQL.contains("current_setting($2, true)"));
+    assert!(!PREPEND_SEARCH_PATH_SQL.contains("$3"));
 }

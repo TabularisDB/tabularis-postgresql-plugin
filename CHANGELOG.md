@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Changed
+
+- A statement that reads now takes one network round trip on a direct
+  connection, where it took four: the `search_path` is set in one statement
+  instead of a read and a `SET`, and it goes out together with the statement's
+  prepare and its data fetch. On a link with a 200 ms round trip, running a
+  query, opening a table, a next page and a row count each drop from about
+  0.8 s to 0.2 s. A statement that writes still waits for its `search_path`
+  first. Connections in transaction pooler mode are unchanged.
+- `tokio-postgres` 0.7.18 is vendored under `vendor/tokio-postgres` with one
+  change: a typed query receives its rows before it looks up a column type the
+  connection has not met. Without it, a large result with an enum, domain,
+  composite or extension-type column could hang unless the statement was
+  prepared first, which is the round trip the plugin used to spend. See
+  `vendor/tokio-postgres/README.tabularis.md`.
+
+### Fixed
+
+- A `bigint` or `money` value of `-9223372036854775808` no longer overflows
+  when it is converted for the grid. A debug build panicked on it and left the
+  request unanswered; a release build sent it as a JSON number, which loses
+  precision. It is now sent as a string, like every other value outside
+  JavaScript's safe integer range.
+
 ### Added
 
 - `get_foreign_keys` and `get_all_foreign_keys_batch` now return `ref_schema`,
