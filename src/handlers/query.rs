@@ -164,14 +164,22 @@ async fn run_batch_in_session(
     ));
 
     // Applying search_path to a reused connection would run inside the open
-    // transaction and change what the rest of it sees.
-    if let Some(s) = schema.filter(|_| !reused) {
-        apply_search_path(&pg_client, s).await?;
-    }
+    // transaction and change what the rest of it sees. Otherwise it is set
+    // ahead of the first statement, or with it (see `with_search_path`).
+    let mut pending_search_path = schema.filter(|_| !reused);
 
     let mut results: Vec<Value> = Vec::new();
     for query in queries {
         let start = Instant::now();
+
+        let search_path_with_query = match pending_search_path.take() {
+            Some(s) if travels_with_search_path(conn_params, query) => Some(s),
+            Some(s) => {
+                apply_search_path(&pg_client, s).await?;
+                None
+            }
+            None => None,
+        };
 
         // On a transaction-mode pooler, a result-set query with non-builtin
         // column types needs its column types pre-resolved before the data
@@ -290,7 +298,7 @@ async fn run_batch_in_session(
                 // `in_transaction` is threaded for the direct-connection batch
                 // path inside a user's `BEGIN` (pre-existing from #168): a
                 // prepare failure there aborts the txn the same way (#170).
-                exec_query_on_client(
+                let run = exec_query_on_client(
                     &pg_client,
                     query,
                     limit,
@@ -298,8 +306,13 @@ async fn run_batch_in_session(
                     conn_params.is_transaction_pooler(),
                     !conn_params.is_transaction_pooler(),
                     /* in_transaction = */ in_transaction,
-                )
-                .await
+                );
+                // Only a direct connection gets here with a path to send
+                // along: `travels_with_search_path` refuses a pooler.
+                match search_path_with_query {
+                    Some(s) => with_search_path(&pg_client, s, run).await?,
+                    None => run.await,
+                }
             };
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -486,12 +499,9 @@ async fn exec_query(
     let _cancel_guard =
         cancel::CancelGuard::register(request_id.as_u64(), &pg_client, conn_params.clone());
 
-    // Set search_path if schema is specified
-    if let Some(s) = schema {
-        apply_search_path(&pg_client, s).await?;
-    }
-
-    let outcome = exec_query_on_client(
+    // Set search_path if schema is specified, in the statement's own round
+    // trip where that is safe (see `with_search_path`).
+    let run = exec_query_on_client(
         &pg_client,
         query,
         limit,
@@ -500,8 +510,17 @@ async fn exec_query(
         !conn_params.is_transaction_pooler(),
         /* in_transaction = */
         false, // single-query path has no session, never an open txn
-    )
-    .await;
+    );
+    let outcome = match schema {
+        Some(s) if travels_with_search_path(conn_params, query) => {
+            with_search_path(&pg_client, s, run).await?
+        }
+        Some(s) => {
+            apply_search_path(&pg_client, s).await?;
+            run.await
+        }
+        None => run.await,
+    };
     // `txn_aborted` can only be true inside an open transaction, which this
     // single-query path never has. Unwrap to the inner `Result`.
     debug_assert!(
@@ -951,65 +970,103 @@ fn build_search_path_sql(schema: &str, current: &str, local: bool) -> String {
     }
 }
 
-/// Read the connection's *base* `search_path` and prepend `schema` onto it
-/// (#51). The base is the value captured at connection creation by the
-/// `post_create` hook in `client.rs` (after any startup script) — stored in
-/// the custom GUC `app.tabularis_base_search_path`. Reading the base rather
-/// than the live `current_setting('search_path')` is what makes the prepend
-/// idempotent across recycled pooled connections (`RecyclingMethod::Fast`
-/// resets nothing): without it, a recycled connection would report an
+/// Prepend `schema` onto the connection's *base* `search_path` (#51). The
+/// base is the value captured at connection creation by the `post_create`
+/// hook in `client.rs` (after any startup script) — stored in the custom GUC
+/// `app.tabularis_base_search_path`. Reading the base rather than the live
+/// `current_setting('search_path')` is what makes the prepend idempotent
+/// across recycled pooled connections (`RecyclingMethod::Fast` resets
+/// nothing): without it, a recycled connection would report an
 /// already-prepended path and each call would stack another schema, leaking
 /// a previous selection into object resolution.
 ///
 /// If the snapshot GUC is unset (e.g. the connection predates the snapshot
-/// hook, or the hook failed at creation), fall back to the live
-/// `current_setting('search_path')` — degrading to the pre-fix behavior
-/// rather than erroring, so an older pool isn't broken by the new code.
+/// hook, or the hook failed at creation), the live
+/// `current_setting('search_path')` is used — degrading to the pre-fix
+/// behavior rather than erroring, so an older pool isn't broken by the new
+/// code.
 async fn apply_search_path(pg_client: &PgClient, schema: &str) -> Result<(), String> {
-    // current_setting(name, true) returns NULL when the GUC is unset
-    // (missing_ok), so the snapshot's absence is a clean fallback, not an
-    // error.
-    //
-    // Uses the unnamed-statement protocol (`query_typed_one`) rather than
-    // the named `query_one` so this is pooler-safe under transaction-mode
-    // poolers (PgBouncer) — see `client`'s module note (tabularis#1097). The
-    // GUC name is bound as `TEXT`; PostgreSQL's `current_setting(text, bool)`
-    // accepts it directly.
-    let read = pg_client
-        .query_typed_one(
-            "SELECT current_setting($1, true), current_setting('search_path')",
-            &[(
-                &client::BASE_SEARCH_PATH_GUC as &(dyn ToSql + Sync),
-                Type::TEXT,
-            )],
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to read search_path: {}",
-                client::format_pg_error(&e)
-            )
-        })?;
-    let snapshot: Option<String> = read.try_get(0).map_err(|e| {
-        format!(
-            "Failed to read search_path: {}",
-            client::format_pg_error(&e)
-        )
-    })?;
-    let live: String = read.try_get(1).map_err(|e| {
-        format!(
-            "Failed to read search_path: {}",
-            client::format_pg_error(&e)
-        )
-    })?;
-    // Prefer the stable base snapshot; fall back to the live value if it's
-    // unset so an older pool (no snapshot hook) keeps working.
-    let current = snapshot.unwrap_or(live);
-    let set_path = build_search_path_sql(schema, &current, false);
+    // One statement, so the path costs one round trip and can go out with the
+    // statement it is for (see `with_search_path`). The unnamed-statement
+    // protocol keeps it pooler-safe under transaction-mode poolers
+    // (PgBouncer) — see `client`'s module note (tabularis#1097).
     pg_client
-        .batch_execute(&set_path)
+        .execute_typed(
+            PREPEND_SEARCH_PATH_SQL,
+            &[
+                (&schema as &(dyn ToSql + Sync), Type::TEXT),
+                (
+                    &client::BASE_SEARCH_PATH_GUC as &(dyn ToSql + Sync),
+                    Type::TEXT,
+                ),
+            ],
+        )
         .await
+        .map(|_| ())
         .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))
+}
+
+/// Prepends the schema named `$1` onto the connection's base `search_path`,
+/// for the session. `$2` names the GUC holding the base path.
+///
+/// The server does what `build_search_path_sql(schema, current, false)`
+/// spells out for the two-step form: it reads the base snapshot, falls back
+/// to the live path where the snapshot is unset (`current_setting(name, true)`
+/// is NULL then), and leaves the schema alone on an empty path. A path set
+/// from text is parsed like the list `SET search_path TO` takes, `"$user"`
+/// included. `quote_ident` quotes the schema only where it has to, which is
+/// how `SET` itself writes a name back, so `SHOW search_path` reads the same
+/// either way.
+const PREPEND_SEARCH_PATH_SQL: &str = "SELECT set_config('search_path', \
+     CASE WHEN btrim(base.path) = '' THEN quote_ident($1) \
+     ELSE quote_ident($1) || ', ' || base.path END, false) \
+     FROM (SELECT COALESCE(current_setting($2, true), current_setting('search_path')) AS path) base";
+
+/// Sets `schema` first on the `search_path` and runs `run`, in one round
+/// trip: tokio-postgres sends a request when its future is first polled, the
+/// first poll reaches both in this order, and the server takes them one after
+/// the other.
+///
+/// `run` is not held back when the path fails to apply, so only a statement
+/// that `travels_with_search_path` may come here: the failure is reported and
+/// what `run` read is dropped.
+async fn with_search_path<T>(
+    pg_client: &PgClient,
+    schema: &str,
+    run: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let (applied, outcome) = tokio::join!(apply_search_path(pg_client, schema), run);
+    applied?;
+    Ok(outcome)
+}
+
+/// Whether `query` may be sent together with the statement that sets its
+/// `search_path`, instead of after that one has answered.
+///
+/// Sent together, the query runs even when the path failed to apply. That is
+/// harmless for a statement that only reads, and not for one that writes. A
+/// transaction-mode pooler is left out: it may hand each statement to a
+/// different backend, and its result-set queries set the path their own way.
+fn travels_with_search_path(conn_params: &ConnectionParams, query: &str) -> bool {
+    !conn_params.is_transaction_pooler() && reads_only(query)
+}
+
+/// Whether `query` reads and does nothing else, as far as its text tells: it
+/// opens with `SELECT`, `WITH`, `TABLE`, `VALUES` or `SHOW`, and names no
+/// command that writes anywhere, so a data-modifying `WITH`, `SELECT INTO`
+/// and `SELECT ... FOR UPDATE` are all refused. A name inside a string or a
+/// comment refuses the statement as well. A function the statement calls can
+/// still write: no text shows that.
+fn reads_only(query: &str) -> bool {
+    const READS: &[&str] = &["SELECT", "WITH", "TABLE", "VALUES", "SHOW"];
+    const WRITES: &[&str] = &["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"];
+    let opens_with_a_read = leading_keywords(query, 1)
+        .first()
+        .is_some_and(|word| READS.contains(&word.as_str()));
+    opens_with_a_read
+        && !query
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| WRITES.iter().any(|w| word.eq_ignore_ascii_case(w)))
 }
 
 /// Execute a query on an existing client (used by both single and batch execution).
@@ -1212,9 +1269,34 @@ async fn exec_query_on_client(
     // `InnerClient` regardless of the `Statement`'s lifetime — `Statement::Drop`
     // sends a server `Close` but does not clear `CachedTypeInfo.types` — so
     // holding it alive is for `.columns()` reuse, not cache persistence.)
+    //
+    // The prepare and the data fetch go out together and the client waits on
+    // both at once, so the pre-resolve costs no round trip of its own:
+    // tokio-postgres sends a request when its future is first polled, the
+    // prepare is polled first, and the server takes the two in that order.
+    // The fetch no longer depends on the prepare for its types: the vendored
+    // `query_typed` receives its rows before it looks up a type it has not
+    // met (see vendor/tokio-postgres/README.tabularis.md), so a cold type
+    // cache cannot stall it whichever of the two is answered first. The
+    // prepare still decides everything it decided before: its failure inside
+    // an open transaction short-circuits below, where the fetch, sent behind
+    // it, met the transaction already aborted and ran nothing.
+    let fetch = pg_client.query_typed(&final_query, &[]);
+    tokio::pin!(fetch);
+    // The fetch's answer, when it came in while the prepare was awaited.
+    let mut fetched: Option<Result<Vec<tokio_postgres::Row>, tokio_postgres::Error>> = None;
     let mut prepared: Option<tokio_postgres::Statement> = None;
     let prepare_err: Option<tokio_postgres::Error> = if pre_resolve_types {
-        match pg_client.prepare(&final_query).await {
+        let prepare = pg_client.prepare(&final_query);
+        tokio::pin!(prepare);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                outcome = &mut prepare => break outcome,
+                rows = &mut fetch, if fetched.is_none() => fetched = Some(rows),
+            }
+        };
+        match outcome {
             Ok(stmt) => {
                 prepared = Some(stmt);
                 None
@@ -1302,10 +1384,16 @@ async fn exec_query_on_client(
     // `in_transaction`), so classification there returns `false` (the
     // `!in_transaction` guard) and the outer arm's behavior is unchanged for
     // that sub-path.
+    // The fetch from where it stands: its answer when that already came in,
+    // else the rest of it.
+    let rest_of_fetch = async {
+        match fetched {
+            Some(rows) => rows,
+            None => fetch.await,
+        }
+    };
     let rows: Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> = if prepare_err.is_some() {
-        match tokio::time::timeout(POOLED_TXN_TIMEOUT, pg_client.query_typed(&final_query, &[]))
-            .await
-        {
+        match tokio::time::timeout(POOLED_TXN_TIMEOUT, rest_of_fetch).await {
             Ok(Ok(rows)) => Ok(rows),
             Ok(Err(e)) => Err(e),
             Err(_elapsed) => {
@@ -1337,7 +1425,7 @@ async fn exec_query_on_client(
             }
         }
     } else {
-        pg_client.query_typed(&final_query, &[]).await
+        rest_of_fetch.await
     };
     let rows = match rows {
         Ok(rows) => rows,
