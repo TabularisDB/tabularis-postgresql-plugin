@@ -48,6 +48,7 @@ fn live_params(password: &str) -> Option<ConnectionParams> {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        unix_socket_path: None,
         pooler_mode: None,
     })
 }
@@ -2341,6 +2342,70 @@ async fn failed_commit_in_batch_does_not_get_spurious_rolled_back_notice() {
     POOLS.lock().unwrap().remove(&key);
 }
 
+/// Regression guard for #197: when `unix_socket_path` is set, the plugin must
+/// dial the Unix socket (not TCP). This is the load-bearing test — it fails on
+/// rc.14, which ignores `unix_socket_path` and dials `host`/`port` (TCP).
+///
+/// Sets `unix_socket_path` to the socket dir/file and `host`/`port` to a
+/// bogus endpoint (`ignored.invalid:1`). If the plugin honors the socket,
+/// `test_connection` succeeds despite the unreachable TCP endpoint. If it
+/// dials TCP, it fails to connect to `ignored.invalid:1`.
+///
+/// The host strips `unix_socket_path` to `None` at every tunnel activation
+/// site, so a present value here means "no tunnel is active, dial locally."
+///
+/// Run against a local PostgreSQL with a reachable socket. Expose the
+/// container's socket or use a local install:
+///   # Expose the demo container's socket:
+///   podman run --rm -d --name pg-socket-test -e POSTGRES_PASSWORD=password \
+///     -e POSTGRES_DB=testdb -v /tmp/pgsock:/var/run/postgresql \
+///     docker.io/library/postgres:16
+///   PG_PLUGIN_TEST_UNIX_SOCKET=/tmp/pgsock/.s.PGSQL.5432 \
+///   POSTGRES_PLUGIN_BIN=target/release/postgresql-plugin \
+///   cargo test --lib -- --include-ignored unix_socket_dials_socket_not_tcp
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "needs a local PostgreSQL socket (PG_PLUGIN_TEST_UNIX_SOCKET=/path/to/.s.PGSQL.5432 or socket dir)"]
+async fn unix_socket_dials_socket_not_tcp() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let socket_path = std::env::var("PG_PLUGIN_TEST_UNIX_SOCKET")
+        .expect("PG_PLUGIN_TEST_UNIX_SOCKET not set — point it at the socket file or dir");
+    let user = std::env::var("PG_PLUGIN_TEST_USER").unwrap_or_else(|_| "postgres".to_string());
+    let password =
+        std::env::var("PG_PLUGIN_TEST_PASSWORD").unwrap_or_else(|_| "password".to_string());
+    let database = std::env::var("PG_PLUGIN_TEST_DB").unwrap_or_else(|_| "testdb".to_string());
+
+    // unix_socket_path set + bogus host:port. If the plugin honors the
+    // socket, test_connection succeeds; if it dials TCP, it fails to reach
+    // ignored.invalid:1 — the exact #197 reproduction.
+    let params = ConnectionParams {
+        driver: Some("postgresql".to_string()),
+        host: Some("ignored.invalid".to_string()),
+        port: Some(1),
+        database: Some(database),
+        username: Some(user),
+        password: Some(password),
+        ssl_mode: Some("disable".to_string()),
+        ssl_ca: None,
+        ssl_cert: None,
+        ssl_key: None,
+        connection_string: None,
+        startup_script: None,
+        unix_socket_path: Some(socket_path),
+        pooler_mode: None,
+    };
+
+    test_connection(&params).await.expect(
+        "test_connection must succeed via the Unix socket, not TCP — \
+                 if this fails, the plugin is ignoring unix_socket_path (#197)",
+    );
+
+    // Clean up the pool entry the connection left behind.
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
+
 /// Regression guard for #192: a connection with `ssl_mode` unset (which the
 /// builtin treats as `prefer`) must actually negotiate TLS — not connect in
 /// plaintext — against an SSL-capable server. This is the load-bearing test
@@ -2394,6 +2459,7 @@ async fn prefer_unset_negotiates_tls_not_plaintext() {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        unix_socket_path: None,
         pooler_mode: None,
     };
 
