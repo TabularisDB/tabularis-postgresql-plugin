@@ -6,7 +6,8 @@ use tokio::sync::Mutex;
 use super::{
     build_pool_pub, build_tls_connector, cleanup_idle_pools, connection_key, get_or_create_pool,
     get_pool_client, load_client_cert_from_pem, load_roots_from_pem, pooler_error_lead,
-    resolve_ssl_mode, with_text_types, NoCertVerifier, VerifyCaCertVerifier, POOLS,
+    resolve_ssl_mode, split_postgres_socket_path, uses_tls, with_text_types, NoCertVerifier,
+    VerifyCaCertVerifier, POOLS,
 };
 use crate::models::ConnectionParams;
 use crate::settings;
@@ -36,6 +37,7 @@ fn params(host: &str, port: u16, db: &str, user: &str) -> ConnectionParams {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        unix_socket_path: None,
         pooler_mode: None,
     }
 }
@@ -805,6 +807,7 @@ fn params_with_ssl(ssl_mode: &str) -> ConnectionParams {
         ssl_key: None,
         connection_string: None,
         startup_script: None,
+        unix_socket_path: None,
         pooler_mode: None,
     }
 }
@@ -1069,6 +1072,153 @@ fn resolve_ssl_mode_leaves_unset_or_unknown_values_unmapped() {
     assert_eq!(resolve_ssl_mode(Some("bogus")), None);
 }
 
+// Coverage for #192: `uses_tls` returned false for `prefer`/`allow`/unset,
+// so `build_pool_impl` wired `NoTls` for them. With `cfg.ssl_mode = Prefer`
+// (the unset/default, and the explicit `prefer`/`allow` mapping) plus a
+// `NoTls` connector, tokio_postgres's `connect_tls` took its
+// `Prefer if !tls.can_connect` arm — and `NoTls::can_connect` is always false
+// — so it skipped the SSL request entirely: pure plaintext, never asking the
+// server for TLS. Servers that require SSL (`hostssl` / cloud-managed
+// Postgres / k8s port-forwards) reject that with
+// `no pg_hba.conf entry for host ... no encryption`. The fix inverts the
+// predicate to `uses_tls`: only `disable` is plaintext; every other mode
+// (including unset, which the builtin normalizes to `prefer`) wires a
+// TLS-capable connector so the SSL request is actually sent.
+
+#[test]
+fn uses_tls_is_false_only_for_disable() {
+    assert!(!uses_tls(&params_with_ssl("disable")));
+}
+
+#[test]
+fn uses_tls_is_true_for_require_verify_ca_verify_full() {
+    assert!(uses_tls(&params_with_ssl("require")));
+    assert!(uses_tls(&params_with_ssl("verify-ca")));
+    assert!(uses_tls(&params_with_ssl("verify-full")));
+}
+
+#[test]
+fn uses_tls_is_true_for_prefer_allow_and_unset() {
+    // The #192 regression: these three must use TLS so tokio_postgres sends
+    // the SSLRequest and can negotiate (or fall back) rather than being
+    // forced to plaintext by a NoTls connector whose can_connect is false.
+    assert!(uses_tls(&params_with_ssl("prefer")));
+    assert!(uses_tls(&params_with_ssl("allow")));
+    let mut unset = params_with_ssl("prefer");
+    unset.ssl_mode = None;
+    assert!(
+        uses_tls(&unset),
+        "unset ssl_mode must use TLS (builtin treats unset as prefer)"
+    );
+}
+
+#[test]
+fn uses_tls_is_true_for_an_unrecognized_mode() {
+    // An unknown ssl_mode is left unmapped by resolve_ssl_mode (tokio_postgres
+    // keeps its Prefer default), and uses_tls must still wire a TLS connector
+    // so the connection attempts TLS rather than being forced to plaintext.
+    // Matching the builtin: only an explicit `disable` opts out of TLS.
+    assert!(uses_tls(&params_with_ssl("bogus")));
+}
+
+// The #192 fix also closes a second parity gap: `prefer`/`allow`/unset
+// previously fell through `build_tls_connector` to `with_platform_verifier()`
+// (which validates the server cert against the OS trust store), but the
+// builtin uses `NoCertVerifier` (no validation) for `prefer`/`allow`/`require`.
+// The three now share the `NoCertVerifier` branch with `require`.
+//
+// We can't assert the verifier type directly — rustls's `ClientConfig.verifier`
+// field is `pub(super)`, private to external crates — and distinguishing
+// NoCertVerifier from a platform verifier behaviorally requires an actual TLS
+// handshake. The load-bearing live proof that prefer/unset actually negotiate
+// TLS (not plaintext) lives in `client_live_tests::prefer_unset_negotiates_tls
+// _not_plaintext` (uses `pg_stat_ssl`). Here we lock in the structural
+// precondition: the connector still builds for all three non-validating modes
+// without a CA. The non-vacuous guard against a revert of the NoCertVerifier
+// arm is `build_tls_connector_rejects_an_unrecognized_ssl_mode` below (an
+// unrecognized mode that reached the old platform-verifier fallthrough would
+// build, not error — that test fails on a revert).
+
+#[test]
+fn build_tls_connector_prefer_allow_unset_build_without_a_ca() {
+    build_tls_connector(&params_with_ssl("prefer"))
+        .expect("prefer must build a connector without ssl_ca");
+    build_tls_connector(&params_with_ssl("allow"))
+        .expect("allow must build a connector without ssl_ca");
+    let mut unset = params_with_ssl("prefer");
+    unset.ssl_mode = None;
+    build_tls_connector(&unset).expect("unset must build a connector without ssl_ca");
+}
+
+// Coverage for the unrecognized-ssl_mode finding from the #195 ensemble
+// review: a typo'd or unrecognized ssl_mode must produce a clear config error,
+// not silently fall through to with_platform_verifier (verify-full behavior).
+// Before this guard, "bogus" matched neither the NoCertVerifier arm nor the
+// cert-validation block and reached the platform-verifier fallthrough,
+// silently enforcing full chain+hostname validation against the OS trust
+// store — breaking self-signed-cert connections with a misleading cert error
+// instead of naming the bad ssl_mode. The builtin rejects unknown modes via
+// `parse_postgres_ssl_mode`'s `_ => Err(unknown_ssl_mode_message(...))` arm.
+
+#[test]
+fn build_tls_connector_rejects_an_unrecognized_ssl_mode() {
+    let err = build_tls_connector(&params_with_ssl("bogus"))
+        .expect_err("an unrecognized ssl_mode must be rejected, not silently used");
+    assert!(
+        err.contains("Unknown SSL mode") && err.contains("bogus"),
+        "error must name the unrecognized mode; got: {err}"
+    );
+    assert!(
+        err.contains("verify-ca") && err.contains("verify-full"),
+        "error must list the accepted values; got: {err}"
+    );
+}
+
+#[test]
+fn build_tls_connector_rejects_a_typo_of_require() {
+    // A plausible typo: missing the 'u' in "require". Must error, not silently
+    // fall through to platform-verifier TLS (which would break a connection
+    // that previously worked in plaintext, with a misleading cert error).
+    let err = build_tls_connector(&params_with_ssl("reqire"))
+        .expect_err("a typo of require must be rejected");
+    assert!(
+        err.contains("Unknown SSL mode"),
+        "expected unknown-ssl_mode error; got: {err}"
+    );
+}
+
+// Normalization (trim + lowercase, matching the builtin's normalized_ssl_mode
+// + non_empty_ssl_mode): case and whitespace variants must route the same way
+// as their canonical form. These close the edge-case findings from the #195
+// review (case-sensitivity, whitespace, empty-string).
+
+#[test]
+fn uses_tls_is_false_for_case_and_whitespace_variants_of_disable() {
+    assert!(!uses_tls(&params_with_ssl("DISABLE")));
+    assert!(!uses_tls(&params_with_ssl("Disable")));
+    assert!(!uses_tls(&params_with_ssl(" disable ")));
+    assert!(!uses_tls(&params_with_ssl("\tdisable\n")));
+}
+
+#[test]
+fn uses_tls_treats_trimmed_empty_as_unset_not_disable() {
+    // An empty/whitespace ssl_mode is treated as unset (prefer), not disable —
+    // matching the builtin's non_empty_ssl_mode, which filters trimmed-empty
+    // to None. So it must use TLS, not plaintext.
+    assert!(uses_tls(&params_with_ssl("")));
+    assert!(uses_tls(&params_with_ssl("   ")));
+}
+
+#[test]
+fn build_tls_connector_accepts_case_and_whitespace_variants_of_prefer() {
+    // The normalized match arm must accept uppercase/whitespace variants,
+    // not just the canonical lowercase "prefer".
+    build_tls_connector(&params_with_ssl("PREFER"))
+        .expect("PREFER must build (normalized to prefer)");
+    build_tls_connector(&params_with_ssl(" Prefer "))
+        .expect("\" Prefer \" must build (normalized to prefer)");
+}
+
 // Coverage for #44: build_tls_connector's `require` branch fell through to
 // with_platform_verifier(), which DOES validate the server cert against the
 // OS trust store — contradicting the function's own doc comment ("require
@@ -1113,10 +1263,11 @@ fn build_tls_connector_require_builds_successfully_with_no_ssl_ca() {
 // Coverage for #90: `require`/`verify-ca` lazily install the rustls
 // CryptoProvider as a side effect of `NoCertVerifier::new()` /
 // `VerifyCaCertVerifier::new()`, but `verify-full` (both branches below)
-// and the prefer/allow/disable fallthrough build a `ClientConfig`/
-// `WebPkiServerVerifier` directly, with no such side effect. In rustls
-// 0.23 with only the `ring` feature enabled (no auto-install), the first
-// TLS operation in the *process* to reach `ClientConfig::builder()` (or
+// builds a `ClientConfig`/`WebPkiServerVerifier` directly, with no such side
+// effect. (`prefer`/`allow`/unset now go through `NoCertVerifier::new()` too
+// after #192, and `disable` never reaches `build_tls_connector` at all.) In
+// rustls 0.23 with only the `ring` feature enabled (no auto-install), the
+// first TLS operation in the *process* to reach `ClientConfig::builder()` (or
 // `WebPkiServerVerifier::builder()`, or `with_platform_verifier()`) panics
 // with "no process-level CryptoProvider available" unless something
 // installed a provider first. `build_tls_connector` now calls
@@ -1124,8 +1275,8 @@ fn build_tls_connector_require_builds_successfully_with_no_ssl_ca() {
 // branches build successfully regardless of call order — these tests
 // don't (and structurally can't, since the shared test binary runs many
 // tests in one process and a `Once` is process-global) prove the panic
-// would occur without the fix; they lock in that all four
-// previously-under-verified branches still succeed with it.
+// would occur without the fix; they lock in that the previously-under-
+// verified `verify-full` branches still succeed with it.
 #[test]
 fn build_tls_connector_verify_full_with_ca_builds_successfully() {
     let ca_path = write_temp_file(FIXTURE_CA_CERT_PEM);
@@ -1151,17 +1302,27 @@ fn build_tls_connector_verify_full_without_ca_builds_successfully() {
 
 #[test]
 fn build_tls_connector_prefer_mode_builds_successfully() {
-    // The plain fallthrough branch: ssl_mode outside
-    // require/verify-ca/verify-full goes straight to
-    // with_platform_verifier() with no verifier constructor run first.
+    // `prefer` now shares the NoCertVerifier branch with `require`/`allow`/
+    // unset (#192), instead of falling through to with_platform_verifier().
+    // The connector must still build without panicking.
     let params = params_with_ssl("prefer");
     build_tls_connector(&params).expect("prefer mode must build a connector without panicking");
 }
 
 #[test]
-fn build_tls_connector_disable_mode_builds_successfully() {
+fn build_tls_connector_disable_mode_does_not_build_a_tls_connector() {
+    // `disable` never reaches `build_tls_connector` in production — `uses_tls`
+    // is false for it, so the pool wires `NoTls` directly. The function
+    // rejects it as an unrecognized-for-this-path mode rather than silently
+    // building a TLS connector the pool would never use. This guards against
+    // a future refactor that routes `disable` here by accident.
     let params = params_with_ssl("disable");
-    build_tls_connector(&params).expect("disable mode must build a connector without panicking");
+    let err = build_tls_connector(&params)
+        .expect_err("disable must not build a TLS connector — it uses NoTls");
+    assert!(
+        err.contains("Unknown SSL mode") && err.contains("disable"),
+        "expected an unknown-ssl_mode error for disable, got: {err}"
+    );
 }
 
 // Coverage for #46: verify-ca without an explicit ssl_ca silently fell
@@ -1337,5 +1498,275 @@ fn pooler_error_lead_conditional_when_pooler_not_declared() {
     assert!(
         lead.contains("Supabase/Supavisor"),
         "conditional lead should name the pooler flavors users hit (#163): {lead:?}"
+    );
+}
+
+// Coverage for #197: `split_postgres_socket_path` ports the builtin's
+// `split_postgres_socket_path` (`pool_manager.rs` at `012cd844^`, line 667-
+// 680) verbatim — recognizing the `.s.PGSQL.<port>` socket-file shape vs a
+// bare directory path.
+
+#[test]
+fn split_postgres_socket_path_recognizes_the_socket_file_shape() {
+    // `/var/run/postgresql/.s.PGSQL.5432` -> dir + port from the filename.
+    assert_eq!(
+        split_postgres_socket_path("/var/run/postgresql/.s.PGSQL.5432", 5432),
+        ("/var/run/postgresql".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_recognizes_a_custom_port_in_the_filename() {
+    assert_eq!(
+        split_postgres_socket_path("/tmp/.s.PGSQL.54320", 5432),
+        ("/tmp".to_string(), 54320)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_treats_a_bare_directory_as_dir_plus_default_port() {
+    // A path whose last component isn't `.s.PGSQL.<port>` is the directory
+    // itself, paired with the default port.
+    assert_eq!(
+        split_postgres_socket_path("/var/run/postgresql", 5432),
+        ("/var/run/postgresql".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_handles_root_dir_when_socket_is_at_root() {
+    // `/.s.PGSQL.5432` -> dir is `/` (not empty), port 5432.
+    assert_eq!(
+        split_postgres_socket_path("/.s.PGSQL.5432", 5432),
+        ("/".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_passes_through_a_path_with_no_slash() {
+    // No `/` in the path -> the whole thing is the directory.
+    assert_eq!(
+        split_postgres_socket_path("relative_dir", 5432),
+        ("relative_dir".to_string(), 5432)
+    );
+}
+
+#[test]
+fn split_postgres_socket_path_does_not_match_a_non_pgsql_filename() {
+    // A filename that isn't `.s.PGSQL.<port>` is not a socket file — the
+    // whole path is treated as the directory with the default port.
+    assert_eq!(
+        split_postgres_socket_path("/var/run/postgresql/postgres.sock", 5432),
+        ("/var/run/postgresql/postgres.sock".to_string(), 5432)
+    );
+}
+
+// Coverage for #197: the pool cache key must distinguish a Unix-socket
+// connection from a TCP connection to the same database, and two socket
+// connections to the same path must share a key.
+
+#[test]
+fn connection_key_distinguishes_socket_from_tcp_for_the_same_database() {
+    // Same host:port on both — the distinction can ONLY come from the socket
+    // endpoint. If the socket keying were reverted (falling back to host:port),
+    // both keys would be identical and this test would fail. (The earlier
+    // version of this test used different host:port values, which made it
+    // vacuous — it passed even with the socket keying reverted. #198 review.)
+    let tcp = params("localhost", 5432, "db", "user");
+    let mut sock = tcp.clone();
+    sock.unix_socket_path = Some("/var/run/postgresql".to_string());
+    // Same host:port as tcp — the socket must override it in the key.
+    assert_ne!(
+        connection_key(&tcp),
+        connection_key(&sock),
+        "a socket connection and a TCP connection with the same host:port + database \
+         must not share a pool — the socket endpoint must distinguish them"
+    );
+}
+
+#[test]
+fn connection_key_socket_key_ignores_host_and_port() {
+    // Two socket connections to the same path but different (bogus) host/port
+    // must share a key — the socket overrides host:port, so the key should
+    // not depend on them.
+    let mut a = params("ignored.invalid", 1, "db", "user");
+    a.unix_socket_path = Some("/var/run/postgresql".to_string());
+    let mut b = params("also.invalid", 9999, "db", "user");
+    b.unix_socket_path = Some("/var/run/postgresql".to_string());
+    assert_eq!(
+        connection_key(&a),
+        connection_key(&b),
+        "same socket + database must share a key regardless of host/port \
+         (the socket overrides them)"
+    );
+}
+
+#[test]
+fn connection_key_distinguishes_different_socket_paths() {
+    let mut a = params("ignored.invalid", 1, "db", "user");
+    a.unix_socket_path = Some("/var/run/postgresql".to_string());
+    let mut b = params("ignored.invalid", 1, "db", "user");
+    b.unix_socket_path = Some("/tmp".to_string());
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "different socket paths must produce distinct keys"
+    );
+}
+
+#[test]
+fn connection_key_treats_a_blank_socket_path_as_absent() {
+    // A whitespace-only socket path is treated as unset (local_socket_path
+    // filters it), so the key falls back to host:port.
+    let mut with_blank = params("localhost", 5432, "db", "user");
+    with_blank.unix_socket_path = Some("   ".to_string());
+    let without = params("localhost", 5432, "db", "user");
+    assert_eq!(
+        connection_key(&with_blank),
+        connection_key(&without),
+        "a blank socket path must be treated as absent (falls back to host:port)"
+    );
+}
+
+// Coverage for the #198 review's test-coverage finding: build_socket_pool's
+// .host_path(&dir) call (the load-bearing Unix-socket-dialing call) had no
+// CI-runnable test. Extracted build_socket_pg_config so a unit test can
+// assert the config dials a Host::Unix path (not a TCP host) and forces
+// SslMode::Disable — without a live socket.
+
+#[cfg(unix)]
+#[test]
+fn build_socket_pg_config_dials_a_unix_socket_not_tcp() {
+    use tokio_postgres::config::Host;
+
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/var/run/postgresql/.s.PGSQL.5432".to_string());
+    let config = super::build_socket_pg_config(&params, "/var/run/postgresql/.s.PGSQL.5432");
+
+    // The host list must contain a Unix socket path, not a TCP hostname.
+    // If .host_path were typo'd to .host, this would be Host::Tcp instead.
+    let hosts = config.get_hosts();
+    assert_eq!(hosts.len(), 1, "exactly one host (the socket dir)");
+    match &hosts[0] {
+        Host::Unix(path) => {
+            assert_eq!(
+                path,
+                std::path::Path::new("/var/run/postgresql"),
+                "host_path must point at the socket directory, not the .s.PGSQL file"
+            );
+        }
+        Host::Tcp(h) => panic!("expected Host::Unix, got Host::Tcp({h}) — .host_path was not used"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn build_socket_pg_config_extracts_port_from_spgsql_filename() {
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/tmp/.s.PGSQL.54320".to_string());
+    let config = super::build_socket_pg_config(&params, "/tmp/.s.PGSQL.54320");
+    let ports = config.get_ports();
+    assert_eq!(
+        ports,
+        vec![54320],
+        "port must be extracted from .s.PGSQL.54320, not params.port=1"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn build_socket_pg_config_forces_ssl_mode_disable() {
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/var/run/postgresql".to_string());
+    // Even if the user set ssl_mode=require, the socket config must force Disable.
+    params.ssl_mode = Some("require".to_string());
+    let config = super::build_socket_pg_config(&params, "/var/run/postgresql");
+    assert_eq!(
+        config.get_ssl_mode(),
+        tokio_postgres::config::SslMode::Disable,
+        "socket config must force SslMode::Disable regardless of params.ssl_mode"
+    );
+}
+
+// Coverage for the #198 review's cancel-path finding: uses_tls must return
+// false when a Unix socket is set, even if ssl_mode is verify-ca/require/etc.
+// The socket branch forces SslMode::Disable, so the cancel path must match or
+// it would try to build a TLS connector and fail, silently dropping the cancel.
+
+#[test]
+fn uses_tls_returns_false_when_a_socket_is_set_regardless_of_ssl_mode() {
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.unix_socket_path = Some("/var/run/postgresql".to_string());
+
+    for mode in [
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "verify-full",
+    ] {
+        params.ssl_mode = Some(mode.to_string());
+        assert!(
+            !uses_tls(&params),
+            "uses_tls must return false for ssl_mode={mode} when a socket is set (socket forces Disable)"
+        );
+    }
+}
+
+#[test]
+fn uses_tls_returns_true_for_tls_modes_when_no_socket() {
+    let params = params("localhost", 5432, "db", "user");
+    let mut p = params.clone();
+    p.ssl_mode = Some("require".to_string());
+    assert!(uses_tls(&p));
+    p.ssl_mode = Some("verify-ca".to_string());
+    assert!(uses_tls(&p));
+    p.ssl_mode = Some("verify-full".to_string());
+    assert!(uses_tls(&p));
+}
+
+// Coverage for the #198 review's precedence-mismatch finding: connection_key
+// must key on the socket even when connection_string is also set (matching
+// build_pool_impl's order — socket first). Before the fix, connection_key
+// checked connection_string first and ignored the socket, so two requests
+// sharing a connection_string but differing in socket path collided on one
+// cached pool.
+
+#[test]
+fn connection_key_includes_socket_even_when_connection_string_is_set() {
+    // Two connections with the SAME connection_string but DIFFERENT socket
+    // paths. If the socket is ignored in the key (the pre-fix bug), both
+    // produce cs:{same hash} and collide. After the fix, the socket takes
+    // precedence and each gets its own socket:{path} key.
+    let conn_str = "postgres://user@localhost:5432/db";
+    let mut a = params("ignored.invalid", 1, "db", "user");
+    a.connection_string = Some(conn_str.to_string());
+    a.unix_socket_path = Some("/var/run/postgresql".to_string());
+
+    let mut b = params("ignored.invalid", 1, "db", "user");
+    b.connection_string = Some(conn_str.to_string());
+    b.unix_socket_path = Some("/tmp".to_string());
+
+    assert_ne!(
+        connection_key(&a),
+        connection_key(&b),
+        "two connections sharing a connection_string but with different socket paths \
+         must get distinct keys — the socket takes precedence over connection_string \
+         (matching build_pool_impl's order)"
+    );
+}
+
+#[test]
+fn connection_key_socket_precedence_keys_on_socket_not_connection_string() {
+    // A socket connection's key must start with "socket:" (not "cs:"), even
+    // when connection_string is set — proving the socket won the precedence.
+    let mut params = params("ignored.invalid", 1, "db", "user");
+    params.connection_string = Some("postgres://user@localhost:5432/db".to_string());
+    params.unix_socket_path = Some("/var/run/postgresql".to_string());
+    let key = connection_key(&params);
+    assert!(
+        key.starts_with("socket:"),
+        "socket connection's key must start with 'socket:' even when connection_string is set; got: {key}"
     );
 }

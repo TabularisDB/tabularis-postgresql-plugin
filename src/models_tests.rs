@@ -85,3 +85,66 @@ fn is_transaction_pooler_false_for_non_string_json() {
     }));
     assert!(!params.is_transaction_pooler());
 }
+
+// Coverage for #197: `unix_socket_path` must be parsed from the JSON-RPC
+// params (snake_case key — the host's ConnectionParams has no rename_all, so
+// fields serialize as snake_case) and `local_socket_path` must trim/filter
+// it. The host strips `unix_socket_path` to `None` at every tunnel
+// activation site, so a present non-empty value means "dial this socket
+// locally."
+
+#[test]
+fn from_value_parses_unix_socket_path() {
+    let params = ConnectionParams::from_value(&json!({
+        "driver": "postgres",
+        "host": "localhost",
+        "port": 5432,
+        "database": "db",
+        "username": "user",
+        "unix_socket_path": "/var/run/postgresql",
+    }));
+    assert_eq!(
+        params.unix_socket_path.as_deref(),
+        Some("/var/run/postgresql"),
+        "unix_socket_path must be parsed from the snake_case JSON key"
+    );
+}
+
+#[test]
+fn from_value_leaves_unix_socket_path_none_when_absent() {
+    let params = ConnectionParams::from_value(&json!({
+        "driver": "postgres",
+        "host": "localhost",
+        "port": 5432,
+        "database": "db",
+        "username": "user",
+    }));
+    assert!(
+        params.unix_socket_path.is_none(),
+        "unix_socket_path must be None when the key is absent"
+    );
+}
+
+#[test]
+fn local_socket_path_trims_and_filters_empty() {
+    let mut params = ConnectionParams::from_value(&json!({
+        "driver": "postgres",
+        "host": "localhost",
+        "database": "db",
+        "username": "user",
+        "unix_socket_path": "  /var/run/postgresql  ",
+    }));
+    assert_eq!(params.local_socket_path(), Some("/var/run/postgresql"));
+
+    params.unix_socket_path = Some("   ".to_string());
+    assert!(
+        params.local_socket_path().is_none(),
+        "a whitespace-only socket path must be treated as unset"
+    );
+
+    params.unix_socket_path = Some("".to_string());
+    assert!(
+        params.local_socket_path().is_none(),
+        "an empty socket path must be treated as unset"
+    );
+}
