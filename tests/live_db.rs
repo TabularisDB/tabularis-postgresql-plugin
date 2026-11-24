@@ -3020,9 +3020,13 @@ fn import_database_sql_rejects_rollback_copy_stdin_and_meta_commands() {
     let params = conn_params();
     let t = format!("imp_rej_{}", uuid::Uuid::new_v4().simple());
     for (sql, expect) in [
-        ("ROLLBACK;", "ROLLBACK"),
-        ("COPY pg_class FROM stdin;\n1\t2\n\\.\n", "COPY"),
-        ("\\connect other\nSELECT 1;", "meta-command"),
+        ("ROLLBACK;", "ROLLBACK is not allowed"),
+        (
+            "COPY pg_class FROM stdin;\n1\t2\n\\.\n",
+            "is not supported in an import",
+        ),
+        ("\\connect other\nSELECT 1;", "meta-commands"),
+        ("SET standard_conforming_strings = off;", "must stay on"),
     ] {
         let response = import_sql(
             &mut plugin,
@@ -3031,6 +3035,10 @@ fn import_database_sql_rejects_rollback_copy_stdin_and_meta_commands() {
         );
         let error = import_error(&response);
         assert!(error.contains(expect), "{sql:?}: {error}");
+        assert!(
+            error.starts_with("Error at statement 2"),
+            "{sql:?}: {error}"
+        );
         let exists = scalar(
             &mut plugin,
             &params,
@@ -3243,4 +3251,203 @@ fn import_database_sql_is_cancellable_and_rolls_back_what_ran_before_the_cancel(
         exists, false,
         "a cancelled import must leave nothing behind"
     );
+}
+
+#[test]
+fn import_database_sql_keeps_a_commit_after_a_function_with_a_begin_named_parameter_out_of_the_function(
+) {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_beginname_{}", uuid::Uuid::new_v4().simple());
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!(
+            "CREATE TABLE {t} (id int PRIMARY KEY);\n\
+             CREATE FUNCTION {t}_f(begin date) RETURNS int LANGUAGE sql AS 'select 1';\n\
+             INSERT INTO {t} VALUES (1);\nCOMMIT;\nINSERT INTO {t} VALUES (1);\n"
+        ),
+    );
+    assert!(
+        import_error(&response).contains("statement 5"),
+        "{response}"
+    );
+    let exists = scalar(
+        &mut plugin,
+        &params,
+        &format!("SELECT to_regclass('public.{t}') IS NOT NULL"),
+    );
+    assert_eq!(
+        exists, false,
+        "the COMMIT must not have made the first half durable"
+    );
+}
+
+#[test]
+fn import_database_sql_runs_exactly_one_command_per_statement() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_onecmd_{}", uuid::Uuid::new_v4().simple());
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!("CREATE TABLE {t} (id int);\nINSERT INTO {t} VALUES (1);\nDO $$ BEGIN INSERT INTO {t} VALUES (2); END $$;\n"),
+    );
+    assert_eq!(response["result"]["statements"], 3, "{response}");
+    assert_eq!(
+        scalar(&mut plugin, &params, &format!("SELECT count(*) FROM {t}")),
+        2
+    );
+    drop_tables(&mut plugin, &params, &[&t]);
+}
+
+#[test]
+fn import_database_sql_cancel_between_many_small_statements_still_stops_and_rolls_back() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_cancel_many_{}", uuid::Uuid::new_v4().simple());
+    let mut sql = format!("CREATE TABLE {t} (id int);\n");
+    for i in 0..400_000 {
+        sql.push_str(&format!("INSERT INTO {t} VALUES ({i});\n"));
+    }
+    let path = write_sql_file(&sql);
+    let import_id = plugin.next_id;
+    plugin.next_id += 1;
+    let mut line = serde_json::to_string(&json!({
+        "jsonrpc": "2.0", "method": "import_database_sql",
+        "params": {"params": params, "file_path": path}, "id": import_id,
+    }))
+    .unwrap();
+    line.push('\n');
+    plugin
+        .stdin
+        .write_all(line.as_bytes())
+        .expect("write import");
+    plugin.stdin.flush().expect("flush import");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let mut cancel = serde_json::to_string(
+        &json!({"jsonrpc": "2.0", "method": "cancel", "params": {"id": import_id}}),
+    )
+    .unwrap();
+    cancel.push('\n');
+    let started = std::time::Instant::now();
+    plugin
+        .stdin
+        .write_all(cancel.as_bytes())
+        .expect("write cancel");
+    plugin.stdin.flush().expect("flush cancel");
+    let mut response_line = String::new();
+    plugin
+        .stdout
+        .read_line(&mut response_line)
+        .expect("read import response");
+    let _ = std::fs::remove_file(path);
+    let response: Value = serde_json::from_str(response_line.trim()).expect("parse response");
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "the cancel was lost: the import ran to the end"
+    );
+    let error = import_error(&response);
+    assert!(error.contains("cancel"), "{error}");
+    let exists = scalar(
+        &mut plugin,
+        &params,
+        &format!("SELECT to_regclass('public.{t}') IS NOT NULL"),
+    );
+    assert_eq!(
+        exists, false,
+        "a cancelled import must leave nothing behind"
+    );
+}
+
+/// Only runs when `PG_PLUGIN_TEST_POOLER_PORT` points at a transaction-mode
+/// PgBouncer in front of the test database (CI has none, so it skips there).
+#[test]
+fn import_database_sql_does_not_leak_session_settings_through_a_transaction_pooler() {
+    let Ok(port) = std::env::var("PG_PLUGIN_TEST_POOLER_PORT") else {
+        return;
+    };
+    let mut plugin = Plugin::spawn();
+    let mut params = conn_params();
+    params["port"] = json!(port
+        .parse::<u16>()
+        .expect("PG_PLUGIN_TEST_POOLER_PORT must be a port"));
+    params["pooler_mode"] = json!("transaction");
+    let before = scalar(&mut plugin, &params, "SHOW search_path");
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        "SELECT pg_catalog.set_config('search_path', '', false);\nSET check_function_bodies = false;\nSET work_mem = '77MB';\n",
+    );
+    assert_eq!(response["result"]["statements"], 3, "{response}");
+    for _ in 0..6 {
+        assert_eq!(scalar(&mut plugin, &params, "SHOW search_path"), before);
+        assert_eq!(
+            scalar(&mut plugin, &params, "SHOW check_function_bodies"),
+            "on"
+        );
+        assert_ne!(scalar(&mut plugin, &params, "SHOW work_mem"), "77MB");
+    }
+}
+
+#[test]
+fn import_database_sql_does_not_leak_a_set_role_through_a_transaction_pooler() {
+    let Ok(port) = std::env::var("PG_PLUGIN_TEST_POOLER_PORT") else {
+        return;
+    };
+    let mut plugin = Plugin::spawn();
+    let direct = conn_params();
+    let role = format!("imp_role_{}", uuid::Uuid::new_v4().simple());
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": direct, "query": format!("CREATE ROLE \"{role}\" NOLOGIN")}),
+    );
+    let mut params = direct.clone();
+    params["port"] = json!(port
+        .parse::<u16>()
+        .expect("PG_PLUGIN_TEST_POOLER_PORT must be a port"));
+    params["pooler_mode"] = json!("transaction");
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!(
+            "SET ROLE \"{role}\";\nSET SESSION AUTHORIZATION DEFAULT;\nSET ROLE \"{role}\";\n"
+        ),
+    );
+    let leaked: Vec<Value> = (0..6)
+        .map(|_| scalar(&mut plugin, &params, "SELECT current_user"))
+        .collect();
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": direct, "query": format!("DROP ROLE \"{role}\"")}),
+    );
+    assert_eq!(response["result"]["statements"], 3, "{response}");
+    assert!(
+        leaked.iter().all(|u| u == "postgres"),
+        "SET ROLE leaked to later pooled clients: {leaked:?}"
+    );
+}
+
+#[test]
+fn import_database_sql_reads_plain_strings_literally_even_when_the_session_default_is_off() {
+    let mut plugin = Plugin::spawn();
+    let mut params = conn_params();
+    params["startup_script"] = json!("SET standard_conforming_strings = off");
+    let t = format!("imp_scs_{}", uuid::Uuid::new_v4().simple());
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!("CREATE TABLE {t} (v text);\nINSERT INTO {t} VALUES ('a\\');\nINSERT INTO {t} VALUES ('b');\n"),
+    );
+    assert_eq!(response["result"]["statements"], 3, "{response}");
+    let direct = conn_params();
+    assert_eq!(
+        scalar(
+            &mut plugin,
+            &direct,
+            &format!("SELECT v FROM {t} WHERE v LIKE 'a%'")
+        ),
+        "a\\"
+    );
+    drop_tables(&mut plugin, &direct, &[&t]);
 }

@@ -228,8 +228,14 @@ are skipped. `ROLLBACK`, `COMMIT AND CHAIN`, `PREPARE TRANSACTION`,
 `COPY ... FROM STDIN` / `TO STDOUT` and psql meta-commands (`\connect`, `\i`)
 are rejected with an explanation; use `pg_dump --inserts` for dumps that would
 otherwise rely on `COPY ... FROM STDIN`. Creating a database during import is
-not supported, and read-only connections are rejected. Cancelling the call
-cancels the running statement and rolls everything back.
+not supported, and read-only connections are rejected. `SET
+standard_conforming_strings = off` is rejected too, because it would change how
+the rest of the file's string literals are read. Each statement is sent as
+exactly one command, so a statement the splitter cannot separate fails with an
+error instead of running extra commands. Cancelling the call, including between
+statements, stops the import and rolls everything back. Session settings a dump
+makes (`set_config(..., false)`, `SET ROLE`) are reset before `COMMIT`, so they
+cannot leak to other clients behind a transaction pooler.
 
 ## Building from Source
 

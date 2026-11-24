@@ -3,6 +3,8 @@
 //! itself is covered against a live database in `tests/live_db.rs`.
 
 use super::*;
+use crate::client;
+use crate::models::ConnectionParams;
 use serde_json::json;
 
 fn req(extra: Value) -> Value {
@@ -185,4 +187,158 @@ fn a_huge_statement_is_truncated_in_the_error_message_on_a_char_boundary() {
     assert!(
         msg.starts_with("Error at statement 1 (line 1): ERROR: x\nQuery: INSERT INTO t VALUES ('é")
     );
+}
+
+#[test]
+fn a_dollar_inside_an_identifier_is_not_a_dollar_quote_when_looking_for_copy_stdin() {
+    for sql in [
+        "COPY a$b$ FROM STDIN",
+        "COPY t$x$y (a) FROM stdin WITH (FORMAT csv)",
+    ] {
+        assert!(matches!(classify(sql), Action::Reject(_)), "{sql}");
+    }
+}
+
+#[test]
+fn turning_off_standard_conforming_strings_is_rejected_because_it_changes_how_the_file_must_be_split(
+) {
+    for sql in [
+        "SET standard_conforming_strings = off",
+        "set standard_conforming_strings to 'off'",
+        "SET SESSION standard_conforming_strings = false",
+        "SET LOCAL standard_conforming_strings = 0",
+        "SET standard_conforming_strings TO \"off\"",
+    ] {
+        match classify(sql) {
+            Action::Reject(why) => {
+                assert!(why.contains("standard_conforming_strings"), "{sql}: {why}")
+            }
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn leaving_standard_conforming_strings_on_is_fine() {
+    for sql in [
+        "SET standard_conforming_strings = on",
+        "SET standard_conforming_strings TO 'on'",
+        "SET standard_conforming_strings = true",
+        "SET standard_conforming_strings = DEFAULT",
+        "SELECT 'standard_conforming_strings = off'",
+        "CREATE TABLE standard_conforming_strings (a int)",
+    ] {
+        assert_eq!(classify(sql), Action::Run, "{sql}");
+    }
+}
+
+#[test]
+fn a_commit_rejected_by_the_server_says_nothing_was_imported() {
+    let msg = commit_error_message(12, "ERROR: insert or update violates foreign key", true);
+    assert!(
+        msg.starts_with("COMMIT failed, nothing was imported"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("12 statements") && msg.contains("foreign key"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn a_commit_that_loses_the_connection_does_not_claim_the_outcome() {
+    let msg = commit_error_message(12, "connection closed", false);
+    assert!(msg.starts_with("COMMIT failed"), "{msg}");
+    assert!(!msg.contains("nothing was imported"), "{msg}");
+    assert!(msg.contains("outcome is unknown"), "{msg}");
+}
+
+#[test]
+fn a_multi_command_rejection_explains_the_splitter_could_not_separate_the_statement() {
+    let reason = statement_failure_reason(
+        "42601",
+        "ERROR: cannot insert multiple commands into a prepared statement",
+    );
+    assert!(reason.contains("could not be split"), "{reason}");
+    assert_eq!(
+        statement_failure_reason("23505", "ERROR: duplicate key"),
+        "ERROR: duplicate key"
+    );
+}
+
+#[tokio::test]
+async fn a_reader_that_dies_without_the_end_marker_is_an_error_not_a_clean_end() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Item>(4);
+    tx.send(Ok(Some(SqlStatement {
+        text: "SELECT 1".into(),
+        line: 1,
+    })))
+    .await
+    .unwrap();
+    drop(tx);
+    assert_eq!(next_item(&mut rx).await.unwrap().unwrap().text, "SELECT 1");
+    let err = next_item(&mut rx).await.unwrap_err();
+    assert!(err.contains("stopped unexpectedly"), "{err}");
+}
+
+#[tokio::test]
+async fn the_end_marker_is_a_clean_end() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Item>(4);
+    tx.send(Ok(None)).await.unwrap();
+    assert!(next_item(&mut rx).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_reader_error_is_propagated_verbatim() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Item>(4);
+    tx.send(Err("Unterminated string literal starting at line 9".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_item(&mut rx).await.unwrap_err(),
+        "Unterminated string literal starting at line 9"
+    );
+}
+
+#[test]
+fn session_state_is_restored_before_commit_and_the_durability_setting_is_reapplied_last() {
+    let steps = session_restore_statements();
+    assert_eq!(steps.first(), Some(&"RESET ALL"));
+    // RESET ALL deliberately skips role and session authorization.
+    assert!(steps.contains(&"RESET SESSION AUTHORIZATION"));
+    assert_eq!(steps.last(), Some(&"SET LOCAL synchronous_commit = OFF"));
+}
+
+/// Needs `PG_PLUGIN_TEST_HOST` (see `client_live_tests.rs`); skipped otherwise.
+#[tokio::test]
+async fn one_statement_text_holding_several_commands_is_refused_not_run() {
+    let Ok(host) = std::env::var("PG_PLUGIN_TEST_HOST") else {
+        return;
+    };
+    let params = ConnectionParams::from_value(&json!({
+        "host": host,
+        "port": std::env::var("PG_PLUGIN_TEST_PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(54320),
+        "database": std::env::var("PG_PLUGIN_TEST_DB").unwrap_or_else(|_| "testdb".into()),
+        "username": std::env::var("PG_PLUGIN_TEST_USER").unwrap_or_else(|_| "postgres".into()),
+        "password": std::env::var("PG_PLUGIN_TEST_PASSWORD").unwrap_or_else(|_| "password".into()),
+    }));
+    let client = crate::client::oneshot_pool_client(&params).await.unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .batch_execute("CREATE TEMP TABLE one_cmd (id int)")
+        .await
+        .unwrap();
+
+    let err = run_statement(
+        &client,
+        "INSERT INTO one_cmd VALUES (1); COMMIT; INSERT INTO one_cmd VALUES (2)",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("42601"), "{err}");
+    assert!(client::format_pg_error(&err).contains("multiple commands"));
+
+    // The transaction is still open (COMMIT never ran) and nothing was inserted.
+    let still_open = client.query_one("SELECT count(*) FROM one_cmd", &[]).await;
+    assert!(still_open.is_err() || still_open.unwrap().get::<_, i64>(0) == 0);
 }

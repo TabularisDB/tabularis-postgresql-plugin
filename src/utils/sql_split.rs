@@ -12,6 +12,11 @@
 
 use std::io::BufRead;
 
+/// PostgreSQL itself refuses a query string over 1 GiB, so a statement beyond
+/// this can never run; failing here also bounds memory when an unterminated
+/// quote would otherwise swallow the rest of a huge file.
+pub const MAX_STATEMENT_BYTES: usize = 1 << 30;
+
 /// One statement from a script: its text (no terminating `;`) and the
 /// 1-based line it starts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +50,8 @@ pub struct StatementSplitter<R: BufRead> {
     head: Vec<String>,
     paren_depth: usize,
     begin_depth: usize,
+    pending_begin: bool,
+    max_statement_bytes: usize,
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -53,6 +60,10 @@ fn is_ident_char(c: char) -> bool {
 
 impl<R: BufRead> StatementSplitter<R> {
     pub fn new(reader: R) -> Self {
+        Self::with_max_statement_bytes(reader, MAX_STATEMENT_BYTES)
+    }
+
+    pub fn with_max_statement_bytes(reader: R, max_statement_bytes: usize) -> Self {
         Self {
             reader,
             chars: Vec::new(),
@@ -68,6 +79,8 @@ impl<R: BufRead> StatementSplitter<R> {
             head: Vec::new(),
             paren_depth: 0,
             begin_depth: 0,
+            pending_begin: false,
+            max_statement_bytes,
         }
     }
 
@@ -82,6 +95,13 @@ impl<R: BufRead> StatementSplitter<R> {
                     return self.finish();
                 }
                 continue;
+            }
+            if self.text.len() > self.max_statement_bytes {
+                self.done = true;
+                return Err(format!(
+                    "Statement starting at line {} exceeds the maximum size of {} bytes",
+                    self.start_line, self.max_statement_bytes
+                ));
             }
             if let Some(statement) = self.step() {
                 return Ok(Some(statement));
@@ -134,6 +154,7 @@ impl<R: BufRead> StatementSplitter<R> {
         self.head.clear();
         self.paren_depth = 0;
         self.begin_depth = 0;
+        self.pending_begin = false;
         let started = std::mem::replace(&mut self.started, false);
         let text = std::mem::take(&mut self.text);
         let text = text.trim();
@@ -171,7 +192,7 @@ impl<R: BufRead> StatementSplitter<R> {
             Lex::LineComment => {
                 self.keep(c);
                 self.pos += 1;
-                if c == '\n' {
+                if c == '\n' || c == '\r' {
                     self.state = Lex::Normal;
                 }
                 None
@@ -270,8 +291,15 @@ impl<R: BufRead> StatementSplitter<R> {
         if self.head.len() <= header {
             return;
         }
+        // Only `BEGIN ATOMIC` opens a body: a bare `begin` can be a function
+        // or parameter name, and treating it as a body would swallow every
+        // following statement (including a COMMIT) into this one.
+        if std::mem::take(&mut self.pending_begin) && word == "atomic" {
+            self.begin_depth += 1;
+            return;
+        }
         match word.as_str() {
-            "begin" => self.begin_depth += 1,
+            "begin" if self.paren_depth == 0 && self.begin_depth == 0 => self.pending_begin = true,
             "case" if self.begin_depth > 0 => self.begin_depth += 1,
             "end" if self.begin_depth > 0 => self.begin_depth -= 1,
             _ => {}
@@ -281,6 +309,9 @@ impl<R: BufRead> StatementSplitter<R> {
     fn step_normal(&mut self, c: char) -> Option<SqlStatement> {
         if !(c.is_alphanumeric() || c == '_') {
             self.finish_word();
+            if !c.is_whitespace() && !matches!(c, '-' | '/') {
+                self.pending_begin = false;
+            }
         }
         match c {
             ';' if self.paren_depth == 0 && self.begin_depth == 0 => {

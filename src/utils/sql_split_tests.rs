@@ -321,3 +321,62 @@ fn a_large_dollar_quoted_body_splits_in_linear_time() {
         "dollar-quote scanning is not linear"
     );
 }
+
+#[test]
+fn begin_as_a_parameter_or_column_name_does_not_open_an_atomic_body() {
+    let tail = " INSERT INTO t VALUES (1); COMMIT; INSERT INTO t VALUES (2);";
+    for head in [
+        "CREATE FUNCTION f() RETURNS TABLE(begin int) LANGUAGE sql AS 'select 1';",
+        "CREATE FUNCTION f(begin date) RETURNS int LANGUAGE sql AS 'select 1';",
+        "CREATE FUNCTION begin() RETURNS int LANGUAGE sql AS 'select 1';",
+        "CREATE PROCEDURE p(IN begin int) LANGUAGE sql AS 'select 1';",
+    ] {
+        let out = split(&format!("{head}{tail}"));
+        assert_eq!(out.len(), 4, "{head} -> {out:?}");
+        assert_eq!(out[2], "COMMIT");
+    }
+}
+
+#[test]
+fn begin_atomic_is_recognised_across_whitespace_newlines_and_comments() {
+    for f in [
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN\n  ATOMIC SELECT 1; END",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN /* c */ ATOMIC SELECT 1; END",
+        "create function f() returns int language sql begin -- c\n atomic select 1; select 2; end",
+    ] {
+        assert_eq!(split(&format!("{f}; SELECT 3;")), [f, "SELECT 3"], "{f}");
+    }
+}
+
+#[test]
+fn a_carriage_return_ends_a_line_comment() {
+    assert_eq!(split("SELECT 1; -- c\rSELECT 2;"), ["SELECT 1", "SELECT 2"]);
+    assert_eq!(split("-- header\rSELECT 1;"), ["SELECT 1"]);
+}
+
+#[test]
+fn a_runaway_statement_is_rejected_at_the_size_limit_not_buffered_to_the_end() {
+    let mut splitter = StatementSplitter::with_max_statement_bytes(
+        Cursor::new(
+            "SELECT 1;\nSELECT 'aaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbb\n".as_bytes(),
+        ),
+        20,
+    );
+    assert_eq!(splitter.next_statement().unwrap().unwrap().text, "SELECT 1");
+    let err = splitter.next_statement().unwrap_err();
+    assert!(err.contains("exceeds") && err.contains("line 2"), "{err}");
+    assert!(
+        splitter.next_statement().unwrap().is_none(),
+        "splitter must stay stopped"
+    );
+}
+
+#[test]
+fn a_statement_exactly_at_the_limit_is_accepted() {
+    let mut splitter =
+        StatementSplitter::with_max_statement_bytes(Cursor::new("SELECT 12345;".as_bytes()), 12);
+    assert_eq!(
+        splitter.next_statement().unwrap().unwrap().text,
+        "SELECT 12345"
+    );
+}

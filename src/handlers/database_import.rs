@@ -96,6 +96,12 @@ pub(crate) fn classify(statement: &str) -> Action {
         };
     }
 
+    if disables_standard_conforming_strings(statement) {
+        return Action::Reject(
+            "standard_conforming_strings must stay on in an import: turning it off changes how string literals in the rest of the file are read",
+        );
+    }
+
     let first = leading_keywords(statement, 1)
         .into_iter()
         .next()
@@ -133,6 +139,40 @@ pub(crate) fn classify(statement: &str) -> Action {
         }
     }
     Action::Run
+}
+
+/// `SET [SESSION|LOCAL] standard_conforming_strings = <anything but on>`.
+fn disables_standard_conforming_strings(statement: &str) -> bool {
+    const NAME: &str = "standard_conforming_strings";
+    let words = leading_keywords(statement, 3);
+    if words.first().map(String::as_str) != Some("SET") {
+        return false;
+    }
+    let name_at = if matches!(words.get(1).map(String::as_str), Some("SESSION" | "LOCAL")) {
+        2
+    } else {
+        1
+    };
+    if !words
+        .get(name_at)
+        .is_some_and(|w| w.eq_ignore_ascii_case(NAME))
+    {
+        return false;
+    }
+    let lower = statement.to_lowercase();
+    let Some(at) = lower.find(NAME) else {
+        return false;
+    };
+    let mut value = lower[at + NAME.len()..].trim_start();
+    value = match value.strip_prefix('=') {
+        Some(rest) => rest,
+        None => value.strip_prefix("to").unwrap_or(value),
+    };
+    let value = value.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    !matches!(
+        value,
+        "on" | "true" | "yes" | "1" | "t" | "y" | "tr" | "tru" | "ye" | "default"
+    )
 }
 
 /// Uppercased words of `sql`, skipping comments, string literals, quoted
@@ -194,6 +234,11 @@ fn keywords_outside_quotes(sql: &str) -> Vec<String> {
                     }
                 }
             }
+            '$' if i > 0
+                && (chars[i - 1].is_alphanumeric() || matches!(chars[i - 1], '_' | '$')) =>
+            {
+                i += 1;
+            }
             '$' => {
                 let mut end = i + 1;
                 while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
@@ -221,6 +266,62 @@ fn keywords_outside_quotes(sql: &str) -> Vec<String> {
     words
 }
 
+/// Message for a failed `COMMIT`. A server-side rejection (deferred constraint
+/// violation) means PostgreSQL rolled the transaction back; a transport error
+/// leaves the outcome unknown, so it must not claim either way.
+pub(crate) fn commit_error_message(executed: usize, reason: &str, server_rejected: bool) -> String {
+    if server_rejected {
+        format!("COMMIT failed, nothing was imported ({executed} statements ran): {reason}")
+    } else {
+        format!(
+            "COMMIT failed and the outcome is unknown ({executed} statements ran): {reason}. \
+             Check the target database before retrying"
+        )
+    }
+}
+
+/// SQLSTATE 42601 "cannot insert multiple commands into a prepared statement"
+/// can only mean the splitter handed over text holding more than one command;
+/// say so instead of leaving the user with a bare syntax error.
+pub(crate) fn statement_failure_reason(sqlstate: &str, formatted: &str) -> String {
+    if sqlstate == "42601" && formatted.contains("multiple commands") {
+        format!(
+            "{formatted} (the statement could not be split into a single command; \
+             please report this file's construct as a bug)"
+        )
+    } else {
+        formatted.to_string()
+    }
+}
+
+/// What the import reader sends: a statement, `Ok(None)` as the explicit end
+/// of the file, or the reader's error. A channel that closes without the end
+/// marker means the reader died, which must never look like a complete file.
+pub(crate) type Item = Result<Option<SqlStatement>, String>;
+
+pub(crate) async fn next_item(
+    receiver: &mut mpsc::Receiver<Item>,
+) -> Result<Option<SqlStatement>, String> {
+    match receiver.recv().await {
+        Some(item) => item,
+        None => Err("The SQL file reader stopped unexpectedly; nothing was imported".into()),
+    }
+}
+
+/// Run just before `COMMIT`. On a connection behind a transaction pooler the
+/// backend outlives this import, and a dump's own session-level settings
+/// (`set_config('search_path', '', false)`, `SET ROLE`, ...) would otherwise
+/// leak to the next client (`RESET ALL` skips `ROLE` and `SESSION
+/// AUTHORIZATION`; resetting the latter clears both). `COMMIT` has to stay the last statement on the
+/// pinned backend, so the durability setting is re-applied after the reset.
+pub(crate) fn session_restore_statements() -> &'static [&'static str] {
+    &[
+        "RESET ALL",
+        "RESET SESSION AUTHORIZATION",
+        "SET LOCAL synchronous_commit = OFF",
+    ]
+}
+
 pub(crate) fn statement_error(index: usize, line: usize, reason: &str, text: &str) -> String {
     let total = text.chars().count();
     let shown: String = text.chars().take(MAX_ERROR_QUERY_CHARS).collect();
@@ -240,39 +341,40 @@ async fn run(id: &Value, request: &Value) -> Result<usize, String> {
 
     let file = File::open(&req.file_path)
         .map_err(|e| format!("Failed to open SQL file '{}': {e}", req.file_path))?;
-    let (sender, mut receiver) = mpsc::channel::<Result<SqlStatement, String>>(STATEMENT_QUEUE);
+    let (sender, mut receiver) = mpsc::channel::<Item>(STATEMENT_QUEUE);
     // Statements stream through a bounded channel, so a multi-gigabyte dump
     // never sits in memory and a failed import stops the reader at once (the
     // dropped receiver fails its next send).
     tokio::task::spawn_blocking(move || {
         let mut splitter = StatementSplitter::new(BufReader::with_capacity(128 * 1024, file));
         loop {
-            let item = match splitter.next_statement() {
-                Ok(Some(statement)) => Ok(statement),
-                Ok(None) => return,
-                Err(error) => Err(error),
-            };
-            let failed = item.is_err();
-            if sender.blocking_send(item).is_err() || failed {
+            let item = splitter.next_statement();
+            let last = !matches!(item, Ok(Some(_)));
+            if sender.blocking_send(item).is_err() || last {
                 return;
             }
         }
     });
 
     let pg_client = client::oneshot_pool_client(&req.params).await?;
-    let _cancel_guard = cancel::CancelGuard::register(id.as_u64(), &pg_client, req.params.clone());
+    let cancel_guard = cancel::CancelGuard::register(id.as_u64(), &pg_client, req.params.clone());
 
     pg_client
         .batch_execute("BEGIN")
         .await
         .map_err(|e| client::format_pg_error(&e))?;
 
-    match execute_all(&pg_client, &req.schema, &mut receiver).await {
+    let outcome = match execute_all(&pg_client, &req.schema, &mut receiver, &cancel_guard).await {
+        Ok(executed) => restore_session(&pg_client).await.map(|()| executed),
+        Err(error) => Err(error),
+    };
+    match outcome {
         Ok(executed) => {
             pg_client.batch_execute("COMMIT").await.map_err(|e| {
-                format!(
-                    "COMMIT failed, nothing was imported ({executed} statements ran): {}",
-                    client::format_pg_error(&e)
+                commit_error_message(
+                    executed,
+                    &client::format_pg_error(&e),
+                    e.as_db_error().is_some(),
                 )
             })?;
             Ok(executed)
@@ -284,13 +386,39 @@ async fn run(id: &Value, request: &Value) -> Result<usize, String> {
     }
 }
 
+/// The extended protocol takes exactly one command per statement, so a
+/// splitter mistake becomes a server error instead of a second command (a
+/// stray COMMIT among them) running unchecked.
+pub(crate) async fn run_statement(
+    pg_client: &PgClient,
+    text: &str,
+) -> Result<u64, tokio_postgres::Error> {
+    pg_client.execute_typed(text, &[]).await
+}
+
+async fn restore_session(pg_client: &PgClient) -> Result<(), String> {
+    for statement in session_restore_statements() {
+        pg_client.batch_execute(statement).await.map_err(|e| {
+            format!(
+                "Import cleanup failed ({statement}): {}",
+                client::format_pg_error(&e)
+            )
+        })?;
+    }
+    Ok(())
+}
+
 async fn execute_all(
     pg_client: &PgClient,
     schema: &str,
-    receiver: &mut mpsc::Receiver<Result<SqlStatement, String>>,
+    receiver: &mut mpsc::Receiver<Item>,
+    cancel_guard: &cancel::CancelGuard,
 ) -> Result<usize, String> {
     apply_search_path_local(pg_client, schema).await?;
     for setup in [
+        // The splitter reads plain strings with literal backslashes; make the
+        // server agree even when the database default is `off`.
+        "SET LOCAL standard_conforming_strings = on",
         "SET CONSTRAINTS ALL DEFERRED",
         "SET LOCAL synchronous_commit = OFF",
     ] {
@@ -304,8 +432,15 @@ async fn execute_all(
 
     let mut ordinal = 0;
     let mut executed = 0;
-    while let Some(item) = receiver.recv().await {
-        let statement = item?;
+    while let Some(statement) = next_item(receiver).await? {
+        // `pg_cancel_backend` is discarded while the backend is idle between
+        // statements, so a cancel that lands there is only seen here.
+        if cancel_guard.is_cancelled() {
+            return Err(format!(
+                "Import cancelled before statement {} ({executed} statements ran); nothing was imported",
+                ordinal + 1
+            ));
+        }
         ordinal += 1;
         match classify(&statement.text) {
             Action::Skip => continue,
@@ -319,14 +454,14 @@ async fn execute_all(
             }
             Action::Run => {}
         }
-        pg_client
-            .batch_execute(&statement.text)
+        run_statement(pg_client, &statement.text)
             .await
             .map_err(|e| {
+                let sqlstate = e.code().map(|c| c.code()).unwrap_or("");
                 statement_error(
                     ordinal,
                     statement.line,
-                    &client::format_pg_error(&e),
+                    &statement_failure_reason(sqlstate, &client::format_pg_error(&e)),
                     &statement.text,
                 )
             })?;
