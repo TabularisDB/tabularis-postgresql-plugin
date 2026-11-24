@@ -32,6 +32,12 @@ base64 = "0.23.1"
 infer = "0.22"
 sha2 = "0.11"
 
+# tokio-postgres 0.7.18 with one change: a typed query receives its rows
+# before it looks up a column type the connection has not met.
+# See vendor/tokio-postgres/README.tabularis.md.
+[patch.crates-io]
+tokio-postgres = { path = "vendor/tokio-postgres" }
+
 [profile.release]
 lto = true
 codegen-units = 1

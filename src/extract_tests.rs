@@ -75,6 +75,18 @@ fn money_above_js_safe_integer_becomes_a_string() {
     );
 }
 
+#[test]
+fn money_at_the_lowest_int8_becomes_a_string_without_overflowing() {
+    // `i64::MIN` has no positive counterpart: taking its absolute value
+    // overflows, which panics in a debug build and wraps in a release one.
+    let bytes = i64::MIN.to_be_bytes();
+    let money = Money::from_sql(&Type::MONEY, &bytes).unwrap();
+    assert_eq!(
+        serde_json::Value::from(money),
+        serde_json::json!(i64::MIN.to_string())
+    );
+}
+
 fn hstore_type() -> Type {
     Type::new(
         "hstore".to_string(),
