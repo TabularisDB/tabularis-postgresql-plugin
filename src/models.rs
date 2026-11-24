@@ -20,6 +20,16 @@ pub struct ConnectionParams {
     pub ssl_key: Option<String>,
     pub connection_string: Option<String>,
     pub startup_script: Option<String>,
+    /// Absolute path of the Unix socket the database listens on. When set
+    /// (and no SSH/K8s/SSM tunnel is active — the host strips this to `None`
+    /// at every tunnel activation site, see `tabularis`'s
+    /// `application/tunnels.rs:847/852/904/941/1007/1026`), the plugin dials
+    /// the socket instead of `host`/`port`. TLS is forced off for socket
+    /// connections (a socket peer cannot negotiate it, and the path is
+    /// local). Mirrors the builtin driver's `unix_socket_path` field and
+    /// `local_unix_socket_path()` behavior, minus the tunnel gate (the host
+    /// applies that before the params reach the plugin — see #197).
+    pub unix_socket_path: Option<String>,
     /// Connection pooler mode, set by the host when the user declares the
     /// connection goes through a transaction-mode pooler (e.g. PgBouncer
     /// `pool_mode = transaction`). When `"transaction"`, the plugin avoids
@@ -58,8 +68,24 @@ impl ConnectionParams {
             ssl_key: get_str("ssl_key"),
             connection_string: get_str("connection_string"),
             startup_script: get_str("startup_script"),
+            unix_socket_path: get_str("unix_socket_path"),
             pooler_mode: get_str("pooler_mode"),
         }
+    }
+
+    /// The Unix socket path the plugin should dial locally: trimmed and
+    /// non-empty, or `None` when unset/blank. The host strips
+    /// `unix_socket_path` to `None` at every tunnel activation site (SSH/K8s/
+    /// SSM — see `tabularis`'s `application/tunnels.rs`), so by the time
+    /// params reach the plugin, a present non-empty value means "no tunnel is
+    /// active, dial this socket." Mirrors the builtin's
+    /// `local_unix_socket_path()` (`tabularis`'s `models.rs:373-378`) minus
+    /// the tunnel gate (the host applies that upstream — see #197).
+    pub fn local_socket_path(&self) -> Option<&str> {
+        self.unix_socket_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
     }
 
     /// True when the connection goes through a transaction-mode pooler

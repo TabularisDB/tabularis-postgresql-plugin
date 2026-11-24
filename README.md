@@ -107,6 +107,7 @@ both drivers against the same live database and compares every response.
 | `ssl_ca` | Path to a custom CA bundle PEM file. Required for `verify-ca` (platform roots aren't used for this mode); optional for `verify-full`, where it overrides the system trust store | No |
 | `ssl_cert` | Path to a client certificate PEM file, for servers requiring mutual TLS (e.g. Google Cloud SQL). Must be set together with `ssl_key` | No |
 | `ssl_key` | Path to the private key PEM file matching `ssl_cert`. Must be set together with `ssl_cert` | No |
+| `unix_socket_path` | Path to a Unix socket file (`/var/run/postgresql/.s.PGSQL.5432`) or its directory. When set, the plugin dials the socket instead of `host`/`port`, and TLS is forced off (a socket peer cannot negotiate it). The host strips this when a tunnel is active, so the tunnel owns the route | No |
 | `connection_string` | Full `postgres://user:pass@host:port/db` URL, as an alternative to the discrete fields above | No |
 | `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query | No |
 
