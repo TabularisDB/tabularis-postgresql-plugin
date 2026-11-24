@@ -1,10 +1,9 @@
 //! Unit tests for the pure parts of `import_database_sql`: request parsing,
 //! statement classification and error formatting. The transactional behavior
-//! itself is covered against a live database in `tests/live_db.rs`.
+//! is covered against a live database in `tests/live_db.rs` and
+//! `client_live_tests.rs` (the latter runs in CI's TCP-client step).
 
 use super::*;
-use crate::client;
-use crate::models::ConnectionParams;
 use serde_json::json;
 
 fn req(extra: Value) -> Value {
@@ -224,8 +223,10 @@ fn leaving_standard_conforming_strings_on_is_fine() {
         "SET standard_conforming_strings = on",
         "SET standard_conforming_strings TO 'on'",
         "SET standard_conforming_strings = true",
-        "SET standard_conforming_strings = DEFAULT",
+        "SET standard_conforming_strings = on -- keep it on",
+        "SET standard_conforming_strings /* c */ = 'on'",
         "SELECT 'standard_conforming_strings = off'",
+        "INSERT INTO t VALUES ('standard_conforming_strings', 'set_config')",
         "CREATE TABLE standard_conforming_strings (a int)",
     ] {
         assert_eq!(classify(sql), Action::Run, "{sql}");
@@ -309,36 +310,49 @@ fn session_state_is_restored_before_commit_and_the_durability_setting_is_reappli
     assert_eq!(steps.last(), Some(&"SET LOCAL synchronous_commit = OFF"));
 }
 
-/// Needs `PG_PLUGIN_TEST_HOST` (see `client_live_tests.rs`); skipped otherwise.
-#[tokio::test]
-async fn one_statement_text_holding_several_commands_is_refused_not_run() {
-    let Ok(host) = std::env::var("PG_PLUGIN_TEST_HOST") else {
-        return;
-    };
-    let params = ConnectionParams::from_value(&json!({
-        "host": host,
-        "port": std::env::var("PG_PLUGIN_TEST_PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(54320),
-        "database": std::env::var("PG_PLUGIN_TEST_DB").unwrap_or_else(|_| "testdb".into()),
-        "username": std::env::var("PG_PLUGIN_TEST_USER").unwrap_or_else(|_| "postgres".into()),
-        "password": std::env::var("PG_PLUGIN_TEST_PASSWORD").unwrap_or_else(|_| "password".into()),
-    }));
-    let client = crate::client::oneshot_pool_client(&params).await.unwrap();
-    client.batch_execute("BEGIN").await.unwrap();
-    client
-        .batch_execute("CREATE TEMP TABLE one_cmd (id int)")
-        .await
-        .unwrap();
+#[test]
+fn the_browsed_database_overrides_the_one_named_in_a_legacy_connection_string() {
+    let mut r = req(json!({}));
+    r["params"] = json!({
+        "database": "staging",
+        "connection_string": "postgres://uri_user:uri_pw@uri-host:6543/prod",
+        "username": "ignored", "host": "ignored"
+    });
+    let parsed = parse_request(&r).unwrap();
+    assert_eq!(parsed.params.database.as_deref(), Some("staging"));
+    assert_eq!(parsed.params.host.as_deref(), Some("uri-host"));
+    assert_eq!(parsed.params.port, Some(6543));
+    assert_eq!(parsed.params.username.as_deref(), Some("uri_user"));
+    assert_eq!(parsed.params.password.as_deref(), Some("uri_pw"));
+    assert!(
+        parsed.params.connection_string.is_none(),
+        "the URI must not re-assert prod"
+    );
+}
 
-    let err = run_statement(
-        &client,
-        "INSERT INTO one_cmd VALUES (1); COMMIT; INSERT INTO one_cmd VALUES (2)",
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.code().map(|c| c.code()), Some("42601"), "{err}");
-    assert!(client::format_pg_error(&err).contains("multiple commands"));
+#[test]
+fn a_connection_string_alone_still_supplies_its_own_database() {
+    let mut r = req(json!({}));
+    r["params"] = json!({"connection_string": "postgres://u:p@h:5432/only_db"});
+    let parsed = parse_request(&r).unwrap();
+    assert_eq!(parsed.params.database.as_deref(), Some("only_db"));
+    assert!(parsed.params.connection_string.is_none());
+}
 
-    // The transaction is still open (COMMIT never ran) and nothing was inserted.
-    let still_open = client.query_one("SELECT count(*) FROM one_cmd", &[]).await;
-    assert!(still_open.is_err() || still_open.unwrap().get::<_, i64>(0) == 0);
+#[test]
+fn a_blank_connection_string_changes_nothing() {
+    let mut r = req(json!({}));
+    r["params"]["connection_string"] = json!("   ");
+    let parsed = parse_request(&r).unwrap();
+    assert_eq!(parsed.params.database.as_deref(), Some("d"));
+    assert_eq!(parsed.params.host.as_deref(), Some("h"));
+}
+
+#[test]
+fn an_unparseable_connection_string_is_a_clear_error() {
+    let mut r = req(json!({}));
+    r["params"]["connection_string"] = json!("postgres://[bad");
+    assert!(parse_request(&r)
+        .unwrap_err()
+        .contains("Invalid connection string"));
 }

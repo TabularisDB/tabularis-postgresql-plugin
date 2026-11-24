@@ -113,3 +113,40 @@ async fn cancelling_an_unregistered_id_records_nothing() {
 fn a_guard_without_a_request_id_is_never_cancelled() {
     assert!(!CancelGuard { request_id: None }.is_cancelled());
 }
+
+#[tokio::test]
+async fn a_cancel_that_arrives_before_the_connection_is_attached_is_remembered() {
+    let guard = CancelGuard::reserve(Some(41));
+    assert!(!guard.is_cancelled());
+
+    cancel(41).await;
+
+    assert!(
+        guard.is_cancelled(),
+        "a cancel during connection setup must not be lost"
+    );
+    drop(guard);
+    assert!(!was_cancelled(41));
+}
+
+#[test]
+fn reserving_without_a_request_id_is_a_no_op_guard() {
+    let guard = CancelGuard::reserve(None);
+    assert!(!guard.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_cancel_racing_the_guard_drop_never_leaves_a_stale_flag() {
+    for round in 0..200u64 {
+        let id = 1_000_000 + round;
+        let guard = CancelGuard::reserve(Some(id));
+        let canceller = tokio::spawn(cancel(id));
+        tokio::task::yield_now().await;
+        drop(guard);
+        canceller.await.unwrap();
+        assert!(
+            !was_cancelled(id),
+            "round {round}: flag survived the guard's drop"
+        );
+    }
+}

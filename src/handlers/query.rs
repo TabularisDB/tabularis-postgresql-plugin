@@ -912,6 +912,22 @@ pub(crate) async fn apply_search_path_local(
     pg_client: &PgClient,
     schema: &str,
 ) -> Result<(), String> {
+    let set_path = search_path_local_sql(pg_client, schema).await?;
+    pg_client
+        .batch_execute(&set_path)
+        .await
+        .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))
+}
+
+/// The `SET LOCAL search_path` statement [`apply_search_path_local`] runs,
+/// without running it. Reading the base path is a query, which takes the
+/// transaction's snapshot; a caller that must still accept a later
+/// `SET TRANSACTION ISOLATION LEVEL` reads it before `BEGIN` and runs the
+/// returned statement (a plain `SET`, which takes no snapshot) afterwards.
+pub(crate) async fn search_path_local_sql(
+    pg_client: &PgClient,
+    schema: &str,
+) -> Result<String, String> {
     let read = pg_client
         .query_typed_one(
             "SELECT current_setting($1, true), current_setting('search_path')",
@@ -940,11 +956,7 @@ pub(crate) async fn apply_search_path_local(
         )
     })?;
     let current = snapshot.unwrap_or(live);
-    let set_path = build_search_path_sql(schema, &current, true);
-    pg_client
-        .batch_execute(&set_path)
-        .await
-        .map_err(|e| format!("Failed to set search_path: {}", client::format_pg_error(&e)))
+    Ok(build_search_path_sql(schema, &current, true))
 }
 
 /// Build a `SET [LOCAL] search_path TO` statement that prepends `schema` onto

@@ -380,3 +380,31 @@ fn a_statement_exactly_at_the_limit_is_accepted() {
         "SELECT 12345"
     );
 }
+
+#[test]
+fn a_single_endless_line_stops_at_the_line_cap_instead_of_filling_memory() {
+    struct Endless;
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+    let mut splitter =
+        StatementSplitter::with_max_statement_bytes(std::io::BufReader::new(Endless), 100);
+    let err = splitter.next_statement().unwrap_err();
+    assert!(err.contains("Line 1 exceeds"), "{err}");
+    assert!(
+        splitter.next_statement().unwrap().is_none(),
+        "splitter must stay stopped"
+    );
+}
+
+#[test]
+fn a_dollar_body_clones_no_tag_per_character() {
+    let body = "x;\n".repeat(3_000_000);
+    let sql = format!("DO $tag$\n{body}$tag$; SELECT 1;");
+    let started = std::time::Instant::now();
+    assert_eq!(split(&sql).len(), 2);
+    assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+}

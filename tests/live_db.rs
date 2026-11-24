@@ -2974,7 +2974,12 @@ fn import_database_sql_defers_constraints_for_the_whole_file() {
              INSERT INTO {child} VALUES (1, 99);\n"
         ),
     );
-    assert!(import_error(&broken).contains("COMMIT failed"), "{broken}");
+    let error = import_error(&broken);
+    assert!(
+        error.starts_with("Deferred constraint check failed, nothing was imported"),
+        "{error}"
+    );
+    assert!(error.contains("foreign key"), "{error}");
     let exists = scalar(
         &mut plugin,
         &params,
@@ -3133,13 +3138,18 @@ fn import_database_sql_reports_bad_requests_without_touching_the_database() {
     assert!(import_error(&create).contains("creating a database"));
     let mut read_only = params.clone();
     read_only["read_only"] = json!(true);
-    let ro = import_sql(&mut plugin, &read_only, "CREATE TABLE imp_ro (id int);");
+    let ro_table = format!("imp_ro_{}", uuid::Uuid::new_v4().simple());
+    let ro = import_sql(
+        &mut plugin,
+        &read_only,
+        &format!("CREATE TABLE {ro_table} (id int);"),
+    );
     assert!(import_error(&ro).contains("read-only"));
     assert_eq!(
         scalar(
             &mut plugin,
             &params,
-            "SELECT to_regclass('public.imp_ro') IS NOT NULL"
+            &format!("SELECT to_regclass('public.{ro_table}') IS NOT NULL")
         ),
         false
     );
@@ -3360,13 +3370,15 @@ fn import_database_sql_cancel_between_many_small_statements_still_stops_and_roll
     );
 }
 
-/// Only runs when `PG_PLUGIN_TEST_POOLER_PORT` points at a transaction-mode
-/// PgBouncer in front of the test database (CI has none, so it skips there).
+/// Needs `PG_PLUGIN_TEST_POOLER_PORT` to point at a transaction-mode PgBouncer
+/// in front of the test database. CI has none, so these are `#[ignore]`d there
+/// (and reported as ignored, not passed); the same guards run in CI through
+/// `client_live_tests::import_*`.
 #[test]
+#[ignore = "needs a transaction-mode PgBouncer: set PG_PLUGIN_TEST_POOLER_PORT and run with --ignored"]
 fn import_database_sql_does_not_leak_session_settings_through_a_transaction_pooler() {
-    let Ok(port) = std::env::var("PG_PLUGIN_TEST_POOLER_PORT") else {
-        return;
-    };
+    let port = std::env::var("PG_PLUGIN_TEST_POOLER_PORT")
+        .expect("PG_PLUGIN_TEST_POOLER_PORT must point at a transaction-mode PgBouncer");
     let mut plugin = Plugin::spawn();
     let mut params = conn_params();
     params["port"] = json!(port
@@ -3391,10 +3403,10 @@ fn import_database_sql_does_not_leak_session_settings_through_a_transaction_pool
 }
 
 #[test]
+#[ignore = "needs a transaction-mode PgBouncer: set PG_PLUGIN_TEST_POOLER_PORT and run with --ignored"]
 fn import_database_sql_does_not_leak_a_set_role_through_a_transaction_pooler() {
-    let Ok(port) = std::env::var("PG_PLUGIN_TEST_POOLER_PORT") else {
-        return;
-    };
+    let port = std::env::var("PG_PLUGIN_TEST_POOLER_PORT")
+        .expect("PG_PLUGIN_TEST_POOLER_PORT must point at a transaction-mode PgBouncer");
     let mut plugin = Plugin::spawn();
     let direct = conn_params();
     let role = format!("imp_role_{}", uuid::Uuid::new_v4().simple());
@@ -3450,4 +3462,61 @@ fn import_database_sql_reads_plain_strings_literally_even_when_the_session_defau
         "a\\"
     );
     drop_tables(&mut plugin, &direct, &[&t]);
+}
+
+#[test]
+fn import_database_sql_lands_in_the_browsed_database_not_the_one_in_a_legacy_connection_string() {
+    let mut plugin = Plugin::spawn();
+    let admin = conn_params();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let (uri_db, picked_db) = (format!("imp_uri_{suffix}"), format!("imp_picked_{suffix}"));
+    for name in [&uri_db, &picked_db] {
+        plugin.call_ok(
+            "execute_query",
+            json!({"params": admin, "query": format!("CREATE DATABASE \"{name}\"")}),
+        );
+    }
+    let mut params = admin.clone();
+    params["database"] = json!(picked_db);
+    params["connection_string"] = json!(format!(
+        "postgres://{}:{}@{}:{}/{}",
+        admin["username"].as_str().unwrap(),
+        admin["password"].as_str().unwrap(),
+        admin["host"].as_str().unwrap(),
+        admin["port"],
+        uri_db
+    ));
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        "CREATE TABLE where_am_i (db text);\nINSERT INTO where_am_i VALUES (current_database());\n",
+    );
+    let in_picked = {
+        let mut p = admin.clone();
+        p["database"] = json!(picked_db);
+        plugin.call(
+            "execute_query",
+            json!({"params": p, "query": "SELECT db FROM where_am_i"}),
+        )
+    };
+    let in_uri = {
+        let mut p = admin.clone();
+        p["database"] = json!(uri_db);
+        plugin.call(
+            "execute_query",
+            json!({"params": p, "query": "SELECT to_regclass('public.where_am_i') IS NOT NULL"}),
+        )
+    };
+    for name in [&uri_db, &picked_db] {
+        plugin.call_ok(
+            "execute_query",
+            json!({"params": admin, "query": format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")}),
+        );
+    }
+    assert_eq!(response["result"]["statements"], 2, "{response}");
+    assert_eq!(in_picked["result"]["rows"][0][0], picked_db, "{in_picked}");
+    assert_eq!(
+        in_uri["result"]["rows"][0][0], false,
+        "the import also created the table in the URI's database: {in_uri}"
+    );
 }

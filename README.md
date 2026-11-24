@@ -215,27 +215,42 @@ embedded in a legacy connection string. Read-only requests are rejected.
 
 `import_database_sql` runs a `.sql` file in a single transaction on a dedicated
 connection, so any failing statement rolls the whole import back. The error
-names the statement number, its line and its text. The import applies the same
-session setup as the former built-in driver (`search_path` set to the requested
-schema, defaulting to `public`; `SET CONSTRAINTS ALL DEFERRED`;
-`SET LOCAL synchronous_commit = OFF`), so deferrable constraints are checked
-once at `COMMIT`. Statements are split on `;` outside strings, quoted
-identifiers, dollar-quoted bodies, comments and `BEGIN ATOMIC` bodies, and
-streamed from disk, so large dumps are not held in memory.
+names the statement number, its line and its text. The import prepends the
+requested schema (default `public`) onto the connection's base `search_path`,
+sets `SET CONSTRAINTS ALL DEFERRED` and `SET LOCAL synchronous_commit = OFF`,
+and checks deferred constraints before `COMMIT` while the file's own session
+state is still in place. Unlike the former built-in driver, which replaced the
+`search_path`, the base path stays reachable, so unqualified names that are
+absent from the requested schema can still resolve through it. The Tabularis
+host does not send a target schema over this RPC yet, so today every import
+uses `public`. Statements are split on `;` outside strings, quoted identifiers,
+dollar-quoted bodies, comments, parentheses and `BEGIN ATOMIC` bodies, and are
+streamed from disk with only a few held in memory. A single statement is
+limited to 1 GiB, the most PostgreSQL accepts. The plugin reports no progress
+while it runs, only the final statement count.
 
 Because the import owns the transaction, `BEGIN` and `COMMIT` lines in the file
-are skipped. `ROLLBACK`, `COMMIT AND CHAIN`, `PREPARE TRANSACTION`,
+are skipped, and the returned count covers only the statements that ran.
+`ROLLBACK`, `COMMIT AND CHAIN`, `PREPARE TRANSACTION`,
 `COPY ... FROM STDIN` / `TO STDOUT` and psql meta-commands (`\connect`, `\i`)
-are rejected with an explanation; use `pg_dump --inserts` for dumps that would
-otherwise rely on `COPY ... FROM STDIN`. Creating a database during import is
-not supported, and read-only connections are rejected. `SET
-standard_conforming_strings = off` is rejected too, because it would change how
-the rest of the file's string literals are read. Each statement is sent as
-exactly one command, so a statement the splitter cannot separate fails with an
-error instead of running extra commands. Cancelling the call, including between
-statements, stops the import and rolls everything back. Session settings a dump
+are rejected with an explanation (`\restrict` and `\unrestrict`, which recent
+`pg_dump` versions emit, are skipped); use `pg_dump --inserts` for dumps that
+would otherwise rely on `COPY ... FROM STDIN`. A file's own
+`SET TRANSACTION ISOLATION LEVEL` still works, but the options on a `BEGIN`
+line are dropped with it. Anything that could turn `standard_conforming_strings`
+off (`SET` to anything but `on`, `RESET`, `RESET ALL`, `set_config`) is rejected,
+because it would change how the rest of the file's strings are read. Each
+statement is sent as exactly one command, so a statement the splitter cannot
+separate fails with an error instead of running extra commands. When the
+connection carries a legacy connection string, its host, port and credentials
+are used but the database the user picked wins. Creating a database during
+import is not supported, and read-only connections are rejected.
+
+Cancelling the call stops the running statement, is noticed between statements
+and just before `COMMIT`, and rolls everything back. Session settings a dump
 makes (`set_config(..., false)`, `SET ROLE`) are reset before `COMMIT`, so they
-cannot leak to other clients behind a transaction pooler.
+cannot leak to other clients behind a transaction pooler. The import holds one
+of the plugin's four general workers for its whole run.
 
 ## Building from Source
 

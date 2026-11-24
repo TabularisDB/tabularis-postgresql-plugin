@@ -1,21 +1,28 @@
 //! Streaming splitter for SQL script files (`import_database_sql`).
 //!
 //! Splits on `;` outside of single-quoted strings (including `E'..'` backslash
-//! escapes), quoted identifiers, dollar-quoted bodies and (nested) comments.
-//! Lines that start with a backslash before any statement text (psql
-//! meta-commands such as `\connect`) are returned as statements of their own so
-//! the server rejects them at a precise statement number instead of them being
-//! glued onto the next statement.
+//! escapes), quoted identifiers, dollar-quoted bodies, (nested) comments,
+//! parentheses and `CREATE FUNCTION|PROCEDURE ... BEGIN ATOMIC ... END` bodies
+//! (`CASE ... END` inside one is tracked).
+//! A line that starts with a backslash before any statement text (a psql
+//! meta-command such as `\connect`) is returned as a statement of its own, so
+//! the caller can reject or skip it at a precise statement number instead of it
+//! being glued onto the next statement. Deciding what to do with it is the
+//! caller's job: this module only splits.
 //!
 //! Plain `'..'` strings treat backslash literally, which is PostgreSQL's
 //! default (`standard_conforming_strings = on`) and what `pg_dump` emits.
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
+use std::sync::Arc;
 
 /// PostgreSQL itself refuses a query string over 1 GiB, so a statement beyond
 /// this can never run; failing here also bounds memory when an unterminated
 /// quote would otherwise swallow the rest of a huge file.
 pub const MAX_STATEMENT_BYTES: usize = 1 << 30;
+/// What a single line may hold beyond the statement cap (the `;`, whitespace
+/// and the next statement's start share a line with it).
+const LINE_SLACK_BYTES: usize = 1 << 20;
 
 /// One statement from a script: its text (no terminating `;`) and the
 /// 1-based line it starts on.
@@ -32,7 +39,7 @@ enum Lex {
     BlockComment(usize),
     SingleQuote { backslash_escapes: bool },
     DoubleQuote,
-    Dollar(Vec<char>),
+    Dollar(Arc<[char]>),
 }
 
 pub struct StatementSplitter<R: BufRead> {
@@ -111,12 +118,26 @@ impl<R: BufRead> StatementSplitter<R> {
 
     fn read_line(&mut self) -> Result<bool, String> {
         let mut buf = Vec::new();
+        // A line is held whole (and expanded to `chars`, four bytes a
+        // character), so bound it: one without a newline in sight stops here
+        // instead of exhausting memory before the statement-size check runs.
+        let limit = self.max_statement_bytes.saturating_add(LINE_SLACK_BYTES) as u64;
         let read = self
             .reader
+            .by_ref()
+            .take(limit)
             .read_until(b'\n', &mut buf)
             .map_err(|e| format!("Failed to read SQL file: {e}"))?;
         if read == 0 {
             return Ok(false);
+        }
+        if buf.len() as u64 >= limit && buf.last() != Some(&b'\n') {
+            self.done = true;
+            return Err(format!(
+                "Line {} exceeds the maximum statement size of {} bytes",
+                self.line_no + 1,
+                self.max_statement_bytes
+            ));
         }
         self.line_no += 1;
         let line = String::from_utf8(buf)
@@ -382,7 +403,7 @@ impl<R: BufRead> StatementSplitter<R> {
                         self.construct_line = self.line_no;
                         self.text.extend(tag.iter());
                         self.pos += tag.len();
-                        self.state = Lex::Dollar(tag);
+                        self.state = Lex::Dollar(tag.into());
                     }
                     None => {
                         self.text.push(c);
