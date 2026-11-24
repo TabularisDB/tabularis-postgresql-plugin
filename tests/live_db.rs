@@ -2831,3 +2831,416 @@ fn database_operations_use_the_explicit_target_even_when_a_uri_names_another_dat
         json!({"params":uri_params,"operation":"drop"}),
     );
 }
+
+fn write_sql_file(sql: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("import_{}.sql", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&path, sql).expect("write sql file");
+    path
+}
+
+fn import_sql(plugin: &mut Plugin, params: &Value, sql: &str) -> Value {
+    let path = write_sql_file(sql);
+    let response = plugin.call(
+        "import_database_sql",
+        json!({"params": params, "file_path": path, "create_database": false}),
+    );
+    let _ = std::fs::remove_file(path);
+    response
+}
+
+fn import_error(response: &Value) -> String {
+    response["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an import error, got {response}"))
+        .to_string()
+}
+
+fn scalar(plugin: &mut Plugin, params: &Value, query: &str) -> Value {
+    let result = plugin.call_ok("execute_query", json!({"params": params, "query": query}));
+    result["rows"][0][0].clone()
+}
+
+fn drop_tables(plugin: &mut Plugin, params: &Value, tables: &[&str]) {
+    for table in tables {
+        plugin.call_ok(
+            "execute_query",
+            json!({"params": params, "query": format!("DROP TABLE IF EXISTS public.\"{table}\" CASCADE")}),
+        );
+    }
+}
+
+#[test]
+fn import_database_sql_commits_every_statement_and_reports_the_count() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_ok_{}", uuid::Uuid::new_v4().simple());
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!(
+            "-- dump\nCREATE TABLE {t} (id int PRIMARY KEY, note text);\n\
+             INSERT INTO {t} VALUES (1, 'a;b'), (2, 'it''s');\n\
+             CREATE FUNCTION {t}_f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN PERFORM 1; RETURN 2; END; $$;\n\
+             INSERT INTO {t} VALUES (3, {t}_f()::text);\n"
+        ),
+    );
+    assert_eq!(response["result"]["statements"], 4, "{response}");
+    assert_eq!(
+        scalar(&mut plugin, &params, &format!("SELECT count(*) FROM {t}")),
+        3
+    );
+    assert_eq!(
+        scalar(
+            &mut plugin,
+            &params,
+            &format!("SELECT note FROM {t} WHERE id = 2")
+        ),
+        "it's"
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": format!("DROP FUNCTION {t}_f()")}),
+    );
+    drop_tables(&mut plugin, &params, &[&t]);
+}
+
+#[test]
+fn import_database_sql_rolls_everything_back_when_a_statement_fails() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_atomic_{}", uuid::Uuid::new_v4().simple());
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!(
+            "CREATE TABLE {t} (id int PRIMARY KEY);\nINSERT INTO {t} VALUES (1);\n\
+             INSERT INTO {t} VALUES (1);\nINSERT INTO {t} VALUES (2);\n"
+        ),
+    );
+    let error = import_error(&response);
+    assert!(error.contains("Error at statement 3 (line 3)"), "{error}");
+    assert!(error.contains("duplicate key"), "{error}");
+    assert!(
+        error.contains(&format!("INSERT INTO {t} VALUES (1)")),
+        "{error}"
+    );
+    let exists = scalar(
+        &mut plugin,
+        &params,
+        &format!("SELECT to_regclass('public.{t}') IS NOT NULL"),
+    );
+    assert_eq!(
+        exists, false,
+        "the CREATE TABLE before the failure must be rolled back"
+    );
+}
+
+#[test]
+fn import_database_sql_leaves_the_connection_usable_after_a_failure() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        "SELECT 1;\nSELECT * FROM imp_no_such_table;\n",
+    );
+    assert!(import_error(&response).contains("statement 2"));
+    assert_eq!(scalar(&mut plugin, &params, "SELECT 1"), 1);
+    let again = import_sql(&mut plugin, &params, "SELECT 1;");
+    assert_eq!(again["result"]["statements"], 1);
+}
+
+#[test]
+fn import_database_sql_defers_constraints_for_the_whole_file() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let s = uuid::Uuid::new_v4().simple().to_string();
+    let (parent, child) = (format!("imp_parent_{s}"), format!("imp_child_{s}"));
+    let sql = format!(
+        "CREATE TABLE {parent} (id int PRIMARY KEY);\n\
+         CREATE TABLE {child} (id int, pid int REFERENCES {parent}(id) DEFERRABLE INITIALLY IMMEDIATE);\n\
+         INSERT INTO {child} VALUES (1, 10);\nINSERT INTO {parent} VALUES (10);\n"
+    );
+    let response = import_sql(&mut plugin, &params, &sql);
+    assert_eq!(response["result"]["statements"], 4, "{response}");
+    drop_tables(&mut plugin, &params, &[&child, &parent]);
+
+    let broken = import_sql(
+        &mut plugin,
+        &params,
+        &format!(
+            "CREATE TABLE {parent} (id int PRIMARY KEY);\n\
+             CREATE TABLE {child} (id int, pid int REFERENCES {parent}(id) DEFERRABLE INITIALLY IMMEDIATE);\n\
+             INSERT INTO {child} VALUES (1, 99);\n"
+        ),
+    );
+    assert!(import_error(&broken).contains("COMMIT failed"), "{broken}");
+    let exists = scalar(
+        &mut plugin,
+        &params,
+        &format!("SELECT to_regclass('public.{parent}') IS NOT NULL"),
+    );
+    assert_eq!(
+        exists, false,
+        "a deferred violation at COMMIT must leave nothing behind"
+    );
+}
+
+#[test]
+fn import_database_sql_ignores_begin_and_commit_so_a_later_failure_still_rolls_back() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_commit_{}", uuid::Uuid::new_v4().simple());
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!(
+            "BEGIN;\nCREATE TABLE {t} (id int PRIMARY KEY);\nINSERT INTO {t} VALUES (1);\nCOMMIT;\n\
+             BEGIN;\nINSERT INTO {t} VALUES (1);\nCOMMIT;\n"
+        ),
+    );
+    assert!(
+        import_error(&response).contains("duplicate key"),
+        "{response}"
+    );
+    let exists = scalar(
+        &mut plugin,
+        &params,
+        &format!("SELECT to_regclass('public.{t}') IS NOT NULL"),
+    );
+    assert_eq!(
+        exists, false,
+        "the first COMMIT in the file must not make the import partially durable"
+    );
+}
+
+#[test]
+fn import_database_sql_rejects_rollback_copy_stdin_and_meta_commands() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_rej_{}", uuid::Uuid::new_v4().simple());
+    for (sql, expect) in [
+        ("ROLLBACK;", "ROLLBACK"),
+        ("COPY pg_class FROM stdin;\n1\t2\n\\.\n", "COPY"),
+        ("\\connect other\nSELECT 1;", "meta-command"),
+    ] {
+        let response = import_sql(
+            &mut plugin,
+            &params,
+            &format!("CREATE TABLE {t} (id int);\n{sql}"),
+        );
+        let error = import_error(&response);
+        assert!(error.contains(expect), "{sql:?}: {error}");
+        let exists = scalar(
+            &mut plugin,
+            &params,
+            &format!("SELECT to_regclass('public.{t}') IS NOT NULL"),
+        );
+        assert_eq!(
+            exists, false,
+            "{sql:?}: earlier statements must be rolled back"
+        );
+    }
+}
+
+#[test]
+fn import_database_sql_does_not_leak_session_settings_to_later_queries() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let before = scalar(&mut plugin, &params, "SHOW work_mem");
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        "SET work_mem = '123MB';\nSELECT set_config('application_name', 'leaked', false);\n",
+    );
+    assert_eq!(response["result"]["statements"], 2, "{response}");
+    for _ in 0..8 {
+        assert_eq!(scalar(&mut plugin, &params, "SHOW work_mem"), before);
+        assert_ne!(
+            scalar(&mut plugin, &params, "SHOW application_name"),
+            "leaked"
+        );
+    }
+}
+
+#[test]
+fn import_database_sql_resolves_unqualified_names_in_the_requested_schema() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let schema = format!("imp_schema_{}", uuid::Uuid::new_v4().simple());
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": format!("CREATE SCHEMA \"{schema}\"")}),
+    );
+    let path =
+        write_sql_file("CREATE TABLE only_here (id int);\nINSERT INTO only_here VALUES (7);\n");
+    let response = plugin.call(
+        "import_database_sql",
+        json!({"params": params, "file_path": path, "create_database": false, "schema": schema}),
+    );
+    let _ = std::fs::remove_file(path);
+    assert_eq!(response["result"]["statements"], 2, "{response}");
+    assert_eq!(
+        scalar(
+            &mut plugin,
+            &params,
+            &format!("SELECT id FROM \"{schema}\".only_here")
+        ),
+        7
+    );
+    plugin.call_ok(
+        "execute_query",
+        json!({"params": params, "query": format!("DROP SCHEMA \"{schema}\" CASCADE")}),
+    );
+}
+
+#[test]
+fn import_database_sql_quotes_a_hostile_schema_name_instead_of_executing_it() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let path = write_sql_file("SELECT 1;");
+    let response = plugin.call(
+        "import_database_sql",
+        json!({"params": params, "file_path": path, "schema": "x\"; DROP TABLE victim; --"}),
+    );
+    let _ = std::fs::remove_file(path);
+    assert_eq!(response["result"]["statements"], 1, "{response}");
+}
+
+#[test]
+fn import_database_sql_reports_bad_requests_without_touching_the_database() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let missing = plugin.call(
+        "import_database_sql",
+        json!({"params": params, "file_path": "/nonexistent/x.sql"}),
+    );
+    assert!(import_error(&missing).contains("Failed to open SQL file"));
+    let no_path = plugin.call("import_database_sql", json!({"params": params}));
+    assert!(import_error(&no_path).contains("file_path"));
+    let create = plugin.call(
+        "import_database_sql",
+        json!({"params": params, "file_path": "/x", "create_database": true}),
+    );
+    assert!(import_error(&create).contains("creating a database"));
+    let mut read_only = params.clone();
+    read_only["read_only"] = json!(true);
+    let ro = import_sql(&mut plugin, &read_only, "CREATE TABLE imp_ro (id int);");
+    assert!(import_error(&ro).contains("read-only"));
+    assert_eq!(
+        scalar(
+            &mut plugin,
+            &params,
+            "SELECT to_regclass('public.imp_ro') IS NOT NULL"
+        ),
+        false
+    );
+}
+
+#[test]
+fn import_database_sql_surfaces_an_unterminated_construct_and_imports_nothing() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_unterm_{}", uuid::Uuid::new_v4().simple());
+    let response = import_sql(
+        &mut plugin,
+        &params,
+        &format!("CREATE TABLE {t} (id int);\nSELECT 'oops;\n"),
+    );
+    let error = import_error(&response);
+    assert!(
+        error.contains("Unterminated string literal starting at line 2"),
+        "{error}"
+    );
+    let exists = scalar(
+        &mut plugin,
+        &params,
+        &format!("SELECT to_regclass('public.{t}') IS NOT NULL"),
+    );
+    assert_eq!(exists, false);
+}
+
+#[test]
+fn import_database_sql_handles_a_large_file_in_one_transaction() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_big_{}", uuid::Uuid::new_v4().simple());
+    let mut sql = format!("CREATE TABLE {t} (id int, pad text);\n");
+    for i in 0..20_000 {
+        sql.push_str(&format!(
+            "INSERT INTO {t} VALUES ({i}, '{}');\n",
+            "x".repeat(50)
+        ));
+    }
+    let response = import_sql(&mut plugin, &params, &sql);
+    assert_eq!(response["result"]["statements"], 20_001, "{response}");
+    assert_eq!(
+        scalar(&mut plugin, &params, &format!("SELECT count(*) FROM {t}")),
+        20_000
+    );
+    drop_tables(&mut plugin, &params, &[&t]);
+}
+
+#[test]
+fn import_database_sql_is_cancellable_and_rolls_back_what_ran_before_the_cancel() {
+    let mut plugin = Plugin::spawn();
+    let params = conn_params();
+    let t = format!("imp_cancel_{}", uuid::Uuid::new_v4().simple());
+    let path = write_sql_file(&format!(
+        "CREATE TABLE {t} (id int);\nINSERT INTO {t} VALUES (1);\nSELECT pg_sleep(30);\nINSERT INTO {t} VALUES (2);\n"
+    ));
+
+    let import_id = plugin.next_id;
+    plugin.next_id += 1;
+    let mut line = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "method": "import_database_sql",
+        "params": {"params": params, "file_path": path, "create_database": false},
+        "id": import_id,
+    }))
+    .unwrap();
+    line.push('\n');
+    plugin
+        .stdin
+        .write_all(line.as_bytes())
+        .expect("write import");
+    plugin.stdin.flush().expect("flush import");
+
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let mut cancel = serde_json::to_string(
+        &json!({"jsonrpc": "2.0", "method": "cancel", "params": {"id": import_id}}),
+    )
+    .unwrap();
+    cancel.push('\n');
+    let started = std::time::Instant::now();
+    plugin
+        .stdin
+        .write_all(cancel.as_bytes())
+        .expect("write cancel");
+    plugin.stdin.flush().expect("flush cancel");
+
+    let mut response_line = String::new();
+    plugin
+        .stdout
+        .read_line(&mut response_line)
+        .expect("read import response");
+    let response: Value = serde_json::from_str(response_line.trim()).expect("parse response");
+    let _ = std::fs::remove_file(path);
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "cancel did not interrupt the import promptly"
+    );
+    assert_eq!(response["id"].as_u64(), Some(import_id));
+    let error = import_error(&response);
+    assert!(error.contains("Error at statement 3"), "{error}");
+    assert!(error.contains("canceling statement"), "{error}");
+    let exists = scalar(
+        &mut plugin,
+        &params,
+        &format!("SELECT to_regclass('public.{t}') IS NOT NULL"),
+    );
+    assert_eq!(
+        exists, false,
+        "a cancelled import must leave nothing behind"
+    );
+}

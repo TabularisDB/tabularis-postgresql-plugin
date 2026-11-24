@@ -93,6 +93,7 @@ pub async fn handle_line(line: &str) -> Option<Value> {
         // Metadata — stubs for future sprints
         "get_databases" => handlers::metadata::get_databases(id, &params).await,
         "get_schemas" => handlers::metadata::get_schemas(id, &params).await,
+        "import_database_sql" => handlers::database_import::import_database_sql(id, &params).await,
         "database_operation" => {
             handlers::database_operations::database_operation(id, &params).await
         }

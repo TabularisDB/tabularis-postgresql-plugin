@@ -889,7 +889,10 @@ async fn run_pinned_body(
 /// change scoped to this transaction so it can't leak across pooler
 /// reassignment — and since the backend is pinned for the transaction, the
 /// `SET LOCAL` is guaranteed to land on the same backend that runs the query.
-async fn apply_search_path_local(pg_client: &PgClient, schema: &str) -> Result<(), String> {
+pub(crate) async fn apply_search_path_local(
+    pg_client: &PgClient,
+    schema: &str,
+) -> Result<(), String> {
     let read = pg_client
         .query_typed_one(
             "SELECT current_setting($1, true), current_setting('search_path')",
@@ -1585,7 +1588,7 @@ pub fn transaction_effect(query: &str) -> TransactionEffect {
 /// The first `n` keywords of `query`, uppercased. Every `--` and (nested)
 /// `/* */` comment is skipped, wherever it appears, and reading stops at a
 /// string literal, dollar quote or `;`, so no data is read as a keyword.
-fn leading_keywords(query: &str, n: usize) -> Vec<String> {
+pub(crate) fn leading_keywords(query: &str, n: usize) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut chars = query.chars().peekable();

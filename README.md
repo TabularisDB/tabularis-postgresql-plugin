@@ -47,6 +47,7 @@ both drivers against the same live database and compares every response.
 - [How It Works](#how-it-works)
 - [Supported Operations](#supported-operations)
   - [Whole-database operations](#whole-database-operations)
+  - [SQL file import](#sql-file-import)
 - [Building from Source](#building-from-source)
 - [Development](#development)
 - [Changelog](#changelog)
@@ -196,6 +197,7 @@ instead of reconnecting.
 | `insert_record` / `update_record` / `delete_record` | Row-level CRUD with type-aware value binding |
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
 | `save_blob_to_file` / `fetch_blob_as_data_url` | BLOB (`bytea`) export and preview |
+| `import_database_sql` | Transactional SQL file import: the whole file runs in one transaction, all-or-nothing |
 
 ### Whole-database operations
 
@@ -208,6 +210,26 @@ Both operations use a transaction. Drop connects through `postgres` and refuses
 protected databases or databases still used by other sessions; it never forcibly
 terminates unrelated clients. The explicit browsed database overrides the database
 embedded in a legacy connection string. Read-only requests are rejected.
+
+### SQL file import
+
+`import_database_sql` runs a `.sql` file in a single transaction on a dedicated
+connection, so any failing statement rolls the whole import back. The error
+names the statement number, its line and its text. The import applies the same
+session setup as the former built-in driver (`search_path` set to the requested
+schema, defaulting to `public`; `SET CONSTRAINTS ALL DEFERRED`;
+`SET LOCAL synchronous_commit = OFF`), so deferrable constraints are checked
+once at `COMMIT`. Statements are split on `;` outside strings, quoted
+identifiers, dollar-quoted bodies, comments and `BEGIN ATOMIC` bodies, and
+streamed from disk, so large dumps are not held in memory.
+
+Because the import owns the transaction, `BEGIN` and `COMMIT` lines in the file
+are skipped. `ROLLBACK`, `COMMIT AND CHAIN`, `PREPARE TRANSACTION`,
+`COPY ... FROM STDIN` / `TO STDOUT` and psql meta-commands (`\connect`, `\i`)
+are rejected with an explanation; use `pg_dump --inserts` for dumps that would
+otherwise rely on `COPY ... FROM STDIN`. Creating a database during import is
+not supported, and read-only connections are rejected. Cancelling the call
+cancels the running statement and rolls everything back.
 
 ## Building from Source
 
