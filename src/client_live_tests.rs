@@ -2405,3 +2405,90 @@ async fn unix_socket_dials_socket_not_tcp() {
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+/// Regression guard for #192: a connection with `ssl_mode` unset (which the
+/// builtin treats as `prefer`) must actually negotiate TLS — not connect in
+/// plaintext — against an SSL-capable server. This is the load-bearing test
+/// the #195 ensemble review flagged as missing: the unit tests prove the
+/// `uses_tls` predicate and `build_tls_connector` branch selection, but only a
+/// live connection proves the downstream behavior — that the `SSLRequest` is
+/// sent and TLS is negotiated, not skipped.
+///
+/// Asserts via `pg_stat_ssl`: the `ssl` column is `t` for a TLS connection
+/// and `f` for plaintext. Before the #192 fix, `uses_tls` was `needs_tls`
+/// (false for unset), so the pool wired `NoTls` and the connection was
+/// plaintext (`ssl = f`). After the fix, the pool wires a rustls connector and
+/// the connection negotiates TLS (`ssl = t`).
+///
+/// Run against the SSL test container (postgres:16 with `ssl = on`, self-signed
+/// cert, port 55432). Requires `PG_PLUGIN_TEST_SSL_HOST` to opt in (separate
+/// from `PG_PLUGIN_TEST_HOST` so the plain :54320 container's tests still run
+/// without it); if unset, the test is skipped, not failed.
+#[tokio::test]
+#[ignore = "needs a live SSL-capable PostgreSQL (PG_PLUGIN_TEST_SSL_HOST=127.0.0.1 ... podman 55432)"]
+async fn prefer_unset_negotiates_tls_not_plaintext() {
+    use crate::client;
+
+    let _guard = POOLS_TEST_LOCK.lock().await;
+
+    let host = std::env::var("PG_PLUGIN_TEST_SSL_HOST").expect(
+        "PG_PLUGIN_TEST_SSL_HOST not set — set to the SSL test container's host to run this test",
+    );
+    let port: u16 = std::env::var("PG_PLUGIN_TEST_SSL_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(55432);
+    let user = std::env::var("PG_PLUGIN_TEST_USER").unwrap_or_else(|_| "postgres".to_string());
+    let password =
+        std::env::var("PG_PLUGIN_TEST_PASSWORD").unwrap_or_else(|_| "password".to_string());
+    let database = std::env::var("PG_PLUGIN_TEST_DB").unwrap_or_else(|_| "testdb".to_string());
+
+    // ssl_mode unset — the #192 regression case (builtin treats unset as
+    // `prefer`: attempt TLS, fall back to plaintext only if the server offers
+    // none). Against an SSL-capable server this must negotiate TLS.
+    let params = ConnectionParams {
+        driver: Some("postgresql".to_string()),
+        host: Some(host),
+        port: Some(port),
+        database: Some(database),
+        username: Some(user),
+        password: Some(password),
+        ssl_mode: None,
+        ssl_ca: None,
+        ssl_cert: None,
+        ssl_key: None,
+        connection_string: None,
+        startup_script: None,
+        unix_socket_path: None,
+        pooler_mode: None,
+    };
+
+    // Verify connectivity first — a failure here is a server/config issue,
+    // not the regression.
+    test_connection(&params)
+        .await
+        .expect("test_connection must succeed against the SSL test container");
+
+    // Query pg_stat_ssl: `ssl = t` means TLS was negotiated. Before #192,
+    // the NoTls connector made this `f` (plaintext).
+    let rows = client::query_typed(
+        &params,
+        "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+        &[],
+    )
+    .await
+    .expect("pg_stat_ssl query must succeed");
+    let ssl: bool = rows
+        .first()
+        .and_then(|r| r.try_get::<usize, bool>(0).ok())
+        .expect("pg_stat_ssl must return one row with a boolean ssl column");
+    assert!(
+        ssl,
+        "unset ssl_mode must negotiate TLS against an SSL-capable server (pg_stat_ssl.ssl = true); \
+         if this is false, the #192 fix regressed — the pool is wiring NoTls instead of a TLS connector"
+    );
+
+    // Clean up the pool entry the connection left behind.
+    let key = connection_key(&params);
+    POOLS.lock().unwrap().remove(&key);
+}
