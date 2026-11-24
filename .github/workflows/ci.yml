@@ -40,6 +40,25 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  vendored-postgres-version:
+    name: Check for new tokio-postgres releases
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare the vendored version with the latest stable release
+        shell: bash
+        run: |
+          vendored=$(python3 -c 'import tomllib; print(tomllib.load(open("vendor/tokio-postgres/Cargo.toml", "rb"))["package"]["version"])')
+          latest=$(curl --fail --silent --show-error --retry 3 https://index.crates.io/to/ki/tokio-postgres |
+            jq -r 'select(.yanked == false and (.vers | test("^[0-9]+[.][0-9]+[.][0-9]+$"))) | .vers' |
+            sort -V | tail -n 1)
+          if [[ "$latest" != "$vendored" ]]; then
+            echo "::error::Review the local tokio-postgres $vendored patch against upstream $latest."
+            exit 1
+          fi
+
   validate-manifest:
     name: Validate .tabularium manifest
     runs-on: ubuntu-latest
@@ -134,3 +153,11 @@ jobs:
           PGDATABASE: testdb
         run: cargo test --test live_db -- --test-threads=1
 
+      - name: Run live TCP client tests, including wide enum results
+        env:
+          PG_PLUGIN_TEST_HOST: 127.0.0.1
+          PG_PLUGIN_TEST_PORT: 54320
+        # The service exposes plain TCP. These two tests need a socket or TLS.
+        run: >-
+          cargo test --locked --lib client_live_tests -- --ignored --test-threads=1
+          --skip unix_socket_dials_socket_not_tcp --skip prefer_unset_negotiates_tls_not_plaintext

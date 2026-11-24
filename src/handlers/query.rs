@@ -1056,7 +1056,8 @@ fn travels_with_search_path(conn_params: &ConnectionParams, query: &str) -> bool
 /// command that writes anywhere, so a data-modifying `WITH`, `SELECT INTO`
 /// and `SELECT ... FOR UPDATE` are all refused. A name inside a string or a
 /// comment refuses the statement as well. A function the statement calls can
-/// still write: no text shows that.
+/// still write, and `FOR SHARE` and `FOR KEY SHARE` can acquire row locks.
+/// These effects can occur even if the pipelined search_path change fails.
 fn reads_only(query: &str) -> bool {
     const READS: &[&str] = &["SELECT", "WITH", "TABLE", "VALUES", "SHOW"];
     const WRITES: &[&str] = &["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"];

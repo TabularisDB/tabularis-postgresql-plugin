@@ -51,5 +51,9 @@ through the plugin. To see the hang the patch removes, run a statement that
 returns several megabytes of rows with a custom-type column on a fresh
 connection, without preparing it first.
 
+The live PostgreSQL CI job runs the `wide_enum_*` client tests against large
+results on fresh connections. The weekly CI run also checks crates.io for a
+new stable release so maintainers can reassess the local patch.
+
 Remove this patch when the chosen upstream release looks types up without
 holding up the rows of the query that needs them.
