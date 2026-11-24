@@ -2492,3 +2492,285 @@ async fn prefer_unset_negotiates_tls_not_plaintext() {
     let key = connection_key(&params);
     POOLS.lock().unwrap().remove(&key);
 }
+
+// --- import_database_sql: guards that must be exercised by CI -------------
+//
+// CI's TCP step runs this module with `--ignored`. These drive
+// `import_on_client` and its helpers directly against a real backend, so
+// removing a guard fails here even where CI has no PgBouncer.
+
+fn import_live_params() -> ConnectionParams {
+    live_params(&correct_password())
+        .expect("PG_PLUGIN_TEST_HOST not set — set PG_PLUGIN_TEST_HOST=127.0.0.1 to run live tests")
+}
+
+/// Feed `sql` through the real splitter into `import_on_client` on `client`.
+async fn run_import(
+    client: &deadpool_postgres::Object,
+    sql: &str,
+    cancel_guard: &crate::cancel::CancelGuard,
+) -> Result<usize, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4096);
+    let mut splitter = crate::utils::sql_split::StatementSplitter::new(std::io::Cursor::new(
+        sql.as_bytes().to_vec(),
+    ));
+    loop {
+        let item = splitter.next_statement();
+        let last = !matches!(item, Ok(Some(_)));
+        tx.send(item).await.unwrap();
+        if last {
+            break;
+        }
+    }
+    crate::handlers::database_import::import_on_client(client, "public", &mut rx, cancel_guard)
+        .await
+}
+
+fn no_cancel() -> crate::cancel::CancelGuard {
+    crate::cancel::CancelGuard::reserve(None)
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn import_runs_exactly_one_command_per_statement() {
+    use crate::handlers::database_import::{describe_statement_failure, run_statement};
+    let client = crate::client::oneshot_pool_client(&import_live_params())
+        .await
+        .unwrap();
+    let t = format!("imp_onecmd_{}", uuid::Uuid::new_v4().simple());
+    client
+        .batch_execute(&format!("CREATE TABLE {t} (id int)"))
+        .await
+        .unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+
+    let text = format!("INSERT INTO {t} VALUES (1); COMMIT; INSERT INTO {t} VALUES (2)");
+    let err = run_statement(&client, &text).await.unwrap_err();
+    assert_eq!(err.code().map(|c| c.code()), Some("42601"), "{err}");
+
+    let message = describe_statement_failure(7, 3, &err, &text);
+    assert!(
+        message.starts_with("Error at statement 7 (line 3):"),
+        "{message}"
+    );
+    assert!(message.contains("could not be split"), "{message}");
+
+    // Had any part of the text run, the embedded COMMIT would have made the
+    // first INSERT durable and this ROLLBACK could not remove it.
+    client.batch_execute("ROLLBACK").await.unwrap();
+    let count: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {t}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    let _ = client.batch_execute(&format!("DROP TABLE {t}")).await;
+    assert_eq!(count, 0, "part of the multi-command text ran");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn import_resets_session_state_before_commit_on_the_same_connection() {
+    let params = import_live_params();
+    let role = format!("imp_cl_role_{}", uuid::Uuid::new_v4().simple());
+    crate::client::execute_typed(&params, &format!("CREATE ROLE \"{role}\" NOLOGIN"), &[])
+        .await
+        .unwrap();
+
+    let client = crate::client::oneshot_pool_client(&params).await.unwrap();
+    let result = run_import(
+        &client,
+        &format!(
+            "SELECT pg_catalog.set_config('application_name', 'leaked', false);\n\
+             SET work_mem = '77MB';\nSET ROLE \"{role}\";\nSET check_function_bodies = off;\n"
+        ),
+        &no_cancel(),
+    )
+    .await;
+    let row = client
+        .query_one(
+            "SELECT current_setting('application_name'), current_setting('work_mem'), \
+             current_user::text, current_setting('check_function_bodies')",
+            &[],
+        )
+        .await;
+    drop(client);
+    crate::client::execute_typed(&params, &format!("DROP ROLE \"{role}\""), &[])
+        .await
+        .unwrap();
+
+    assert_eq!(result, Ok(4));
+    let row = row.unwrap();
+    let (app, work_mem, user, bodies): (String, String, String, String) =
+        (row.get(0), row.get(1), row.get(2), row.get(3));
+    assert_ne!(app, "leaked", "set_config(..., false) survived the import");
+    assert_ne!(work_mem, "77MB", "SET survived the import");
+    assert_ne!(user, role, "SET ROLE survived the import");
+    assert_eq!(bodies, "on", "SET survived the import");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn import_counts_only_executed_statements_and_numbers_errors_by_file_position() {
+    let client = crate::client::oneshot_pool_client(&import_live_params())
+        .await
+        .unwrap();
+    assert_eq!(
+        run_import(&client, "BEGIN;\nSELECT 1;\nCOMMIT;\n", &no_cancel()).await,
+        Ok(1)
+    );
+    let err = run_import(
+        &client,
+        "BEGIN;\nSELECT 1;\nCOMMIT;\nSELECT * FROM imp_cl_missing;\n",
+        &no_cancel(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.starts_with("Error at statement 4 (line 4):"), "{err}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn import_notices_a_cancel_that_landed_while_the_backend_was_idle() {
+    let client = crate::client::oneshot_pool_client(&import_live_params())
+        .await
+        .unwrap();
+
+    // Cancelled before the first statement is read.
+    let guard = crate::cancel::CancelGuard::reserve(Some(7_000_001));
+    crate::cancel::cancel(7_000_001).await;
+    let err = run_import(&client, "SELECT 1;\nSELECT 2;\n", &guard)
+        .await
+        .unwrap_err();
+    assert!(err.contains("cancelled before statement 1"), "{err}");
+
+    // Cancelled with every statement already run: only the check before
+    // COMMIT can see it.
+    let guard = crate::cancel::CancelGuard::reserve(Some(7_000_002));
+    crate::cancel::cancel(7_000_002).await;
+    let err = run_import(&client, "", &guard).await.unwrap_err();
+    assert!(err.contains("cancelled before COMMIT"), "{err}");
+    assert!(err.contains("nothing was imported"), "{err}");
+
+    // The connection is clean afterwards: the transaction was rolled back.
+    let in_txn: bool = client
+        .query_one("SELECT pg_current_xact_id_if_assigned() IS NOT NULL", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!in_txn);
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn import_runs_deferred_checks_under_the_files_own_session_state() {
+    let params = import_live_params();
+    let client = crate::client::oneshot_pool_client(&params).await.unwrap();
+    let s = uuid::Uuid::new_v4().simple().to_string();
+    let (t, log, f) = (
+        format!("imp_dt_{s}"),
+        format!("imp_dtlog_{s}"),
+        format!("imp_dtf_{s}"),
+    );
+    let sql = format!(
+        "CREATE TABLE {t} (id int);\nCREATE TABLE {log} (v text);\n\
+         CREATE FUNCTION {f}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         INSERT INTO {log} VALUES (current_setting('application_name')); RETURN NULL; END $$;\n\
+         CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON {t} DEFERRABLE INITIALLY DEFERRED \
+         FOR EACH ROW EXECUTE FUNCTION {f}();\n\
+         SELECT pg_catalog.set_config('application_name', 'file_state', false);\n\
+         INSERT INTO {t} VALUES (1);\n"
+    );
+    let result = run_import(&client, &sql, &no_cancel()).await;
+    let seen = client
+        .query_one(&format!("SELECT v FROM {log}"), &[])
+        .await
+        .map(|r| r.get::<_, String>(0));
+    for cleanup in [
+        format!("DROP TABLE IF EXISTS {t}, {log} CASCADE"),
+        format!("DROP FUNCTION IF EXISTS {f}()"),
+    ] {
+        let _ = client.batch_execute(&cleanup).await;
+    }
+    assert_eq!(result, Ok(6));
+    assert_eq!(
+        seen.unwrap(),
+        "file_state",
+        "the deferred trigger ran after the session reset and lost the file's state"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn import_accepts_a_set_transaction_as_the_files_first_statement() {
+    let client = crate::client::oneshot_pool_client(&import_live_params())
+        .await
+        .unwrap();
+    let s = uuid::Uuid::new_v4().simple().to_string();
+    let t = format!("imp_iso_{s}");
+    let result = run_import(
+        &client,
+        &format!(
+            "BEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\n\
+             CREATE TABLE {t} (lvl text);\n\
+             INSERT INTO {t} VALUES (current_setting('transaction_isolation'));\nCOMMIT;\n"
+        ),
+        &no_cancel(),
+    )
+    .await;
+    let level = client
+        .query_one(&format!("SELECT lvl FROM {t}"), &[])
+        .await
+        .map(|r| r.get::<_, String>(0));
+    let _ = client
+        .batch_execute(&format!("DROP TABLE IF EXISTS {t}"))
+        .await;
+    assert_eq!(result, Ok(3));
+    assert_eq!(level.unwrap(), "serializable");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn import_failure_messages_tell_a_server_rejection_from_an_unknown_outcome() {
+    use crate::handlers::database_import::describe_commit_failure;
+    let client = crate::client::oneshot_pool_client(&import_live_params())
+        .await
+        .unwrap();
+    let server_error = client.batch_execute("SELECT 1/0").await.unwrap_err();
+    assert!(server_error.as_db_error().is_some());
+    let message = describe_commit_failure(12, &server_error);
+    assert!(
+        message.starts_with("COMMIT failed, nothing was imported"),
+        "{message}"
+    );
+    assert!(
+        message.contains("12 statements") && message.contains("division by zero"),
+        "{message}"
+    );
+
+    // A connection that dies mid-COMMIT carries no server verdict.
+    let victim = crate::client::oneshot_pool_client(&import_live_params())
+        .await
+        .unwrap();
+    let pid: i32 = victim
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .await
+        .unwrap();
+    let mut transport_error = None;
+    for _ in 0..50 {
+        match victim.batch_execute("SELECT 1").await {
+            Err(e) if e.as_db_error().is_none() => {
+                transport_error = Some(e);
+                break;
+            }
+            Err(_) | Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    let message = describe_commit_failure(3, &transport_error.expect("a transport error"));
+    assert!(message.contains("outcome is unknown"), "{message}");
+    assert!(!message.contains("nothing was imported"), "{message}");
+}

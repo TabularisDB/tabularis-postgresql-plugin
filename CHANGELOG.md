@@ -4,6 +4,23 @@
 
 ### Added
 
+- `import_database_sql` (#201): imports a `.sql` file in a single transaction on
+  a dedicated connection, so a failing statement rolls the whole import back
+  instead of leaving the database half-imported. Applies the built-in driver's
+  session setup with one difference: the requested schema (default `public`) is
+  prepended onto the connection's `search_path` instead of replacing it. Also
+  sets `SET CONSTRAINTS ALL DEFERRED` and `SET LOCAL synchronous_commit = OFF`,
+  runs deferred constraint checks before `COMMIT`, reports the failing
+  statement's number, line and text, and honors `cancel` between statements and
+  before `COMMIT`. Statements are streamed and split correctly around quotes,
+  dollar quoting, comments and `BEGIN ATOMIC` bodies, and each runs as exactly
+  one command. `BEGIN`/`COMMIT` lines in the file are skipped so the import
+  stays atomic; `ROLLBACK`, `COPY ... FROM STDIN`/`TO STDOUT`, anything that
+  could turn `standard_conforming_strings` off, and psql meta-commands are
+  rejected with an explanation (use `pg_dump --inserts`). The database the user
+  picked wins over the one named in a legacy connection string. Session
+  settings from the dump are reset before `COMMIT` so they do not leak through
+  a transaction pooler. No progress events are emitted.
 - `get_foreign_keys` and `get_all_foreign_keys_batch` now return `ref_schema`,
   the schema of the referenced table. A foreign key into another schema
   (`billing.carry_forwards.organization_id → core.organizations.id`) no longer

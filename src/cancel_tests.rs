@@ -79,3 +79,74 @@ fn a_guard_with_no_request_id_is_a_no_op_on_drop() {
     let guard = CancelGuard { request_id: None };
     drop(guard);
 }
+
+#[tokio::test]
+async fn a_triggered_cancel_is_remembered_so_a_cancel_swallowed_while_idle_is_not_lost() {
+    let (action, _called) = recording_action();
+    insert_action(31, action);
+    assert!(!was_cancelled(31));
+
+    cancel(31).await;
+
+    assert!(was_cancelled(31));
+    let guard = CancelGuard {
+        request_id: Some(31),
+    };
+    assert!(guard.is_cancelled());
+    drop(guard);
+    assert!(
+        !was_cancelled(31),
+        "dropping the guard must forget the flag so the id can be reused"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_an_unregistered_id_records_nothing() {
+    cancel(32).await;
+    assert!(
+        !was_cancelled(32),
+        "a stale cancel must not poison a later request that reuses the id"
+    );
+}
+
+#[test]
+fn a_guard_without_a_request_id_is_never_cancelled() {
+    assert!(!CancelGuard { request_id: None }.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_cancel_that_arrives_before_the_connection_is_attached_is_remembered() {
+    let guard = CancelGuard::reserve(Some(41));
+    assert!(!guard.is_cancelled());
+
+    cancel(41).await;
+
+    assert!(
+        guard.is_cancelled(),
+        "a cancel during connection setup must not be lost"
+    );
+    drop(guard);
+    assert!(!was_cancelled(41));
+}
+
+#[test]
+fn reserving_without_a_request_id_is_a_no_op_guard() {
+    let guard = CancelGuard::reserve(None);
+    assert!(!guard.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_cancel_racing_the_guard_drop_never_leaves_a_stale_flag() {
+    for round in 0..200u64 {
+        let id = 1_000_000 + round;
+        let guard = CancelGuard::reserve(Some(id));
+        let canceller = tokio::spawn(cancel(id));
+        tokio::task::yield_now().await;
+        drop(guard);
+        canceller.await.unwrap();
+        assert!(
+            !was_cancelled(id),
+            "round {round}: flag survived the guard's drop"
+        );
+    }
+}

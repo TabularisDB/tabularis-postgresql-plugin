@@ -1,9 +1,12 @@
 //! Registry of in-flight query cancel actions, keyed by JSON-RPC request id.
 //!
 //! Populated by the query handlers (`execute_query`, `execute_query_batch`,
-//! `explain_query`) before running a statement, and drained by [`CancelGuard`]
-//! when the statement finishes — success, error, or an early `?` — so the
-//! map never grows unbounded. Consulted by the `cancel` notification handler
+//! `explain_query`) and `import_database_sql` before running a statement, and
+//! drained by [`CancelGuard`] when the statement finishes — success, error, or
+//! an early `?` — so the map never grows unbounded. A delivered cancel is also
+//! remembered (see [`CancelGuard::is_cancelled`]) until its guard drops,
+//! because `pg_cancel_backend` is discarded while a backend is idle between
+//! statements and a multi-statement caller has to notice it itself. Consulted by the `cancel` notification handler
 //! (`handlers::query::cancel`) to trigger a server-side `pg_cancel_backend`
 //! for a specific in-flight call.
 //!
@@ -25,7 +28,7 @@
 //! can only be obtained from a live `Client`, which needs a live database
 //! connection. See `cancel_tests.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{LazyLock, Mutex};
@@ -49,13 +52,31 @@ fn insert_action(request_id: u64, action: CancelAction) {
 }
 
 fn remove_action(request_id: u64) {
+    // Both removals happen under the HANDLES lock, the same lock `cancel()`
+    // holds while it takes the action and records the flag, so a cancel racing
+    // the guard's drop either records its flag before this clears it or finds
+    // no action and records nothing.
     if let Ok(mut handles) = HANDLES.lock() {
         handles.remove(&request_id);
+        if let Ok(mut cancelled) = CANCELLED.lock() {
+            cancelled.remove(&request_id);
+        }
     }
 }
 
+/// Ids whose `cancel` was delivered while their guard was still registered.
+/// Cleared by the guard's drop so a reused id starts clean.
+static CANCELLED: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn was_cancelled(request_id: u64) -> bool {
+    CANCELLED
+        .lock()
+        .is_ok_and(|cancelled| cancelled.contains(&request_id))
+}
+
 /// RAII guard: registers a cancel action for `request_id` (if `Some`) on
-/// construction, deregisters it on drop. A `None` `request_id` (should not
+/// construction, deregisters it on drop, and remembers a delivered `cancel`
+/// until then (see [`CancelGuard::is_cancelled`]). A `None` `request_id` (should not
 /// happen with a real host, which always sends a numeric `id`, but this
 /// stays defensive rather than panicking on an unexpected shape) is a no-op
 /// guard.
@@ -79,6 +100,34 @@ impl CancelGuard {
             insert_action(id, Box::new(move || Box::pin(run_cancel(token, params))));
         }
         Self { request_id }
+    }
+}
+
+impl CancelGuard {
+    /// Claim `request_id` before a connection exists, so a `cancel` that
+    /// arrives while the caller is still connecting is remembered instead of
+    /// dropped. [`attach`](Self::attach) later swaps in the real cancel action.
+    pub fn reserve(request_id: Option<u64>) -> Self {
+        if let Some(id) = request_id {
+            insert_action(id, Box::new(|| Box::pin(async {})));
+        }
+        Self { request_id }
+    }
+
+    /// Point a reserved guard at `pg_client`'s backend.
+    pub fn attach(&self, pg_client: &PgClient, params: ConnectionParams) {
+        if let Some(id) = self.request_id {
+            let token = pg_client.cancel_token();
+            insert_action(id, Box::new(move || Box::pin(run_cancel(token, params))));
+        }
+    }
+
+    /// Whether a `cancel` for this request has been delivered. `pg_cancel_backend`
+    /// only affects a statement that is running; PostgreSQL discards one that
+    /// arrives while the backend is idle between statements, so a caller that
+    /// runs many statements checks this between them.
+    pub fn is_cancelled(&self) -> bool {
+        self.request_id.is_some_and(was_cancelled)
     }
 }
 
@@ -119,7 +168,8 @@ async fn run_cancel(token: CancelToken, params: ConnectionParams) {
 }
 
 /// Trigger the registered cancel action for `request_id`, if one is still
-/// registered. Unknown ids (already finished, already cancelled — the
+/// registered, and remember that it was cancelled until the guard drops.
+/// Unknown ids (already finished, already cancelled — the
 /// action is one-shot and removed on trigger — or no cancel action was ever
 /// registered, e.g. a metadata call, which doesn't run through
 /// `CancelGuard`) are a no-op: there is nothing meaningful to report back
@@ -138,7 +188,15 @@ async fn run_cancel(token: CancelToken, params: ConnectionParams) {
 /// left as a documented pre-existing limit matching the builtin.
 pub async fn cancel(request_id: u64) {
     let action = match HANDLES.lock() {
-        Ok(mut handles) => handles.remove(&request_id),
+        Ok(mut handles) => {
+            let action = handles.remove(&request_id);
+            if action.is_some() {
+                if let Ok(mut cancelled) = CANCELLED.lock() {
+                    cancelled.insert(request_id);
+                }
+            }
+            action
+        }
         Err(_) => return,
     };
     if let Some(action) = action {

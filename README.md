@@ -47,6 +47,7 @@ both drivers against the same live database and compares every response.
 - [How It Works](#how-it-works)
 - [Supported Operations](#supported-operations)
   - [Whole-database operations](#whole-database-operations)
+  - [SQL file import](#sql-file-import)
 - [Building from Source](#building-from-source)
 - [Development](#development)
 - [Changelog](#changelog)
@@ -196,6 +197,7 @@ instead of reconnecting.
 | `insert_record` / `update_record` / `delete_record` | Row-level CRUD with type-aware value binding |
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
 | `save_blob_to_file` / `fetch_blob_as_data_url` | BLOB (`bytea`) export and preview |
+| `import_database_sql` | Transactional SQL file import: the whole file runs in one transaction, all-or-nothing |
 
 ### Whole-database operations
 
@@ -208,6 +210,47 @@ Both operations use a transaction. Drop connects through `postgres` and refuses
 protected databases or databases still used by other sessions; it never forcibly
 terminates unrelated clients. The explicit browsed database overrides the database
 embedded in a legacy connection string. Read-only requests are rejected.
+
+### SQL file import
+
+`import_database_sql` runs a `.sql` file in a single transaction on a dedicated
+connection, so any failing statement rolls the whole import back. The error
+names the statement number, its line and its text. The import prepends the
+requested schema (default `public`) onto the connection's base `search_path`,
+sets `SET CONSTRAINTS ALL DEFERRED` and `SET LOCAL synchronous_commit = OFF`,
+and checks deferred constraints before `COMMIT` while the file's own session
+state is still in place. Unlike the former built-in driver, which replaced the
+`search_path`, the base path stays reachable, so unqualified names that are
+absent from the requested schema can still resolve through it. The Tabularis
+host does not send a target schema over this RPC yet, so today every import
+uses `public`. Statements are split on `;` outside strings, quoted identifiers,
+dollar-quoted bodies, comments, parentheses and `BEGIN ATOMIC` bodies, and are
+streamed from disk with only a few held in memory. A single statement is
+limited to 1 GiB, the most PostgreSQL accepts. The plugin reports no progress
+while it runs, only the final statement count.
+
+Because the import owns the transaction, `BEGIN` and `COMMIT` lines in the file
+are skipped, and the returned count covers only the statements that ran.
+`ROLLBACK`, `COMMIT AND CHAIN`, `PREPARE TRANSACTION`,
+`COPY ... FROM STDIN` / `TO STDOUT` and psql meta-commands (`\connect`, `\i`)
+are rejected with an explanation (`\restrict` and `\unrestrict`, which recent
+`pg_dump` versions emit, are skipped); use `pg_dump --inserts` for dumps that
+would otherwise rely on `COPY ... FROM STDIN`. A file's own
+`SET TRANSACTION ISOLATION LEVEL` still works, but the options on a `BEGIN`
+line are dropped with it. Anything that could turn `standard_conforming_strings`
+off (`SET` to anything but `on`, `RESET`, `RESET ALL`, `set_config`) is rejected,
+because it would change how the rest of the file's strings are read. Each
+statement is sent as exactly one command, so a statement the splitter cannot
+separate fails with an error instead of running extra commands. When the
+connection carries a legacy connection string, its host, port and credentials
+are used but the database the user picked wins. Creating a database during
+import is not supported, and read-only connections are rejected.
+
+Cancelling the call stops the running statement, is noticed between statements
+and just before `COMMIT`, and rolls everything back. Session settings a dump
+makes (`set_config(..., false)`, `SET ROLE`) are reset before `COMMIT`, so they
+cannot leak to other clients behind a transaction pooler. The import holds one
+of the plugin's four general workers for its whole run.
 
 ## Building from Source
 
