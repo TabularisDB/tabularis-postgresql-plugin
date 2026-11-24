@@ -297,7 +297,8 @@ fn extract_string_or_null_fallback(row: &Row, index: usize) -> JsonValue {
 /// Safely convert i64 to JSON: numbers within JS safe integer range are
 /// JSON numbers; larger values become JSON strings to prevent precision loss.
 fn i64_to_json(v: i64) -> JsonValue {
-    if v.abs() <= JS_MAX_SAFE_INTEGER {
+    // `unsigned_abs`, not `abs`: `i64::MIN` has no positive counterpart.
+    if v.unsigned_abs() <= JS_MAX_SAFE_UINT {
         JsonValue::from(v)
     } else {
         JsonValue::String(v.to_string())
