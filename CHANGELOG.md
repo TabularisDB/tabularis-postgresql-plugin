@@ -4,6 +4,20 @@
 
 ### Added
 
+- `execute_read_only_query` and the `read_only_queries` capability (#202):
+  protected read-only queries. Each call runs as `BEGIN READ ONLY`, the query,
+  `ROLLBACK`, so PostgreSQL itself refuses `INSERT`, `UPDATE`, `DELETE`, DDL and
+  writing functions; the plugin reads `transaction_read_only` back and fails the
+  call if protection is not in effect. Transaction-control statements are
+  refused. The connection returns to the pool only after `ROLLBACK` succeeded;
+  on a failed `ROLLBACK`, a cancellation or a dropped call it is detached,
+  its running statement is cancelled and it is closed, so protection never
+  leaks to a writable caller of the same pool.
+- A connection with `read_only = true` now opens on its own pool with
+  `default_transaction_read_only=on`, and the plugin never runs its
+  `startup_script` (the host omits it), so connection testing and metadata
+  discovery cannot write. The session option is not sent behind a transaction
+  pooler, which rejects it; the per-call transaction protects there.
 - `import_database_sql` (#201): imports a `.sql` file in a single transaction on
   a dedicated connection, so a failing statement rolls the whole import back
   instead of leaving the database half-imported. Applies the built-in driver's

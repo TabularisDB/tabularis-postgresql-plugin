@@ -48,6 +48,7 @@ both drivers against the same live database and compares every response.
 - [Supported Operations](#supported-operations)
   - [Whole-database operations](#whole-database-operations)
   - [SQL file import](#sql-file-import)
+  - [Protected read-only queries](#protected-read-only-queries)
 - [Building from Source](#building-from-source)
 - [Development](#development)
 - [Changelog](#changelog)
@@ -110,7 +111,8 @@ both drivers against the same live database and compares every response.
 | `ssl_key` | Path to the private key PEM file matching `ssl_cert`. Must be set together with `ssl_cert` | No |
 | `unix_socket_path` | Path to a Unix socket file (`/var/run/postgresql/.s.PGSQL.5432`) or its directory. When set, the plugin dials the socket instead of `host`/`port`, and TLS is forced off (a socket peer cannot negotiate it). The host strips this when a tunnel is active, so the tunnel owns the route | No |
 | `connection_string` | Full `postgres://user:pass@host:port/db` URL, as an alternative to the discrete fields above | No |
-| `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query | No |
+| `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query. Not run for a read-only connection | No |
+| `read_only` | Set by the host for a read-only connection. The plugin opens it on its own pool with `default_transaction_read_only=on` and skips the startup script (see [Protected read-only queries](#protected-read-only-queries)) | No |
 
 ## Supported PostgreSQL Data Types
 
@@ -193,6 +195,7 @@ instead of reconnecting.
 | `get_routines` / `get_routine_parameters` / `get_routine_definition` | Function/procedure metadata |
 | `get_triggers` / `get_trigger_definition` / `create_trigger` / `drop_trigger` | Trigger lifecycle |
 | `execute_query` / `execute_query_batch` / `explain_query` | Query execution, multi-statement batches, and query plans. Both query methods accept an optional `session_id` that keeps the connection while an explicit transaction is open |
+| `execute_read_only_query` | Same request and response as `execute_query`, run in a transaction the database itself will not let write (see [Protected read-only queries](#protected-read-only-queries)) |
 | `release_session` | Rolls back and releases the connection a session pinned for an open transaction |
 | `insert_record` / `update_record` / `delete_record` | Row-level CRUD with type-aware value binding |
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
@@ -251,6 +254,39 @@ and just before `COMMIT`, and rolls everything back. Session settings a dump
 makes (`set_config(..., false)`, `SET ROLE`) are reset before `COMMIT`, so they
 cannot leak to other clients behind a transaction pooler. The import holds one
 of the plugin's four general workers for its whole run.
+
+### Protected read-only queries
+
+The plugin declares `read_only_queries`, so the host sends `execute_read_only_query`
+for a read-only connection and for MCP queries on a writable one. The request
+and response match `execute_query` (`query`, `limit`, `page`, `schema`), and the
+host never falls back to `execute_query`.
+
+Protection is enforced by PostgreSQL, not by inspecting the SQL. Each call runs
+as `BEGIN READ ONLY`, the query, then `ROLLBACK`, and it reads
+`transaction_read_only` back to confirm the server really entered a read-only
+transaction; if it did not, the query is not run. `INSERT`, `UPDATE`, `DELETE`,
+DDL and a function call that writes all fail in the database and change
+nothing. A function or `DO` block cannot switch the transaction back to
+writable, because `SET TRANSACTION READ WRITE` is only accepted before the first
+query of a transaction. A query that opens or ends a transaction (`BEGIN`, `COMMIT`, `ROLLBACK`) is
+refused, since the call owns its transaction. PostgreSQL's read-only mode also
+rejects `nextval()` and temporary tables, but it does allow session-level
+advisory locks (`pg_advisory_lock`), which `ROLLBACK` does not release.
+
+The connection goes back to the pool only after `ROLLBACK` succeeded. If the
+`ROLLBACK` fails, or the call is cancelled or dropped part-way, the connection is
+detached, the statement still running on it is cancelled, and the socket is
+closed, so the next caller never inherits a read-only or half-finished session.
+
+A connection saved with `read_only = true` gets its own pool (keyed apart from
+the writable one) whose sessions also start with `default_transaction_read_only=on`,
+so its connection test and metadata discovery cannot write either. The host
+leaves out the saved `startup_script` for such a connection, and the plugin
+never runs one for it. Behind a transaction pooler (`pooler_mode = transaction`)
+the session option is not sent, because PgBouncer rejects it as a startup
+parameter; the per-call `BEGIN READ ONLY` is the protection there, on a
+dedicated connection that is closed afterwards.
 
 ## Building from Source
 

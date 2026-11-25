@@ -39,6 +39,7 @@ fn params(host: &str, port: u16, db: &str, user: &str) -> ConnectionParams {
         startup_script: None,
         unix_socket_path: None,
         pooler_mode: None,
+        read_only: false,
     }
 }
 
@@ -809,6 +810,7 @@ fn params_with_ssl(ssl_mode: &str) -> ConnectionParams {
         startup_script: None,
         unix_socket_path: None,
         pooler_mode: None,
+        read_only: false,
     }
 }
 
@@ -1769,4 +1771,105 @@ fn connection_key_socket_precedence_keys_on_socket_not_connection_string() {
         key.starts_with("socket:"),
         "socket connection's key must start with 'socket:' even when connection_string is set; got: {key}"
     );
+}
+
+// --- read-only mode (#202) -------------------------------------------------
+
+fn read_only_params() -> ConnectionParams {
+    let mut p = params("localhost", 5432, "db", "postgres");
+    p.read_only = true;
+    p
+}
+
+#[test]
+fn a_read_only_connection_never_shares_a_pool_with_a_writable_one() {
+    let writable = connection_key(&params("localhost", 5432, "db", "postgres"));
+    let protected = connection_key(&read_only_params());
+    assert_ne!(
+        writable, protected,
+        "a protected pool must not hand out writable sessions"
+    );
+    assert!(protected.starts_with("read_only:"), "{protected}");
+}
+
+#[test]
+fn a_read_only_key_is_stable_and_distinguishes_targets_like_a_writable_one() {
+    let a = connection_key(&read_only_params());
+    assert_eq!(a, connection_key(&read_only_params()));
+    let mut other = read_only_params();
+    other.database = Some("other".into());
+    assert_ne!(a, connection_key(&other));
+}
+
+#[test]
+fn the_read_only_key_prefix_applies_to_socket_and_connection_string_keys_too() {
+    let mut cs = read_only_params();
+    cs.connection_string = Some("postgres://u:p@h/db".into());
+    assert!(connection_key(&cs).starts_with("read_only:cs:"));
+    #[cfg(unix)]
+    {
+        let mut sock = read_only_params();
+        sock.unix_socket_path = Some("/var/run/postgresql/.s.PGSQL.5432".into());
+        assert!(connection_key(&sock).starts_with("read_only:socket:"));
+    }
+}
+
+#[test]
+fn the_startup_script_does_not_change_a_read_only_key() {
+    // It never runs in read-only mode, so two scripts must not split the pool.
+    let mut a = read_only_params();
+    a.startup_script = Some("SET a = 1".into());
+    let mut b = read_only_params();
+    b.startup_script = Some("SET b = 2".into());
+    assert_eq!(connection_key(&a), connection_key(&b));
+    assert_eq!(connection_key(&a), connection_key(&read_only_params()));
+}
+
+#[test]
+fn the_startup_script_still_splits_a_writable_key() {
+    let mut a = params("localhost", 5432, "db", "postgres");
+    a.startup_script = Some("SET a = 1".into());
+    let mut b = params("localhost", 5432, "db", "postgres");
+    b.startup_script = Some("SET b = 2".into());
+    assert_ne!(connection_key(&a), connection_key(&b));
+}
+
+#[test]
+fn a_read_only_connection_asks_the_server_for_read_only_sessions() {
+    assert_eq!(
+        super::session_options(&read_only_params()),
+        Some("-c default_transaction_read_only=on".to_string())
+    );
+    assert_eq!(super::session_options(&params("h", 1, "d", "u")), None);
+}
+
+#[test]
+fn a_read_only_connection_behind_a_transaction_pooler_sends_no_startup_option() {
+    // PgBouncer refuses `-c default_transaction_read_only=on` in the startup
+    // packet ("unsupported startup parameter in options"), so sending it would
+    // make the connection impossible to open. A session-level SET would be
+    // worse: the backend is shared, so it could leak read-only mode to another
+    // client. Each protected call opens its own `BEGIN READ ONLY` instead.
+    let mut p = read_only_params();
+    p.pooler_mode = Some("transaction".into());
+    assert_eq!(super::session_options(&p), None);
+    p.pooler_mode = Some("session".into());
+    assert!(super::session_options(&p).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_socket_connection_asks_for_read_only_sessions_too() {
+    let mut p = read_only_params();
+    p.unix_socket_path = Some("/var/run/postgresql/.s.PGSQL.5432".into());
+    let config = super::build_socket_pg_config(&p, "/var/run/postgresql/.s.PGSQL.5432");
+    assert_eq!(
+        config.get_options(),
+        Some("-c default_transaction_read_only=on")
+    );
+    let writable = super::build_socket_pg_config(
+        &params("h", 1, "d", "u"),
+        "/var/run/postgresql/.s.PGSQL.5432",
+    );
+    assert_eq!(writable.get_options(), None);
 }

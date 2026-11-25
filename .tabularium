@@ -84,6 +84,7 @@
     "unix_socket": true,
     "explain": true,
     "readonly": false,
+    "read_only_queries": true,
     "no_connection_required": false,
     "serial_type": "SERIAL",
     "auto_increment_keyword": "",

@@ -6,6 +6,7 @@ pub mod crud;
 pub mod ddl;
 pub mod metadata;
 pub mod query;
+pub mod read_only;
 pub mod routines;
 
 pub mod database_import;

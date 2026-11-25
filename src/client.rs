@@ -383,6 +383,20 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
 
 /// SHA-256 hash of `bytes` as a lowercase hex string. Used for the password
 /// and connection_string cache-key segments — never stores plaintext.
+/// Server options every connection of this pool starts with. A read-only
+/// connection starts every session with `default_transaction_read_only = on`,
+/// so a write fails in the database even on a path that forgets to open a
+/// read-only transaction (metadata, connection tests, `execute_query`).
+///
+/// Not sent behind a transaction pooler: PgBouncer rejects the option in the
+/// startup packet ("unsupported startup parameter in options"), and a
+/// session-level `SET` would land on a backend other clients share. There each
+/// protected call's own `BEGIN READ ONLY` is the protection.
+pub(crate) fn session_options(params: &ConnectionParams) -> Option<String> {
+    (params.read_only && !params.is_transaction_pooler())
+        .then(|| "-c default_transaction_read_only=on".to_string())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -420,6 +434,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// or empty/whitespace connection_string → falls back to the full
 /// discrete-field + password key.
 fn connection_key(params: &ConnectionParams) -> String {
+    let key = connection_key_inner(params);
+    // A protected connection must never borrow a writable session, and a
+    // writable one must never receive a protected session.
+    if params.read_only {
+        format!("read_only:{key}")
+    } else {
+        key
+    }
+}
+
+fn connection_key_inner(params: &ConnectionParams) -> String {
     // The TLS params and startup_script are always part of the key — build_pool
     // reads them from the discrete fields unconditionally, even when
     // connection_string is set (it only ignores the discrete host/port/db/
@@ -430,11 +455,7 @@ fn connection_key(params: &ConnectionParams) -> String {
     // identical pool behavior), not duplicate pools.
     let tls_and_script = format!(
         "{}:{}:{}:{}:{}",
-        params
-            .startup_script
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or(""),
+        params.startup_script_to_run().unwrap_or(""),
         params.ssl_mode.as_deref().unwrap_or(""),
         params.ssl_ca.as_deref().unwrap_or(""),
         params.ssl_cert.as_deref().unwrap_or(""),
@@ -761,12 +782,9 @@ async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Res
         recycling_method: RecyclingMethod::Fast,
     });
     cfg.ssl_mode = resolve_ssl_mode(params.ssl_mode.as_deref());
+    cfg.options = session_options(params);
 
-    let script = params
-        .startup_script
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let script = params.startup_script_to_run();
 
     if uses_tls(params) {
         let tls_config = build_tls_connector(params)?;
@@ -846,6 +864,9 @@ pub(crate) fn build_socket_pg_config(
         // leaves the machine: force it off so `prefer`-style defaults don't
         // stall the handshake. Matches the builtin's socket branch.
         .ssl_mode(tokio_postgres::config::SslMode::Disable);
+    if let Some(options) = session_options(params) {
+        pg_config.options(&options);
+    }
     pg_config
 }
 
@@ -869,11 +890,7 @@ async fn build_socket_pool(
 ) -> Result<Pool, String> {
     let pg_config = build_socket_pg_config(params, socket);
 
-    let script = params
-        .startup_script
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let script = params.startup_script_to_run();
 
     if !skip_preflight {
         if let Some(script) = script {
