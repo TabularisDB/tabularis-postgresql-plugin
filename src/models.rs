@@ -41,10 +41,12 @@ pub struct ConnectionParams {
     /// tabularis#1097). `None` for direct connections — no behavior change.
     pub pooler_mode: Option<String>,
     /// The connection's **Read-only mode** (a saved per-connection policy).
-    /// The host forwards it to every call. While it is on, the plugin keeps
-    /// the connection from writing at the database level and never runs the
-    /// saved `startup_script` (see [`Self::startup_script_to_run`]).
-    /// `execute_read_only_query` protects each call whatever this flag says.
+    /// The host forwards it to every call. While it is on, the plugin makes
+    /// each new session read-only at the database level (except behind a
+    /// transaction pooler, where only `execute_read_only_query` calls are
+    /// protected) and never runs the saved `startup_script` (see
+    /// [`Self::startup_script_to_run`]). `execute_read_only_query` protects
+    /// each call whatever this flag says.
     pub read_only: bool,
 }
 

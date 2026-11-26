@@ -9,15 +9,23 @@
   `ROLLBACK`, so PostgreSQL itself refuses `INSERT`, `UPDATE`, `DELETE`, DDL and
   writing functions; the plugin reads `transaction_read_only` back and fails the
   call if protection is not in effect. Transaction-control statements are
-  refused. The connection returns to the pool only after `ROLLBACK` succeeded;
-  on a failed `ROLLBACK`, a cancellation or a dropped call it is detached,
-  its running statement is cancelled and it is closed, so protection never
-  leaks to a writable caller of the same pool.
-- A connection with `read_only = true` now opens on its own pool with
-  `default_transaction_read_only=on`, and the plugin never runs its
-  `startup_script` (the host omits it), so connection testing and metadata
-  discovery cannot write. The session option is not sent behind a transaction
-  pooler, which rejects it; the per-call transaction protects there.
+  refused, including ones hidden behind a `--` comment that ends at a carriage
+  return. `PREPARE`, `DEALLOCATE`, `COPY`, `ANALYZE`, `CLUSTER`, `REINDEX`,
+  `CHECKPOINT` and `LOAD` are refused too, because a read-only transaction does
+  not stop them from changing state outside it. The connection returns to the
+  pool only after `ROLLBACK` succeeded and the session holds no prepared
+  statement or session-level advisory lock the call created; otherwise, and on
+  a cancellation or a dropped call, it is detached, its running statement is
+  cancelled and it is closed, so protection and session state never leak to a
+  writable caller of the same pool. A `cancel` that lands before the query runs
+  stops the call. Role privileges still bound the protection (see the README).
+- A connection with `read_only = true` now opens on its own pool whose new
+  sessions run `SET default_transaction_read_only = on`, and the plugin never
+  runs its `startup_script` (the host omits it), so connection testing and
+  metadata discovery cannot write. It is a statement and not a startup option,
+  because PgBouncer rejects the option in every pool mode. Behind a transaction
+  pooler the statement is not run and the per-call transaction protects there;
+  `pooler_mode` is part of such a pool's key.
 - `import_database_sql` (#201): imports a `.sql` file in a single transaction on
   a dedicated connection, so a failing statement rolls the whole import back
   instead of leaving the database half-imported. Applies the built-in driver's
@@ -59,6 +67,15 @@
 
 ### Fixed
 
+- A very large `limit` or `page` no longer breaks a paginated query. The page
+  size plus one and the page offset were computed in 32 bits: a debug build
+  panicked and left the request unanswered, and a release build wrapped to
+  `LIMIT 0` and silently returned no rows. They are now 64-bit, and the offset
+  stops at the largest value PostgreSQL's `bigint` accepts.
+- A `--` comment now ends at a carriage return as well as a newline, as it does
+  in PostgreSQL. A statement that follows a comment ended by `\r` was read as
+  part of the comment, which hid its leading keyword from the transaction-control
+  and result-set checks.
 - A `bigint` or `money` value of `-9223372036854775808` no longer overflows
   when it is converted for the grid. A debug build panicked on it and left the
   request unanswered; a release build sent it as a JSON number, which loses

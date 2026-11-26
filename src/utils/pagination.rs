@@ -13,11 +13,19 @@
 //! tokens inside quotes. Sufficient for the current parity test corpus;
 //! revisit if a query pattern breaks this.
 
+const MAX_OFFSET: u64 = i64::MAX as u64;
+
 /// Compute the SQL LIMIT and OFFSET for a given page and page size.
 /// Pages are 1-indexed.
-pub fn limit_offset(page: u32, page_size: u32) -> (u32, u32) {
-    let offset = (page.saturating_sub(1)) * page_size;
-    (page_size, offset)
+///
+/// Widened to `u64`: a caller may send the largest `u32` for both, and their
+/// product (and `page_size + 1`) does not fit in 32 bits. PostgreSQL's
+/// `OFFSET` is a `bigint`, so the offset is capped at `i64::MAX` (the largest
+/// pair of `u32`s multiplies past it); past the end of any table it simply
+/// returns no rows instead of failing with "bigint out of range".
+pub fn limit_offset(page: u32, page_size: u32) -> (u64, u64) {
+    let offset = (u64::from(page.saturating_sub(1)) * u64::from(page_size)).min(MAX_OFFSET);
+    (u64::from(page_size), offset)
 }
 
 /// Split a query into whitespace-separated tokens, tracking each token's
@@ -101,9 +109,9 @@ fn extract_user_offset(query: &str) -> Option<u32> {
 /// this page's clause. A user LIMIT caps the total rows returned across all
 /// pages; a user OFFSET is added to the per-page offset.
 pub fn build_paginated_query(query: &str, page_size: u32, page: u32) -> String {
-    let page_offset = limit_offset(page, page_size).1;
-    let user_limit = extract_user_limit(query);
-    let user_offset = extract_user_offset(query).unwrap_or(0);
+    let (page_size, page_offset) = limit_offset(page, page_size);
+    let user_limit = extract_user_limit(query).map(u64::from);
+    let user_offset = u64::from(extract_user_offset(query).unwrap_or(0));
     let base = strip_limit_offset(query);
 
     let fetch_count = match user_limit {
@@ -114,7 +122,7 @@ pub fn build_paginated_query(query: &str, page_size: u32, page: u32) -> String {
         None => page_size + 1,
     };
 
-    let offset = user_offset.saturating_add(page_offset);
+    let offset = user_offset.saturating_add(page_offset).min(MAX_OFFSET);
 
     format!("{} LIMIT {} OFFSET {}", base, fetch_count, offset)
 }

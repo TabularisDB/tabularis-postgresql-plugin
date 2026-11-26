@@ -68,3 +68,36 @@ fn build_paginated_query_ignores_trailing_semicolon() {
     let sql = build_paginated_query("SELECT * FROM t;", 10, 1);
     assert_eq!(sql, "SELECT * FROM t LIMIT 11 OFFSET 0");
 }
+
+// The caller clamps `limit` and `page` to `u32::MAX`, so the arithmetic has to
+// hold there (#202): a wrapped `page_size + 1` became `LIMIT 0` and an
+// overflowing offset panicked the worker.
+#[test]
+fn the_largest_page_size_does_not_overflow() {
+    let sql = build_paginated_query("SELECT * FROM t", u32::MAX, 1);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 4294967296 OFFSET 0");
+}
+
+#[test]
+fn a_page_offset_beyond_u32_does_not_overflow() {
+    let sql = build_paginated_query("SELECT * FROM t", 100_000, 100_000);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 100001 OFFSET 9999900000");
+    let sql = build_paginated_query("SELECT * FROM t", 2, 3_000_000_000);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 3 OFFSET 5999999998");
+}
+
+#[test]
+fn the_largest_page_and_page_size_stay_within_a_bigint() {
+    let sql = build_paginated_query("SELECT * FROM t", u32::MAX, u32::MAX);
+    assert_eq!(
+        sql,
+        "SELECT * FROM t LIMIT 4294967296 OFFSET 9223372036854775807"
+    );
+}
+
+#[test]
+fn limit_offset_does_not_overflow_at_the_extremes() {
+    assert_eq!(limit_offset(u32::MAX, u32::MAX).0, u64::from(u32::MAX));
+    assert_eq!(limit_offset(u32::MAX, u32::MAX).1, i64::MAX as u64);
+    assert_eq!(limit_offset(0, 10), (10, 0));
+}

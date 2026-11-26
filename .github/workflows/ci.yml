@@ -157,8 +157,9 @@ jobs:
         env:
           PG_PLUGIN_TEST_HOST: 127.0.0.1
           PG_PLUGIN_TEST_PORT: 54320
-        # The service exposes plain TCP. These tests need a socket, TLS or PgBouncer.
+        # The service exposes plain TCP. These tests need a socket, TLS or a PgBouncer (transaction and session mode).
         run: >-
           cargo test --locked --lib client_live_tests -- --ignored --test-threads=1
           --skip unix_socket_dials_socket_not_tcp --skip prefer_unset_negotiates_tls_not_plaintext
           --skip protected_calls_work_behind_a_transaction_pooler
+          --skip a_read_only_connection_opens_through_a_session_mode_pooler

@@ -1,7 +1,6 @@
 //! Unit tests for the pure parts of `execute_read_only_query`. The protection
 //! itself (a write failing in the database, nothing leaking to a writable
-//! session) is covered against a live database in `client_live_tests.rs` and
-//! `tests/live_db.rs`.
+//! session) is covered against a live database in `client_live_tests.rs`.
 
 use super::*;
 use serde_json::json;
@@ -100,6 +99,9 @@ fn transaction_control_is_refused() {
         "ABORT",
         "/* c */ COMMIT",
         "PREPARE TRANSACTION 'x'",
+        "-- x\rCOMMIT\nWORK",
+        "-- x\rPREPARE\nTRANSACTION 'x'",
+        "--\rEND",
     ] {
         let err = refuse_transaction_control(sql).unwrap_err();
         assert!(err.contains("read-only"), "{sql}: {err}");
@@ -117,9 +119,73 @@ fn ordinary_reads_and_savepoint_free_statements_pass_the_transaction_check() {
         "TABLE t",
         "VALUES (1)",
         "SELECT pg_advisory_lock(1)",
+        "SELECT 'PREPARE x'",
+        "SELECT * FROM copy_log",
+        "-- PREPARE x\nSELECT 1",
+        "EXPLAIN ANALYZE SELECT 1",
+        "SELECT analyze_me()",
     ] {
         assert!(refuse_transaction_control(sql).is_ok(), "{sql}");
     }
+}
+
+#[test]
+fn commands_that_act_outside_the_transaction_are_refused_by_name() {
+    for sql in [
+        "PREPARE p AS SELECT 1",
+        "prepare p(int) as select $1",
+        "DEALLOCATE ALL",
+        "DEALLOCATE p",
+        "COPY (SELECT 1) TO '/tmp/x'",
+        "COPY (SELECT 1) TO PROGRAM 'id'",
+        "COPY t FROM STDIN",
+        "ANALYZE t",
+        "ANALYSE",
+        "CLUSTER t",
+        "REINDEX TABLE t",
+        "CHECKPOINT",
+        "LOAD 'auto_explain'",
+        "/* c */ PREPARE p AS SELECT 1",
+        "-- c\rPREPARE p AS SELECT 1",
+    ] {
+        let err = refuse_transaction_control(sql).unwrap_err();
+        assert!(err.contains("not allowed"), "{sql}: {err}");
+        assert!(err.contains("read-only"), "{sql}: {err}");
+    }
+}
+
+fn baseline(sql: i64, protocol: i64, locks: i64) -> SessionBaseline {
+    SessionBaseline {
+        sql_prepared: sql,
+        protocol_prepared: protocol,
+        advisory_locks: locks,
+    }
+}
+
+#[test]
+fn a_session_that_is_as_clean_as_before_may_return_to_the_pool() {
+    assert!(baseline(0, 2, 0).is_unchanged_by(&baseline(0, 2, 0)));
+    // The client library may have cached one more statement meanwhile.
+    assert!(baseline(0, 2, 0).is_unchanged_by(&baseline(0, 3, 0)));
+    // A statement or lock the connection already held is not this call's doing.
+    assert!(baseline(1, 2, 1).is_unchanged_by(&baseline(1, 2, 1)));
+}
+
+#[test]
+fn a_session_that_kept_state_past_rollback_is_not_returned_to_the_pool() {
+    // A `PREPARE` survived the ROLLBACK.
+    assert!(!baseline(0, 2, 0).is_unchanged_by(&baseline(1, 2, 0)));
+    // A statement the client library cached was deallocated under it.
+    assert!(!baseline(0, 2, 0).is_unchanged_by(&baseline(0, 0, 0)));
+    // A session-level advisory lock is still held.
+    assert!(!baseline(0, 2, 0).is_unchanged_by(&baseline(0, 2, 1)));
+}
+
+#[test]
+fn the_session_counts_are_read_in_one_statement_with_fixed_columns() {
+    assert_eq!(SESSION_COUNTS_SQL.matches("count(*)").count(), 3);
+    assert!(SESSION_COUNTS_SQL.contains("from_sql"));
+    assert!(SESSION_COUNTS_SQL.contains("pg_backend_pid()"));
 }
 
 #[test]
@@ -147,4 +213,27 @@ fn protection_is_confirmed_only_by_an_exact_on() {
         let err = require_read_only_transaction(bad).unwrap_err();
         assert!(err.contains("could not be enabled"), "{bad:?}: {err}");
     }
+}
+
+#[test]
+fn page_zero_is_clamped_to_the_first_page() {
+    // Page 0 would underflow the offset arithmetic.
+    assert_eq!(parse_request(&req(json!({"page": 0}))).unwrap().page, 1);
+}
+
+#[test]
+fn the_largest_limit_and_page_are_clamped_not_truncated() {
+    // `as u32` wraps 1e10 into 1_410_065_408; a clamp keeps it the largest value.
+    let r = parse_request(&req(
+        json!({"limit": 10_000_000_000_u64, "page": 10_000_000_000_u64}),
+    ))
+    .unwrap();
+    assert_eq!(r.limit, Some(u32::MAX));
+    assert_eq!(r.page, u32::MAX);
+}
+
+#[test]
+fn a_limit_or_page_of_the_wrong_type_is_treated_as_absent() {
+    let r = parse_request(&req(json!({"limit": "100", "page": -3}))).unwrap();
+    assert_eq!((r.limit, r.page), (None, 1));
 }

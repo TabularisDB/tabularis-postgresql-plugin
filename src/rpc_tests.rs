@@ -307,3 +307,27 @@ fn peek_method_ignores_params_and_other_fields() {
         Some("execute_query")
     );
 }
+
+/// The manifest tells the host the plugin implements `execute_read_only_query`;
+/// the host then never falls back to `execute_query`. Both halves must hold.
+#[test]
+fn the_manifest_declares_the_read_only_queries_capability() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../.tabularium")).expect("manifest is JSON");
+    assert_eq!(
+        manifest["capabilities"]["read_only_queries"],
+        serde_json::json!(true)
+    );
+}
+
+#[tokio::test]
+async fn execute_read_only_query_is_dispatched_and_validates_its_request() {
+    // No query: the handler's own validation answers, which a `Method not
+    // found` (-32601) would not.
+    let line = r#"{"jsonrpc":"2.0","id":9,"method":"execute_read_only_query","params":{"params":{"host":"h","database":"d","username":"u"}}}"#;
+    let response = handle_line(line).await.expect("a request gets a response");
+    let error = response.get("error").expect("a missing query is an error");
+    assert_ne!(error["code"].as_i64(), Some(-32601), "{response}");
+    assert!(error["message"].as_str().unwrap().contains("query"));
+    assert_eq!(response["id"], 9);
+}

@@ -1,7 +1,8 @@
 //! Registry of in-flight query cancel actions, keyed by JSON-RPC request id.
 //!
 //! Populated by the query handlers (`execute_query`, `execute_query_batch`,
-//! `explain_query`) and `import_database_sql` before running a statement, and
+//! `explain_query`, `execute_read_only_query`) and `import_database_sql` before
+//! running a statement, and
 //! drained by [`CancelGuard`] when the statement finishes — success, error, or
 //! an early `?` — so the map never grows unbounded. A delivered cancel is also
 //! remembered (see [`CancelGuard::is_cancelled`]) until its guard drops,

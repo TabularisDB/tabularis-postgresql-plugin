@@ -1,7 +1,10 @@
 //! Protected read-only queries (`execute_read_only_query`).
 
+use std::time::Duration;
+
 use deadpool_postgres::Object as PgClient;
 use serde_json::Value;
+use tokio_postgres::SimpleQueryMessage;
 
 use crate::cancel;
 use crate::client;
@@ -29,8 +32,10 @@ async fn run(id: &Value, params: &Value) -> Result<Value, String> {
 /// not let write. Every path ends the transaction with `ROLLBACK`, and the
 /// connection goes back to the pool only once that succeeded.
 async fn exec_read_only(req: &ReadOnlyRequest, id: &Value) -> Result<Value, String> {
-    // A one-shot connection is used behind a transaction pooler: the explicit
-    // transaction pins one backend, and the connection is closed afterwards.
+    // Behind a transaction pooler a result-set query runs on a one-shot
+    // connection: the explicit transaction pins one backend, and the
+    // connection is closed afterwards. Any other statement runs on the shared
+    // pool, where the same `BEGIN READ ONLY` pins the backend for the call.
     if req.params.is_transaction_pooler() && returns_result_set(&req.query) {
         return exec_query_pooled_txn(
             &req.params,
@@ -41,7 +46,8 @@ async fn exec_read_only(req: &ReadOnlyRequest, id: &Value) -> Result<Value, Stri
             id,
             /* read_only = */ true,
         )
-        .await;
+        .await
+        .map_err(strip_rollback_notice);
     }
     exec_on_shared_pool(req, id).await
 }
@@ -56,40 +62,65 @@ async fn exec_read_only(req: &ReadOnlyRequest, id: &Value) -> Result<Value, Stri
 /// mid-flight (a host timeout, a worker abort): [`Discard`] detaches the
 /// connection and closes it.
 async fn exec_on_shared_pool(req: &ReadOnlyRequest, id: &Value) -> Result<Value, String> {
-    exec_on_shared_pool_ending_with(req, id, "ROLLBACK").await
+    exec_on_shared_pool_with(req, id, BEGIN_READ_ONLY, "ROLLBACK").await
 }
 
-/// [`exec_on_shared_pool`] with the statement that ends the transaction as a
-/// parameter, so a test can make the ending fail and show the connection is
-/// discarded rather than pooled.
-pub(crate) async fn exec_on_shared_pool_ending_with(
+/// [`exec_on_shared_pool`] with the statements that open and end the
+/// transaction as parameters, so a test can show that a transaction that is
+/// not read-only stops the call before the query runs, and that an ending that
+/// fails discards the connection rather than pooling it.
+pub(crate) async fn exec_on_shared_pool_with(
     req: &ReadOnlyRequest,
     id: &Value,
+    begin_sql: &str,
     end_sql: &str,
 ) -> Result<Value, String> {
+    // Reserved before the connection exists, so a `cancel` that arrives while
+    // the call is still connecting is remembered instead of dropped.
+    let cancel_guard = cancel::CancelGuard::reserve(id.as_u64());
     let pg_client = client::get_pool_client(&req.params).await?;
-    let _cancel_guard = cancel::CancelGuard::register(id.as_u64(), &pg_client, req.params.clone());
+    cancel_guard.attach(&pg_client, req.params.clone());
 
     let mut in_flight = Discard::new(pg_client, req.params.clone());
     let pg_client = in_flight.client();
 
     // An early return from here on drops `in_flight` un-released, which
     // discards the connection: it may be inside an open transaction.
-    begin_protected(pg_client).await?;
-    let outcome = run_protected(pg_client, req).await;
+    let baseline = begin_protected_with(pg_client, begin_sql).await?;
+
+    // PostgreSQL discards a cancel that arrives while the backend is idle
+    // between statements, and the protected call's own BEGIN and read-back are
+    // such statements: a cancel landing there must stop the call here.
+    let outcome = if cancel_guard.is_cancelled() {
+        Err(CANCELLED_MESSAGE.to_string())
+    } else {
+        run_protected(pg_client, req).await
+    };
 
     // Always end the transaction, whether the query succeeded or failed. A
     // failed statement leaves it aborted and ROLLBACK is the one command the
     // server still accepts.
-    match pg_client.batch_execute(end_sql).await {
-        Ok(()) => in_flight.release(),
+    let check_session = !req.params.is_transaction_pooler();
+    match end_protected(pg_client, end_sql, &baseline, check_session).await {
+        Ok(true) => {
+            // Deregister before the connection can be handed to anyone else, so
+            // a late `cancel` cannot reach the next borrower's statement.
+            drop(cancel_guard);
+            in_flight.release();
+        }
+        Ok(false) => log::warn!(
+            "PostgreSQL: a read-only query left session state that ROLLBACK does not undo (a prepared statement or an advisory lock), closing the connection"
+        ),
         Err(e) => log::warn!(
-            "PostgreSQL: ROLLBACK after a read-only query failed, closing the connection: {}",
-            client::format_pg_error(&e)
+            "PostgreSQL: ending a read-only query failed, closing the connection: {e}"
         ),
     }
     outcome
 }
+
+/// What the server reports when the call is cancelled before its query ran.
+/// Matches the text of a cancelled statement (SQLSTATE 57014).
+const CANCELLED_MESSAGE: &str = "ERROR: canceling statement due to user request";
 
 async fn run_protected(pg_client: &PgClient, req: &ReadOnlyRequest) -> Result<Value, String> {
     if let Some(schema) = req.schema.as_deref() {
@@ -140,7 +171,13 @@ impl Drop for Discard {
         // server only notices the client is gone when it next writes to it.
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(cancel::run_cancel(client.cancel_token(), self.1.clone()));
+                let (token, params) = (client.cancel_token(), self.1.clone());
+                // The cancel opens a connection of its own, which would
+                // otherwise wait for the OS to give up on an unreachable server.
+                runtime.spawn(async move {
+                    let _ = tokio::time::timeout(CANCEL_TIMEOUT, cancel::run_cancel(token, params))
+                        .await;
+                });
             }
             Err(_) => log::warn!("PostgreSQL: no runtime to send a cancel request from"),
         }
@@ -150,13 +187,54 @@ impl Drop for Discard {
     }
 }
 
+/// How long a discarded connection's cancel request may take.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The statement that opens a protected call's transaction.
 pub(crate) const BEGIN_READ_ONLY: &str = "BEGIN READ ONLY";
+
+/// Counts of what a session holds that `ROLLBACK` does not undo, read inside
+/// the protected transaction and again after it ends. A `PREPARE` (directly,
+/// or from dynamic SQL in a `DO` block or function) survives `ROLLBACK`, and
+/// would be inherited by whoever borrows the connection next; a `DEALLOCATE`
+/// would remove a statement the client library still has cached; a
+/// session-level advisory lock stays held for the life of the connection. A
+/// connection that fails the comparison is closed, which releases all three.
+#[derive(Debug)]
+pub(crate) struct SessionBaseline {
+    sql_prepared: i64,
+    protocol_prepared: i64,
+    advisory_locks: i64,
+}
+
+/// Prepared statements the SQL `PREPARE` command created, and those the client
+/// library created through the wire protocol.
+const SESSION_COUNTS_SQL: &str = "(SELECT count(*) FROM pg_prepared_statements WHERE from_sql), \
+     (SELECT count(*) FROM pg_prepared_statements WHERE NOT from_sql), \
+     (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())";
+
+impl SessionBaseline {
+    fn from_row(first: usize, get: impl Fn(usize) -> Option<i64>) -> Result<Self, String> {
+        let read = |i| get(i).ok_or_else(|| "could not read the session state".to_string());
+        Ok(Self {
+            sql_prepared: read(first)?,
+            protocol_prepared: read(first + 1)?,
+            advisory_locks: read(first + 2)?,
+        })
+    }
+
+    /// Whether a session now at `after` is as clean as it was at `self`.
+    fn is_unchanged_by(&self, after: &SessionBaseline) -> bool {
+        after.sql_prepared <= self.sql_prepared
+            && after.protocol_prepared >= self.protocol_prepared
+            && after.advisory_locks <= self.advisory_locks
+    }
+}
 
 /// Opens a protected call's transaction and confirms, in the database, that
 /// it really is read-only. On any error the caller must treat the connection
 /// as unusable (it may be inside an open transaction) and discard it.
-pub(crate) async fn begin_protected(pg_client: &PgClient) -> Result<(), String> {
+pub(crate) async fn begin_protected(pg_client: &PgClient) -> Result<SessionBaseline, String> {
     begin_protected_with(pg_client, BEGIN_READ_ONLY).await
 }
 
@@ -165,27 +243,58 @@ pub(crate) async fn begin_protected(pg_client: &PgClient) -> Result<(), String> 
 pub(crate) async fn begin_protected_with(
     pg_client: &PgClient,
     begin_sql: &str,
-) -> Result<(), String> {
+) -> Result<SessionBaseline, String> {
     pg_client
         .batch_execute(begin_sql)
         .await
         .map_err(|e| client::format_pg_error(&e))?;
+    let unprotected = |e: String| format!("Read-only protection could not be enabled: {e}");
+    let sql = format!("SELECT current_setting('transaction_read_only'), {SESSION_COUNTS_SQL}");
     let row = pg_client
-        .query_typed_one("SELECT current_setting('transaction_read_only')", &[])
+        .query_typed_one(&sql, &[])
         .await
-        .map_err(|e| {
-            format!(
-                "Read-only protection could not be enabled: {}",
-                client::format_pg_error(&e)
-            )
-        })?;
-    let setting: String = row.try_get(0).map_err(|e| {
-        format!(
-            "Read-only protection could not be enabled: {}",
-            client::format_pg_error(&e)
-        )
-    })?;
-    require_read_only_transaction(&setting)
+        .map_err(|e| unprotected(client::format_pg_error(&e)))?;
+    let setting: String = row
+        .try_get(0)
+        .map_err(|e| unprotected(client::format_pg_error(&e)))?;
+    require_read_only_transaction(&setting)?;
+    SessionBaseline::from_row(1, |i| row.try_get::<_, i64>(i).ok()).map_err(unprotected)
+}
+
+/// Ends a protected call's transaction with `end_sql` (`ROLLBACK`). With
+/// `check_session` it also reads the session state back in the same round
+/// trip, and answers whether the connection is as clean as `baseline`: only
+/// then may it return to the pool. A failure to end the transaction or to read
+/// the state is an `Err`, and the caller discards the connection.
+///
+/// `check_session` is off behind a transaction pooler, where the read could be
+/// served by a different backend than the one that ran the query.
+async fn end_protected(
+    pg_client: &PgClient,
+    end_sql: &str,
+    baseline: &SessionBaseline,
+    check_session: bool,
+) -> Result<bool, String> {
+    if !check_session {
+        pg_client
+            .batch_execute(end_sql)
+            .await
+            .map_err(|e| client::format_pg_error(&e))?;
+        return Ok(true);
+    }
+    let messages = pg_client
+        .simple_query(&format!("{end_sql}; SELECT {SESSION_COUNTS_SQL}"))
+        .await
+        .map_err(|e| client::format_pg_error(&e))?;
+    let row = messages
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .ok_or("the server did not report the session state")?;
+    let after = SessionBaseline::from_row(0, |i| row.get(i).and_then(|v| v.parse().ok()))?;
+    Ok(baseline.is_unchanged_by(&after))
 }
 
 #[derive(Debug)]
@@ -230,13 +339,29 @@ pub(crate) fn parse_request(request: &Value) -> Result<ReadOnlyRequest, String> 
 /// before the call's own `ROLLBACK`, and `BEGIN READ WRITE` is refused by the
 /// server only after it has already ended the protected one. The host refuses
 /// these in read-only mode too; this keeps a direct caller (MCP) honest.
+///
+/// PostgreSQL's read-only mode also lets through a few commands whose effect
+/// is not part of the transaction, so `ROLLBACK` cannot undo it: `PREPARE` and
+/// `DEALLOCATE` change what the connection keeps for the next borrower, `COPY`
+/// can write a server-side file or run a program, and `ANALYZE`, `CLUSTER`,
+/// `REINDEX`, `CHECKPOINT` and `LOAD` write statistics, rewrite storage or load
+/// code. They are refused by name rather than left to a role's privileges.
 pub(crate) fn refuse_transaction_control(query: &str) -> Result<(), String> {
-    match transaction_effect(query) {
-        TransactionEffect::None => Ok(()),
-        _ => Err(
+    if !matches!(transaction_effect(query), TransactionEffect::None) {
+        return Err(
             "Transaction control is not allowed in a read-only query: each read-only query runs in its own transaction"
                 .into(),
-        ),
+        );
+    }
+    let first = leading_keywords(query, 1).into_iter().next();
+    match first.as_deref() {
+        Some(
+            command @ ("PREPARE" | "DEALLOCATE" | "COPY" | "ANALYZE" | "ANALYSE" | "CLUSTER"
+            | "REINDEX" | "CHECKPOINT" | "LOAD"),
+        ) => Err(format!(
+            "{command} is not allowed in a read-only query: PostgreSQL's read-only mode does not stop it from changing state outside the transaction"
+        )),
+        _ => Ok(()),
     }
 }
 

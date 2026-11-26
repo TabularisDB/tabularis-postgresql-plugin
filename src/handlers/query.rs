@@ -737,7 +737,9 @@ fn in_transaction_after_outcome(
 ///    unnamed protocol — #149's pooler-safe path is preserved (#1097 stays
 ///    fixed), and binary `Row` decoding / `extract_value` is unchanged.
 /// 5. A final `DEALLOCATE ALL` clears the statements `prepare` created.
-/// 6. `COMMIT` ends the pin.
+/// 6. `COMMIT` ends the pin (a protected call, `read_only`, opens it with
+///    `BEGIN READ ONLY` plus a read-back and ends it with `ROLLBACK` instead,
+///    so nothing is ever committed).
 ///
 /// The client comes from [`client::oneshot_pool_client`] — a transient pool
 /// not inserted into the global cache. Both the client and its pool drop at
@@ -749,6 +751,8 @@ fn in_transaction_after_outcome(
 /// actionable error, not a 120s host timeout. On any error after `BEGIN` we
 /// best-effort `ROLLBACK` (the one-shot client drop closes the connection
 /// regardless).
+///
+/// `read_only` makes this a protected call (`execute_read_only_query`).
 pub(crate) async fn exec_query_pooled_txn(
     conn_params: &ConnectionParams,
     query: &str,
@@ -815,6 +819,8 @@ async fn pin_pooled_txn(
     // transaction read-only and always ends it with ROLLBACK, so the server
     // refuses any write the statement attempts and nothing is ever committed.
     if read_only {
+        // The one-shot client is closed afterwards, so nothing it leaves in the
+        // session can reach another caller and the baseline is not needed.
         if let Err(e) = crate::handlers::read_only::begin_protected(pg_client).await {
             // May be mid-transaction; the one-shot client closes right after.
             let _ = pg_client.batch_execute("ROLLBACK").await;
@@ -1123,7 +1129,8 @@ fn reads_only(query: &str) -> bool {
             .any(|word| WRITES.iter().any(|w| word.eq_ignore_ascii_case(w)))
 }
 
-/// Execute a query on an existing client (used by both single and batch execution).
+/// Execute a query on an existing client (used by single and batch execution,
+/// and by protected read-only queries inside their own transaction).
 ///
 /// `is_transaction_pooler` selects error-message phrasing (definitive when
 /// the host declared a transaction pooler, conditional when it didn't).
@@ -1748,8 +1755,11 @@ pub(crate) fn leading_keywords(query: &str, n: usize) -> Vec<String> {
         }
         match (c, chars.peek()) {
             ('-', Some('-')) => {
+                // PostgreSQL ends a `--` comment at `\n` or `\r`; stopping only
+                // at `\n` would read a keyword the server treats as code as
+                // part of the comment.
                 for c in chars.by_ref() {
-                    if c == '\n' {
+                    if c == '\n' || c == '\r' {
                         break;
                     }
                 }
@@ -1778,7 +1788,8 @@ fn strip_leading_sql_comments(query: &str) -> &str {
     loop {
         s = s.trim_start();
         if s.starts_with("--") {
-            match s.find('\n') {
+            // `\n` or `\r` ends the comment, as in PostgreSQL's lexer.
+            match s.find(['\n', '\r']) {
                 Some(pos) => s = &s[pos + 1..],
                 None => return "",
             }

@@ -2818,15 +2818,169 @@ async fn run_ro_with(
     }
 }
 
+async fn run_ro_with_id(
+    params: &ConnectionParams,
+    query: &str,
+    request_id: u64,
+) -> Result<serde_json::Value, String> {
+    let response = crate::handlers::read_only::execute_read_only_query(
+        serde_json::json!(request_id),
+        &ro_request(params, query, false),
+    )
+    .await;
+    match response.get("error") {
+        Some(e) => Err(e["message"].as_str().unwrap_or("").to_string()),
+        None => Ok(response["result"].clone()),
+    }
+}
+
 /// A writable pool connection for the same target, for checking side effects.
 async fn writable(params: &ConnectionParams) -> deadpool_postgres::Object {
     crate::client::get_pool_client(params).await.unwrap()
+}
+
+/// A pool of one connection for the shared import target, so that every call
+/// borrows the same backend. Holds the process-wide pool-size lock, and on drop
+/// (also when a test panics) evicts the pools it built and restores the size,
+/// so a failure here cannot leave `poolMaxSize = 1` or a one-connection pool
+/// behind for the tests that follow.
+struct SmallPool {
+    keys: Vec<String>,
+    _size_lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl SmallPool {
+    async fn new() -> Self {
+        let size_lock = crate::settings::test_support::POOL_MAX_SIZE_TEST_LOCK
+            .lock()
+            .await;
+        crate::settings::set_pool_max_size(&serde_json::json!({"poolMaxSize": 1}));
+        let mut pools = POOLS.lock().unwrap();
+        let mut keys = Vec::new();
+        for read_only in [false, true] {
+            let mut p = import_live_params();
+            p.read_only = read_only;
+            let key = connection_key(&p);
+            pools.remove(&key);
+            keys.push(key);
+        }
+        Self {
+            keys,
+            _size_lock: size_lock,
+        }
+    }
+}
+
+impl Drop for SmallPool {
+    fn drop(&mut self) {
+        if let Ok(mut pools) = POOLS.lock() {
+            for key in &self.keys {
+                pools.remove(key);
+            }
+        }
+        crate::settings::set_pool_max_size(&serde_json::Value::Null);
+    }
+}
+
+async fn backend_pid(c: &deadpool_postgres::Object) -> i32 {
+    c.query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A second session that `LISTEN`s on a channel and records what arrives.
+/// `NOTIFY` is allowed in a read-only transaction but is only delivered when
+/// the transaction commits, so a notification reaching this session proves a
+/// protected call committed instead of rolling back, even on a connection that
+/// is closed right afterwards.
+struct Listener {
+    channel: String,
+    received: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    client: tokio_postgres::Client,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Listener {
+    async fn start() -> Self {
+        let params = import_live_params();
+        let (client, mut connection) = tokio_postgres::Config::new()
+            .host(params.host.as_deref().unwrap())
+            .port(params.port.unwrap())
+            .user(params.username.as_deref().unwrap())
+            .password(params.password.as_deref().unwrap())
+            .dbname(params.database.as_deref().unwrap())
+            .connect(tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let task = tokio::spawn(async move {
+            while let Some(Ok(message)) =
+                std::future::poll_fn(|cx| connection.poll_message(cx)).await
+            {
+                if let tokio_postgres::AsyncMessage::Notification(n) = message {
+                    sink.lock().unwrap().push(n.payload().to_string());
+                }
+            }
+        });
+        let channel = format!("ro_chan_{}", uuid::Uuid::new_v4().simple());
+        client
+            .batch_execute(&format!("LISTEN {channel}"))
+            .await
+            .unwrap();
+        Self {
+            channel,
+            received,
+            client,
+            task,
+        }
+    }
+
+    fn notify_sql(&self, payload: &str) -> String {
+        format!("SELECT pg_notify('{}', '{payload}')", self.channel)
+    }
+
+    /// Everything delivered so far, after giving the server time to deliver it.
+    async fn delivered(&self) -> Vec<String> {
+        self.client.simple_query("SELECT 1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        self.client.simple_query("SELECT 1").await.unwrap();
+        self.received.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 struct RoFixture {
     table: String,
     func: String,
     params: ConnectionParams,
+}
+
+impl Drop for RoFixture {
+    /// Removes the fixture's objects even when a test panics before its own
+    /// `cleanup`, from a thread of its own (a destructor cannot `.await`).
+    fn drop(&mut self) {
+        let sql = self.cleanup_sql();
+        let params = self.params.clone();
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                if let Ok(c) = crate::client::oneshot_pool_client(&params).await {
+                    let _ = c.batch_execute(&sql).await;
+                }
+            });
+        })
+        .join();
+    }
 }
 
 impl RoFixture {
@@ -2860,14 +3014,21 @@ impl RoFixture {
             .get(0)
     }
 
+    fn cleanup_sql(&self) -> String {
+        format!(
+            "DROP FUNCTION IF EXISTS {f}(); DROP FUNCTION IF EXISTS {f}_flip();
+             DROP PROCEDURE IF EXISTS {f}_flip_p();
+             DROP TABLE IF EXISTS {t}_new, {t}_copy, {t} CASCADE",
+            f = self.func,
+            t = self.table
+        )
+    }
+
+    /// Kept for the tests that call it at the end; `Drop` does the same work
+    /// when they do not get that far.
     async fn cleanup(&self) {
         let c = writable(&self.params).await;
-        let _ = c
-            .batch_execute(&format!(
-                "DROP FUNCTION IF EXISTS {}(); DROP TABLE IF EXISTS {} CASCADE",
-                self.func, self.table
-            ))
-            .await;
+        let _ = c.batch_execute(&self.cleanup_sql()).await;
     }
 }
 
@@ -2928,17 +3089,10 @@ async fn read_only_query_runs_reads_and_honors_paging() {
 #[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
 async fn a_protected_call_never_leaves_protection_on_a_pooled_connection() {
     let _guard = POOLS_TEST_LOCK.lock().await;
-    let mut params = import_live_params();
     // A pool of one forces every call, protected or not, onto the same backend.
-    crate::settings::set_pool_max_size(&serde_json::json!({"poolMaxSize": 1}));
-    params.read_only = false;
+    let _small = SmallPool::new().await;
     let f = RoFixture::new("leak").await;
-    let before: i32 = writable(&f.params)
-        .await
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let before = backend_pid(&writable(&f.params).await).await;
 
     // Protected success, protected failure, then a writable call on the pool.
     run_ro(&f.params, "SELECT 1").await.unwrap();
@@ -2951,11 +3105,7 @@ async fn a_protected_call_never_leaves_protection_on_a_pooled_connection() {
     run_ro(&f.params, "SELECT 1").await.unwrap();
 
     let c = writable(&f.params).await;
-    let pid: i32 = c
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let pid = backend_pid(&c).await;
     c.batch_execute(&format!("INSERT INTO {} VALUES (8)", f.table))
         .await
         .expect("the next writable call on the same pool must be able to write");
@@ -2965,7 +3115,6 @@ async fn a_protected_call_never_leaves_protection_on_a_pooled_connection() {
         .unwrap()
         .get(0);
     drop(c);
-    crate::settings::set_pool_max_size(&serde_json::Value::Null);
     assert_eq!(pid, before, "the test must have reused the same backend");
     assert_eq!(ro, "off");
     assert_eq!(f.count().await, 4);
@@ -2977,7 +3126,7 @@ async fn a_protected_call_never_leaves_protection_on_a_pooled_connection() {
 async fn a_cancelled_protected_call_does_not_hand_its_transaction_to_the_next_caller() {
     let _guard = POOLS_TEST_LOCK.lock().await;
     let params = import_live_params();
-    crate::settings::set_pool_max_size(&serde_json::json!({"poolMaxSize": 1}));
+    let _small = SmallPool::new().await;
     let f = RoFixture::new("cancel").await;
 
     // Drop the call while the statement is still running, as a host timeout does.
@@ -3005,7 +3154,6 @@ async fn a_cancelled_protected_call_does_not_hand_its_transaction_to_the_next_ca
         .await
         .expect("the next writable call must be able to write");
     drop(c);
-    crate::settings::set_pool_max_size(&serde_json::Value::Null);
     assert_eq!(state.0, "off");
     assert_eq!(state.1, "active");
     f.cleanup().await;
@@ -3016,13 +3164,8 @@ async fn a_cancelled_protected_call_does_not_hand_its_transaction_to_the_next_ca
 async fn a_protected_call_is_rolled_back_so_its_session_settings_do_not_persist() {
     let _guard = POOLS_TEST_LOCK.lock().await;
     let params = import_live_params();
-    crate::settings::set_pool_max_size(&serde_json::json!({"poolMaxSize": 1}));
-    let before: i32 = writable(&params)
-        .await
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let _small = SmallPool::new().await;
+    let before = backend_pid(&writable(&params).await).await;
 
     // A plain `SET` made inside a transaction survives COMMIT but not ROLLBACK.
     run_ro(&params, "SET ro_leak.marker = 'leaked'")
@@ -3039,7 +3182,6 @@ async fn a_protected_call_is_rolled_back_so_its_session_settings_do_not_persist(
         .unwrap();
     let (pid, marker): (i32, Option<String>) = (row.get(0), row.get(1));
     drop(c);
-    crate::settings::set_pool_max_size(&serde_json::Value::Null);
     assert_eq!(pid, before, "the test must have reused the same backend");
     assert!(
         marker.as_deref().unwrap_or("").is_empty(),
@@ -3101,20 +3243,16 @@ async fn an_abandoned_protected_call_stops_its_statement_on_the_server() {
 async fn a_protected_call_whose_rollback_fails_discards_the_connection() {
     let _guard = POOLS_TEST_LOCK.lock().await;
     let params = import_live_params();
-    crate::settings::set_pool_max_size(&serde_json::json!({"poolMaxSize": 1}));
-    let before: i32 = writable(&params)
-        .await
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let _small = SmallPool::new().await;
+    let before = backend_pid(&writable(&params).await).await;
 
     // An ending statement that fails leaves the read-only transaction open.
     let req =
         crate::handlers::read_only::parse_request(&ro_request(&params, "SELECT 1", false)).unwrap();
-    crate::handlers::read_only::exec_on_shared_pool_ending_with(
+    crate::handlers::read_only::exec_on_shared_pool_with(
         &req,
         &serde_json::json!(1),
+        crate::handlers::read_only::BEGIN_READ_ONLY,
         "SELECT 1/0",
     )
     .await
@@ -3130,7 +3268,6 @@ async fn a_protected_call_whose_rollback_fails_discards_the_connection() {
         .unwrap();
     let (pid, ro): (i32, String) = (row.get(0), row.get(1));
     drop(c);
-    crate::settings::set_pool_max_size(&serde_json::Value::Null);
     assert_ne!(pid, before, "the connection was returned mid-transaction");
     assert_eq!(ro, "off");
 }
@@ -3192,6 +3329,442 @@ async fn protected_calls_work_behind_a_transaction_pooler_and_leak_nothing() {
     }
     drop(c);
     assert_eq!(f.count().await, 7);
+    f.cleanup().await;
+}
+
+/// The `\r` that ends a `--` comment in PostgreSQL's lexer once hid a COMMIT
+/// from the transaction-control check (the plugin read the rest of the line as
+/// comment). Each statement must be refused before it reaches the server.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn transaction_control_hidden_behind_a_carriage_return_comment_is_refused() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let f = RoFixture::new("cr").await;
+    for sql in [
+        "-- x\rCOMMIT\nWORK",
+        "-- x\rEND",
+        "--\rROLLBACK",
+        "-- x\rPREPARE\nTRANSACTION 'x'",
+        "/* a */-- x\rCOMMIT",
+    ] {
+        let err = run_ro(&f.params, sql).await.expect_err(sql);
+        assert!(
+            err.contains("Transaction control is not allowed"),
+            "{sql:?}: {err}"
+        );
+    }
+    // The same text with `\n` is an ordinary read, so the refusal is about the
+    // keyword and not about the comment.
+    run_ro(&f.params, "-- x\r\nSELECT 1").await.unwrap();
+    assert_eq!(f.count().await, 3);
+    f.cleanup().await;
+}
+
+/// `PREPARE` survives `ROLLBACK`, so a protected call used to leave a prepared
+/// statement on a pooled connection for the next caller (a name clash, or a
+/// statement the next caller never made).
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_protected_call_cannot_leave_a_prepared_statement_for_the_next_caller() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let _small = SmallPool::new().await;
+    let params = import_live_params();
+    let name = format!("ro_prep_{}", uuid::Uuid::new_v4().simple());
+
+    for sql in [
+        format!("PREPARE {name} AS SELECT 1"),
+        format!("DEALLOCATE {name}"),
+        "DEALLOCATE ALL".to_string(),
+    ] {
+        let err = run_ro(&params, &sql).await.expect_err(&sql);
+        assert!(err.contains("not allowed"), "{sql}: {err}");
+    }
+
+    // Dynamic SQL gets past a keyword check, so the connection is inspected
+    // after the call and closed when it kept the statement.
+    let before = backend_pid(&writable(&params).await).await;
+    run_ro(
+        &params,
+        &format!("DO $$ BEGIN EXECUTE 'PREPARE {name} AS SELECT 1'; END $$"),
+    )
+    .await
+    .unwrap();
+    let c = writable(&params).await;
+    let row = c
+        .query_one(
+            "SELECT pg_backend_pid(), \
+             (SELECT count(*) FROM pg_prepared_statements WHERE name = $1)",
+            &[&name],
+        )
+        .await
+        .unwrap();
+    let (pid, left): (i32, i64) = (row.get(0), row.get(1));
+    assert_eq!(left, 0, "the next caller inherited the prepared statement");
+    assert_ne!(pid, before, "the dirty connection must have been closed");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_protected_call_cannot_leave_a_session_advisory_lock_for_the_next_caller() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let _small = SmallPool::new().await;
+    let params = import_live_params();
+    let key = 7_202_001_i64;
+
+    let before = backend_pid(&writable(&params).await).await;
+    run_ro(&params, &format!("SELECT pg_advisory_lock({key})"))
+        .await
+        .unwrap();
+    let c = writable(&params).await;
+    let row = c
+        .query_one(
+            "SELECT pg_backend_pid(), (SELECT count(*) FROM pg_locks \
+             WHERE locktype = 'advisory' AND pid = pg_backend_pid())",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (pid, held): (i32, i64) = (row.get(0), row.get(1));
+    assert_eq!(held, 0, "the next caller inherited the advisory lock");
+    assert_ne!(pid, before, "the dirty connection must have been closed");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_clean_protected_call_keeps_its_connection_in_the_pool() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let _small = SmallPool::new().await;
+    let params = import_live_params();
+    let before = backend_pid(&writable(&params).await).await;
+    for _ in 0..3 {
+        run_ro(&params, "SELECT 1").await.unwrap();
+        run_ro(&params, "SELECT 1/0").await.unwrap_err();
+    }
+    assert_eq!(
+        backend_pid(&writable(&params).await).await,
+        before,
+        "a clean call must not cost a reconnect"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn commands_that_act_outside_the_transaction_are_refused_before_they_run() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let f = RoFixture::new("outside").await;
+    let file = format!("/tmp/{}.copy", f.table);
+    for sql in [
+        format!("COPY (SELECT 1) TO '{file}'"),
+        "COPY (SELECT 1) TO PROGRAM 'true'".to_string(),
+        format!("ANALYZE {}", f.table),
+        "CHECKPOINT".to_string(),
+        "LOAD 'auto_explain'".to_string(),
+    ] {
+        let err = run_ro(&f.params, &sql).await.expect_err(&sql);
+        assert!(err.contains("not allowed"), "{sql}: {err}");
+    }
+    let c = writable(&f.params).await;
+    let exists: bool = c
+        .query_one("SELECT pg_stat_file($1, true) IS NOT NULL", &[&file])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!exists, "COPY ... TO wrote a server-side file");
+    f.cleanup().await;
+}
+
+/// Page and limit are clamped to `u32::MAX`; both used to overflow the
+/// pagination arithmetic and kill the worker without a reply.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn the_largest_limit_and_page_return_a_result_instead_of_overflowing() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let f = RoFixture::new("huge").await;
+    let query = format!("SELECT id FROM {} ORDER BY id", f.table);
+    for (limit, page, expected) in [
+        (
+            10_000_000_000_u64,
+            1_u64,
+            serde_json::json!([[1], [2], [3]]),
+        ),
+        (u64::from(u32::MAX), 1, serde_json::json!([[1], [2], [3]])),
+        (2, 3_000_000_000, serde_json::json!([])),
+        (100_000, 100_000, serde_json::json!([])),
+        (
+            u64::from(u32::MAX),
+            u64::from(u32::MAX),
+            serde_json::json!([]),
+        ),
+    ] {
+        let mut req = ro_request(&f.params, &query, false);
+        req["limit"] = serde_json::json!(limit);
+        req["page"] = serde_json::json!(page);
+        let response =
+            crate::handlers::read_only::execute_read_only_query(serde_json::json!(3), &req).await;
+        assert!(
+            response.get("error").is_none(),
+            "{limit}/{page}: {response}"
+        );
+        assert_eq!(response["result"]["rows"], expected, "{limit}/{page}");
+    }
+    f.cleanup().await;
+}
+
+/// A protected call that names a schema runs with it on the search path, for
+/// that transaction only.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_protected_call_applies_the_schema_for_its_own_transaction_only() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let _small = SmallPool::new().await;
+    let params = import_live_params();
+    let mut req = ro_request(&params, "SELECT (current_schemas(false))[1]", false);
+    req["schema"] = serde_json::json!("pg_catalog");
+    let first =
+        crate::handlers::read_only::execute_read_only_query(serde_json::json!(4), &req).await;
+    assert_eq!(
+        first["result"]["rows"],
+        serde_json::json!([["pg_catalog"]]),
+        "{first}"
+    );
+
+    let after = run_ro(&params, "SELECT (current_schemas(false))[1]")
+        .await
+        .unwrap();
+    assert_ne!(
+        after["rows"],
+        serde_json::json!([["pg_catalog"]]),
+        "the schema leaked past its transaction"
+    );
+}
+
+/// A failing protected statement reports the database's error, not a notice
+/// about a transaction the user never opened.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_failing_protected_statement_does_not_claim_a_user_transaction_was_rolled_back() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let params = import_live_params();
+    let err = run_ro(&params, "SELECT 1/0").await.unwrap_err();
+    assert!(err.contains("division by zero"), "{err}");
+    assert!(!err.contains("rolled back"), "{err}");
+}
+
+/// PostgreSQL discards a cancel that reaches an idle backend, and a protected
+/// call has idle gaps (waiting for a connection, between its own BEGIN and the
+/// query). A cancel that lands in one has to stop the call before the query
+/// runs. The cancel here arrives while the call waits for the pool's only
+/// connection, which is the one place it is deterministic.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_cancel_that_arrives_before_the_query_stops_the_call() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let _small = SmallPool::new().await;
+    let params = import_live_params();
+    let request_id = 8_202_001_u64;
+
+    let held = writable(&params).await;
+    let call = run_ro_with_id(&params, "SELECT pg_sleep(20)", request_id);
+    let cancel_then_free = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        crate::cancel::cancel(request_id).await;
+        drop(held);
+    };
+    let started = std::time::Instant::now();
+    let (outcome, ()) = tokio::join!(call, cancel_then_free);
+    let err = outcome.expect_err("a cancelled call must not run its query");
+    assert!(err.contains("canceling statement"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the query ran to completion after the cancel"
+    );
+}
+
+/// A transaction that is not read-only must stop the call before its query.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_call_whose_transaction_is_not_read_only_never_runs_its_query() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let f = RoFixture::new("noprot").await;
+    let req = crate::handlers::read_only::parse_request(&ro_request(
+        &f.params,
+        &format!("INSERT INTO {} VALUES (50)", f.table),
+        false,
+    ))
+    .unwrap();
+    let err = crate::handlers::read_only::exec_on_shared_pool_with(
+        &req,
+        &serde_json::json!(1),
+        "BEGIN",
+        "ROLLBACK",
+    )
+    .await
+    .expect_err("a writable transaction must be refused");
+    assert!(err.contains("could not be enabled"), "{err}");
+    assert_eq!(f.count().await, 3, "the query ran without protection");
+    f.cleanup().await;
+}
+
+/// `pooler_mode = "transaction"` alone selects the pooler code path, so it can
+/// be exercised against a direct server in CI. Its protection is the call's own
+/// `BEGIN READ ONLY` on a one-shot connection.
+fn pooler_request(params: &ConnectionParams, query: &str) -> serde_json::Value {
+    let mut req = ro_request(params, query, false);
+    req["params"]["pooler_mode"] = serde_json::json!("transaction");
+    req
+}
+
+async fn run_pooler(params: &ConnectionParams, query: &str) -> Result<serde_json::Value, String> {
+    let response = crate::handlers::read_only::execute_read_only_query(
+        serde_json::json!(1),
+        &pooler_request(params, query),
+    )
+    .await;
+    match response.get("error") {
+        Some(e) => Err(e["message"].as_str().unwrap_or("").to_string()),
+        None => Ok(response["result"].clone()),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn the_transaction_pooler_path_refuses_writes_reads_and_pages() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let f = RoFixture::new("poolpath").await;
+    let t = &f.table;
+    for sql in [
+        format!("WITH w AS (INSERT INTO {t} VALUES (5) RETURNING id) SELECT * FROM w"),
+        format!("SELECT {}()", f.func),
+        format!("DELETE FROM {t} RETURNING id"),
+        format!("UPDATE {t} SET id = id + 1 RETURNING id"),
+    ] {
+        let err = run_pooler(&f.params, &sql).await.expect_err(&sql);
+        assert!(err.contains("read-only transaction"), "{sql}: {err}");
+        assert!(!err.contains("rolled back"), "{sql}: {err}");
+    }
+    assert_eq!(f.count().await, 3, "the pooler path let a write through");
+
+    let mut req = pooler_request(&f.params, &format!("SELECT id FROM {t} ORDER BY id"));
+    req["limit"] = serde_json::json!(2);
+    req["page"] = serde_json::json!(2);
+    let paged =
+        crate::handlers::read_only::execute_read_only_query(serde_json::json!(2), &req).await;
+    assert_eq!(paged["result"]["rows"], serde_json::json!([[3]]), "{paged}");
+
+    let mut req = pooler_request(&f.params, "SELECT (current_schemas(false))[1]");
+    req["schema"] = serde_json::json!("pg_catalog");
+    let scoped =
+        crate::handlers::read_only::execute_read_only_query(serde_json::json!(3), &req).await;
+    assert_eq!(
+        scoped["result"]["rows"],
+        serde_json::json!([["pg_catalog"]]),
+        "{scoped}"
+    );
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn the_transaction_pooler_path_failure_message_is_the_databases_alone() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let params = import_live_params();
+    let err = run_pooler(&params, "SELECT 1/0").await.unwrap_err();
+    assert!(err.contains("division by zero"), "{err}");
+    assert!(!err.contains("rolled back"), "{err}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_protected_call_never_commits_on_either_path() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let params = import_live_params();
+    let listener = Listener::start().await;
+
+    // Control: a plain autocommitted NOTIFY is delivered, so the listener works.
+    writable(&params)
+        .await
+        .batch_execute(&listener.notify_sql("control"))
+        .await
+        .unwrap();
+    assert_eq!(listener.delivered().await, vec!["control"]);
+
+    run_ro(&params, &listener.notify_sql("shared-pool"))
+        .await
+        .unwrap();
+    run_pooler(&params, &listener.notify_sql("pooler-path"))
+        .await
+        .unwrap();
+    assert_eq!(
+        listener.delivered().await,
+        vec!["control"],
+        "a protected call committed: its NOTIFY was delivered"
+    );
+}
+
+/// Needs a PgBouncer in **session** mode in front of the same database:
+/// `PG_PLUGIN_TEST_SESSION_POOLER_PORT=<port>`. Not run in CI. PgBouncer rejects
+/// `-c default_transaction_read_only=on` in the startup packet in every pool
+/// mode, which once made a read-only connection to it impossible to open.
+#[tokio::test]
+#[ignore = "needs a session-mode PgBouncer (PG_PLUGIN_TEST_SESSION_POOLER_PORT)"]
+async fn a_read_only_connection_opens_through_a_session_mode_pooler() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let port: u16 = std::env::var("PG_PLUGIN_TEST_SESSION_POOLER_PORT")
+        .expect("PG_PLUGIN_TEST_SESSION_POOLER_PORT")
+        .parse()
+        .unwrap();
+    let f = RoFixture::new("sesspool").await;
+    for mode in [None, Some("session")] {
+        let mut ro = f.params.clone();
+        ro.port = Some(port);
+        ro.read_only = true;
+        ro.pooler_mode = mode.map(str::to_string);
+        crate::client::test_connection(&ro).await.unwrap();
+        let c = crate::client::get_pool_client(&ro).await.unwrap();
+        let err = c
+            .batch_execute(&format!("INSERT INTO {} VALUES (6)", f.table))
+            .await
+            .unwrap_err();
+        assert!(
+            crate::client::format_pg_error(&err).contains("read-only transaction"),
+            "{mode:?}"
+        );
+    }
+    assert_eq!(f.count().await, 3);
+    f.cleanup().await;
+}
+
+/// A saved read-only connection sends `read_only = true` with every protected
+/// call; that call uses the read-only pool and must behave the same, including
+/// returning its clean connection to that pool.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_protected_call_on_a_read_only_connection_reads_refuses_writes_and_reuses_its_pool() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let _small = SmallPool::new().await;
+    let f = RoFixture::new("ropool").await;
+    let query = format!("SELECT id FROM {} ORDER BY id", f.table);
+    let rows = run_ro_with(&f.params, &query, true).await.unwrap();
+    assert_eq!(rows["rows"], serde_json::json!([[1], [2], [3]]));
+    for sql in [
+        format!("INSERT INTO {} VALUES (4)", f.table),
+        format!("SELECT {}()", f.func),
+    ] {
+        let err = run_ro_with(&f.params, &sql, true).await.expect_err(&sql);
+        assert!(err.contains("read-only transaction"), "{sql}: {err}");
+    }
+    let mut ro = f.params.clone();
+    ro.read_only = true;
+    let first = backend_pid(&crate::client::get_pool_client(&ro).await.unwrap()).await;
+    run_ro_with(&f.params, "SELECT 1", true).await.unwrap();
+    let second = backend_pid(&crate::client::get_pool_client(&ro).await.unwrap()).await;
+    assert_eq!(
+        first, second,
+        "a clean call must return to the read-only pool"
+    );
+    // And it never touched the writable pool's connection.
+    assert_ne!(first, backend_pid(&writable(&f.params).await).await);
+    assert_eq!(f.count().await, 3);
     f.cleanup().await;
 }
 
@@ -3360,4 +3933,79 @@ async fn a_read_only_connection_opens_and_lists_schemas_and_tables() {
         "{tables}"
     );
     f.cleanup().await;
+}
+
+/// The guards exist for the test that fails: a panic must not leave
+/// `poolMaxSize = 1`, a one-connection pool, or the fixture's objects behind.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_failing_test_leaves_no_pool_size_pool_or_fixture_behind() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let params = import_live_params();
+    let key = connection_key(&params);
+    let table = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+    let seen = table.clone();
+    let failed = tokio::spawn(async move {
+        let _small = SmallPool::new().await;
+        let f = RoFixture::new("panic").await;
+        *seen.lock().unwrap() = f.table.clone();
+        let _ = writable(&f.params).await;
+        panic!("a test failing midway");
+    })
+    .await;
+    assert!(failed.is_err(), "the inner test must have panicked");
+
+    assert_eq!(crate::settings::pool_max_size(), 10, "poolMaxSize leaked");
+    assert!(
+        !POOLS.lock().unwrap().contains_key(&key),
+        "the one-connection pool stayed cached"
+    );
+    let name = table.lock().unwrap().clone();
+    let c = writable(&params).await;
+    let left: i64 = c
+        .query_one("SELECT count(*) FROM pg_class WHERE relname = $1", &[&name])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0, "the fixture table {name} was left behind");
+}
+
+/// A pool of read-only connections must never hand out a session that failed to
+/// become read-only: a statement that fails in the hook rejects the connection.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn a_session_that_cannot_be_made_read_only_is_never_handed_out() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let params = import_live_params();
+    let mut pg_config = tokio_postgres::Config::new();
+    pg_config
+        .host(params.host.as_deref().unwrap())
+        .port(params.port.unwrap())
+        .user(params.username.as_deref().unwrap())
+        .password(params.password.as_deref().unwrap())
+        .dbname(params.database.as_deref().unwrap());
+    let manager = deadpool_postgres::Manager::from_config(
+        pg_config,
+        tokio_postgres::NoTls,
+        deadpool_postgres::ManagerConfig {
+            recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+        },
+    );
+    let failing = deadpool_postgres::Pool::builder(manager)
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .post_create(super::read_only_hook("SELECT 1/0"))
+        .build()
+        .unwrap();
+    let err = failing
+        .get()
+        .await
+        .map(|_| ())
+        .expect_err("the connection must be rejected");
+    let message = super::format_pool_error(&err);
+    assert!(
+        message.contains("Read-only protection could not be enabled"),
+        "{message}"
+    );
+    assert!(message.contains("division by zero"), "{message}");
 }

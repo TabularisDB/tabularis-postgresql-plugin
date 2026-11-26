@@ -1835,41 +1835,66 @@ fn the_startup_script_still_splits_a_writable_key() {
 }
 
 #[test]
-fn a_read_only_connection_asks_the_server_for_read_only_sessions() {
+fn a_read_only_connection_makes_every_new_session_read_only() {
     assert_eq!(
-        super::session_options(&read_only_params()),
-        Some("-c default_transaction_read_only=on".to_string())
+        super::read_only_session_sql(&read_only_params()),
+        Some("SET default_transaction_read_only = on")
     );
-    assert_eq!(super::session_options(&params("h", 1, "d", "u")), None);
+    assert_eq!(
+        super::read_only_session_sql(&params("h", 1, "d", "u")),
+        None
+    );
 }
 
 #[test]
-fn a_read_only_connection_behind_a_transaction_pooler_sends_no_startup_option() {
-    // PgBouncer refuses `-c default_transaction_read_only=on` in the startup
-    // packet ("unsupported startup parameter in options"), so sending it would
-    // make the connection impossible to open. A session-level SET would be
-    // worse: the backend is shared, so it could leak read-only mode to another
-    // client. Each protected call opens its own `BEGIN READ ONLY` instead.
+fn read_only_mode_is_a_session_statement_not_a_startup_option() {
+    // PgBouncer rejects `-c default_transaction_read_only=on` in the startup
+    // packet in every pool mode, so the connection could not be opened.
+    let sql = super::read_only_session_sql(&read_only_params()).unwrap();
+    assert!(!sql.contains("-c "), "{sql}");
+}
+
+#[test]
+fn a_read_only_connection_behind_a_transaction_pooler_runs_no_session_statement() {
+    // A session-level SET would land on a backend other clients share, and so
+    // could leak read-only mode to one of them. Each protected call opens its
+    // own `BEGIN READ ONLY` instead.
     let mut p = read_only_params();
     p.pooler_mode = Some("transaction".into());
-    assert_eq!(super::session_options(&p), None);
-    p.pooler_mode = Some("session".into());
-    assert!(super::session_options(&p).is_some());
+    assert_eq!(super::read_only_session_sql(&p), None);
+    for mode in [Some("session"), Some("none"), None] {
+        p.pooler_mode = mode.map(str::to_string);
+        assert!(super::read_only_session_sql(&p).is_some(), "{mode:?}");
+    }
+}
+
+#[test]
+fn a_pool_built_without_the_session_statement_is_never_reused_for_one_that_needs_it() {
+    // Editing only `pooler_mode` on a saved connection changes whether the
+    // pool is protected at the session level, so it must change the key.
+    let direct = read_only_params();
+    let mut pooled = read_only_params();
+    pooled.pooler_mode = Some("transaction".into());
+    assert_ne!(connection_key(&direct), connection_key(&pooled));
+    assert!(connection_key(&pooled).starts_with("read_only+pooler:"));
+    let mut session = read_only_params();
+    session.pooler_mode = Some("session".into());
+    assert_eq!(connection_key(&direct), connection_key(&session));
+}
+
+#[test]
+fn pooler_mode_does_not_split_a_writable_key() {
+    let plain = params("localhost", 5432, "db", "postgres");
+    let mut pooled = plain.clone();
+    pooled.pooler_mode = Some("transaction".into());
+    assert_eq!(connection_key(&plain), connection_key(&pooled));
 }
 
 #[cfg(unix)]
 #[test]
-fn a_read_only_socket_connection_asks_for_read_only_sessions_too() {
+fn a_read_only_socket_connection_sends_no_startup_option() {
     let mut p = read_only_params();
     p.unix_socket_path = Some("/var/run/postgresql/.s.PGSQL.5432".into());
     let config = super::build_socket_pg_config(&p, "/var/run/postgresql/.s.PGSQL.5432");
-    assert_eq!(
-        config.get_options(),
-        Some("-c default_transaction_read_only=on")
-    );
-    let writable = super::build_socket_pg_config(
-        &params("h", 1, "d", "u"),
-        "/var/run/postgresql/.s.PGSQL.5432",
-    );
-    assert_eq!(writable.get_options(), None);
+    assert_eq!(config.get_options(), None);
 }

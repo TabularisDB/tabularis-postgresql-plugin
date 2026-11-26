@@ -262,31 +262,56 @@ for a read-only connection and for MCP queries on a writable one. The request
 and response match `execute_query` (`query`, `limit`, `page`, `schema`), and the
 host never falls back to `execute_query`.
 
-Protection is enforced by PostgreSQL, not by inspecting the SQL. Each call runs
-as `BEGIN READ ONLY`, the query, then `ROLLBACK`, and it reads
+Each call runs as `BEGIN READ ONLY`, the query, then `ROLLBACK`, and reads
 `transaction_read_only` back to confirm the server really entered a read-only
 transaction; if it did not, the query is not run. `INSERT`, `UPDATE`, `DELETE`,
 DDL and a function call that writes all fail in the database and change
 nothing. A function or `DO` block cannot switch the transaction back to
 writable, because `SET TRANSACTION READ WRITE` is only accepted before the first
-query of a transaction. A query that opens or ends a transaction (`BEGIN`, `COMMIT`, `ROLLBACK`) is
-refused, since the call owns its transaction. PostgreSQL's read-only mode also
-rejects `nextval()` and temporary tables, but it does allow session-level
-advisory locks (`pg_advisory_lock`), which `ROLLBACK` does not release.
+query of a transaction. A query that opens or ends a transaction (`BEGIN`,
+`COMMIT`, `ROLLBACK`, `PREPARE TRANSACTION`) is refused, since the call owns its
+transaction. PostgreSQL's read-only mode also rejects `nextval()` and temporary
+tables.
 
-The connection goes back to the pool only after `ROLLBACK` succeeded. If the
-`ROLLBACK` fails, or the call is cancelled or dropped part-way, the connection is
-detached, the statement still running on it is cancelled, and the socket is
-closed, so the next caller never inherits a read-only or half-finished session.
+A read-only transaction does not cover everything, so the plugin refuses a few
+commands by name and checks the connection afterwards. `PREPARE` and
+`DEALLOCATE` are refused, because they change what the connection keeps for the
+next caller. `COPY` is refused, because `COPY ... TO` can write a server-side
+file or run a program. `ANALYZE`, `CLUSTER`, `REINDEX`, `CHECKPOINT` and `LOAD`
+are refused because they write statistics, rewrite storage or load code. Dynamic
+SQL (a `DO` block, a function) can still create a prepared statement or take a
+session-level advisory lock, so after the call the plugin reads both back and
+closes the connection instead of pooling it when either remains.
+
+PostgreSQL's read-only mode is still bounded by the connecting role. Functions
+that act outside the transaction, such as `pg_create_physical_replication_slot`,
+`pg_logical_emit_message` or `pg_switch_wal`, are allowed in it, and `dblink`
+(where installed) opens a separate session that is not read-only. Connect with
+a role that has only the privileges a read-only user should have.
+
+The connection goes back to the pool only after `ROLLBACK` succeeded and the
+session is as clean as it was. If the `ROLLBACK` fails, or the call is
+cancelled or dropped part-way, the connection is detached, the statement still
+running on it is cancelled, and the socket is closed, so the next caller never
+inherits a read-only or half-finished session. A `cancel` that arrives while the
+call is still connecting, or between its own `BEGIN` and the query, stops the
+call before the query runs.
 
 A connection saved with `read_only = true` gets its own pool (keyed apart from
-the writable one) whose sessions also start with `default_transaction_read_only=on`,
-so its connection test and metadata discovery cannot write either. The host
+the writable one) whose new sessions run `SET default_transaction_read_only = on`
+before they are handed out, so its connection test and metadata discovery
+cannot write either. It is a statement and not a startup option, because
+PgBouncer rejects that option in the startup packet in every pool mode. The host
 leaves out the saved `startup_script` for such a connection, and the plugin
-never runs one for it. Behind a transaction pooler (`pooler_mode = transaction`)
-the session option is not sent, because PgBouncer rejects it as a startup
-parameter; the per-call `BEGIN READ ONLY` is the protection there, on a
-dedicated connection that is closed afterwards.
+never runs one for it.
+
+Behind a transaction pooler (`pooler_mode = transaction`) the statement is not
+run, because a session-level `SET` would land on a backend other clients share,
+and the pool is keyed apart again so editing `pooler_mode` never reuses the
+wrong pool. The per-call `BEGIN READ ONLY` is the protection there: a query that
+returns rows runs on a dedicated connection that is closed afterwards, and any
+other statement runs on the shared pool, where `BEGIN` pins the backend for the
+call.
 
 ## Building from Source
 
