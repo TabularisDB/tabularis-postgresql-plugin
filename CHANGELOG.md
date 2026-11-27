@@ -25,7 +25,10 @@
   metadata discovery cannot write. It is a statement and not a startup option,
   because PgBouncer rejects the option in every pool mode. Behind a transaction
   pooler the statement is not run and the per-call transaction protects there;
-  `pooler_mode` is part of such a pool's key.
+  `pooler_mode` is part of such a pool's key. There a closed client connection
+  does not close the server backend, so a call also releases the session-level
+  advisory locks and `PREPARE`d statements it created in the same message as its
+  `ROLLBACK`, which a real PgBouncer test confirms.
 - `import_database_sql` (#201): imports a `.sql` file in a single transaction on
   a dedicated connection, so a failing statement rolls the whole import back
   instead of leaving the database half-imported. Applies the built-in driver's

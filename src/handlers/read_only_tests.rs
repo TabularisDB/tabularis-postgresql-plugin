@@ -237,3 +237,54 @@ fn a_limit_or_page_of_the_wrong_type_is_treated_as_absent() {
     let r = parse_request(&req(json!({"limit": "100", "page": -3}))).unwrap();
     assert_eq!((r.limit, r.page), (None, 1));
 }
+
+#[test]
+fn behind_a_pooler_the_call_undoes_only_the_session_state_it_created() {
+    let clean = rollback_and_clean_sql("ROLLBACK", &baseline(0, 2, 0));
+    assert!(clean.starts_with("ROLLBACK;"), "{clean}");
+    assert!(clean.contains("pg_advisory_unlock_all()"), "{clean}");
+    assert!(clean.contains("DEALLOCATE"), "{clean}");
+    assert!(clean.contains("from_sql"), "{clean}");
+    // Only SQL-level statements: the client library's own are not `from_sql`.
+    assert!(!clean.contains("DEALLOCATE ALL"), "{clean}");
+}
+
+#[test]
+fn state_the_session_already_held_is_not_released_by_the_call() {
+    let held_lock = rollback_and_clean_sql("ROLLBACK", &baseline(0, 2, 1));
+    assert!(!held_lock.contains("pg_advisory_unlock_all"), "{held_lock}");
+    assert!(held_lock.contains("DEALLOCATE"), "{held_lock}");
+    let held_statement = rollback_and_clean_sql("ROLLBACK", &baseline(1, 2, 0));
+    assert!(!held_statement.contains("DEALLOCATE"), "{held_statement}");
+    assert!(
+        held_statement.contains("pg_advisory_unlock_all"),
+        "{held_statement}"
+    );
+    let both = rollback_and_clean_sql("ROLLBACK", &baseline(3, 2, 1));
+    assert_eq!(both, "ROLLBACK");
+}
+
+#[tokio::test]
+async fn a_cancel_request_that_never_completes_is_given_up_on() {
+    // A server that is down makes the cancel's own connect wait on the OS.
+    // The outer timeout makes an unbounded wait fail here instead of hanging.
+    let finished = tokio::time::timeout(
+        Duration::from_secs(2),
+        bounded(Duration::from_millis(50), std::future::pending::<()>()),
+    )
+    .await
+    .expect("bounded() must give up on its own");
+    assert!(!finished);
+}
+
+#[tokio::test]
+async fn a_cancel_request_that_finishes_in_time_is_not_cut_short() {
+    let quick = tokio::time::sleep(Duration::from_millis(10));
+    assert!(bounded(Duration::from_secs(5), quick).await);
+}
+
+#[test]
+fn the_cancel_bound_is_short_enough_not_to_pile_up_tasks() {
+    assert!(CANCEL_TIMEOUT <= Duration::from_secs(10));
+    assert!(CANCEL_TIMEOUT >= Duration::from_secs(1));
+}

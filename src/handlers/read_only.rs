@@ -102,12 +102,7 @@ pub(crate) async fn exec_on_shared_pool_with(
     // server still accepts.
     let check_session = !req.params.is_transaction_pooler();
     match end_protected(pg_client, end_sql, &baseline, check_session).await {
-        Ok(true) => {
-            // Deregister before the connection can be handed to anyone else, so
-            // a late `cancel` cannot reach the next borrower's statement.
-            drop(cancel_guard);
-            in_flight.release();
-        }
+        Ok(true) => in_flight.release(cancel_guard),
         Ok(false) => log::warn!(
             "PostgreSQL: a read-only query left session state that ROLLBACK does not undo (a prepared statement or an advisory lock), closing the connection"
         ),
@@ -158,8 +153,12 @@ impl Discard {
             .expect("the connection is held until release")
     }
 
-    /// Hand the connection back to the pool.
-    fn release(&mut self) {
+    /// Hand the connection back to the pool. Takes the call's cancel guard and
+    /// drops it first, so a late `cancel` for this request finds nothing
+    /// registered and cannot reach the statement of whoever borrows the
+    /// connection next. The order cannot be reversed by a caller.
+    fn release(&mut self, cancel_guard: cancel::CancelGuard) {
+        drop(cancel_guard);
         self.0 = None;
     }
 }
@@ -174,10 +173,7 @@ impl Drop for Discard {
                 let (token, params) = (client.cancel_token(), self.1.clone());
                 // The cancel opens a connection of its own, which would
                 // otherwise wait for the OS to give up on an unreachable server.
-                runtime.spawn(async move {
-                    let _ = tokio::time::timeout(CANCEL_TIMEOUT, cancel::run_cancel(token, params))
-                        .await;
-                });
+                runtime.spawn(bounded(CANCEL_TIMEOUT, cancel::run_cancel(token, params)));
             }
             Err(_) => log::warn!("PostgreSQL: no runtime to send a cancel request from"),
         }
@@ -189,6 +185,11 @@ impl Drop for Discard {
 
 /// How long a discarded connection's cancel request may take.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `work` for at most `limit`. Answers whether it finished in time.
+pub(crate) async fn bounded(limit: Duration, work: impl std::future::Future<Output = ()>) -> bool {
+    tokio::time::timeout(limit, work).await.is_ok()
+}
 
 /// The statement that opens a protected call's transaction.
 pub(crate) const BEGIN_READ_ONLY: &str = "BEGIN READ ONLY";
@@ -261,14 +262,39 @@ pub(crate) async fn begin_protected_with(
     SessionBaseline::from_row(1, |i| row.try_get::<_, i64>(i).ok()).map_err(unprotected)
 }
 
+/// The statements that end a protected call behind a transaction pooler.
+///
+/// A closed client connection does not close the server backend there, so a
+/// session-level advisory lock or a `PREPARE` the call created would stay on a
+/// backend other clients share. They are undone in the same message as the
+/// `ROLLBACK`, which the pooler keeps on one backend until it finishes. Only
+/// what the call can have created is released: when the session already held a
+/// lock or a statement at the start, it cannot be told apart from the call's
+/// own, so that kind is left alone.
+pub(crate) fn rollback_and_clean_sql(end_sql: &str, baseline: &SessionBaseline) -> String {
+    let mut sql = end_sql.to_string();
+    if baseline.advisory_locks == 0 {
+        sql.push_str("; SELECT pg_advisory_unlock_all()");
+    }
+    if baseline.sql_prepared == 0 {
+        sql.push_str(
+            "; DO $ro$ DECLARE r record; BEGIN \
+             FOR r IN SELECT name FROM pg_prepared_statements WHERE from_sql LOOP \
+             EXECUTE 'DEALLOCATE ' || quote_ident(r.name); END LOOP; END $ro$",
+        );
+    }
+    sql
+}
+
 /// Ends a protected call's transaction with `end_sql` (`ROLLBACK`). With
 /// `check_session` it also reads the session state back in the same round
 /// trip, and answers whether the connection is as clean as `baseline`: only
 /// then may it return to the pool. A failure to end the transaction or to read
 /// the state is an `Err`, and the caller discards the connection.
 ///
-/// `check_session` is off behind a transaction pooler, where the read could be
-/// served by a different backend than the one that ran the query.
+/// Without `check_session` (behind a transaction pooler, where the read could
+/// be served by a different backend) the call's own session state is undone
+/// instead, by [`rollback_and_clean_sql`].
 async fn end_protected(
     pg_client: &PgClient,
     end_sql: &str,
@@ -277,7 +303,7 @@ async fn end_protected(
 ) -> Result<bool, String> {
     if !check_session {
         pg_client
-            .batch_execute(end_sql)
+            .batch_execute(&rollback_and_clean_sql(end_sql, baseline))
             .await
             .map_err(|e| client::format_pg_error(&e))?;
         return Ok(true);

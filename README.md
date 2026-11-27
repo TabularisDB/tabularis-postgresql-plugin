@@ -311,7 +311,9 @@ and the pool is keyed apart again so editing `pooler_mode` never reuses the
 wrong pool. The per-call `BEGIN READ ONLY` is the protection there: a query that
 returns rows runs on a dedicated connection that is closed afterwards, and any
 other statement runs on the shared pool, where `BEGIN` pins the backend for the
-call.
+call. A closed connection does not close the backend behind a pooler, so the call
+releases the session-level advisory locks and `PREPARE`d statements it created in
+the same message as its `ROLLBACK`.
 
 ## Building from Source
 
@@ -358,6 +360,23 @@ just demo-db-stop
 just test    # cargo test — unit tests for SQL builders, parsing, RPC
 just lint    # clippy -D warnings
 just fmt     # cargo fmt --all
+```
+
+#### Live tests
+
+CI runs the live tests against one plain PostgreSQL on `127.0.0.1:54320`. The
+ones that need TLS, mutual TLS, PgBouncer (transaction and session mode) or a
+Unix socket live in `client_live_tests::podman` and are skipped there.
+`tests/podman/env.sh` starts what they need (podman containers named `ro-*`,
+plus a native PostgreSQL for the socket, because a container's socket does not
+cross the podman VM on macOS) and prints the environment variables to export:
+
+```bash
+tests/podman/env.sh up                       # needs podman, openssl, psql, postgresql@16
+eval "$(tests/podman/env.sh env)"
+PG_PLUGIN_TEST_HOST=127.0.0.1 PG_PLUGIN_TEST_PORT=54320 \
+  cargo test --lib client_live_tests -- --ignored --test-threads=1
+tests/podman/env.sh down
 ```
 
 ### Manual JSON-RPC test via shell

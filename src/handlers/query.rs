@@ -818,25 +818,41 @@ async fn pin_pooled_txn(
     // Pin the backend for the whole sequence. A protected call opens the
     // transaction read-only and always ends it with ROLLBACK, so the server
     // refuses any write the statement attempts and nothing is ever committed.
-    if read_only {
-        // The one-shot client is closed afterwards, so nothing it leaves in the
-        // session can reach another caller and the baseline is not needed.
-        if let Err(e) = crate::handlers::read_only::begin_protected(pg_client).await {
-            // May be mid-transaction; the one-shot client closes right after.
-            let _ = pg_client.batch_execute("ROLLBACK").await;
-            return Err(e);
+    let baseline = if read_only {
+        match crate::handlers::read_only::begin_protected(pg_client).await {
+            Ok(baseline) => Some(baseline),
+            Err(e) => {
+                // May be mid-transaction; the one-shot client closes right after.
+                let _ = pg_client.batch_execute("ROLLBACK").await;
+                return Err(e);
+            }
         }
     } else if let Err(e) = pg_client.batch_execute("BEGIN").await {
         return Err(client::format_pg_error(&e));
-    }
+    } else {
+        None
+    };
 
     let result = run_pinned_body(pg_client, query, limit, page, schema).await;
 
+    // The one-shot client closes right after, but behind a pooler that does not
+    // close the backend: end the call and undo the session state it created in
+    // one message, so both happen on the backend that ran it.
+    let end_protected_call = || async {
+        match &baseline {
+            Some(baseline) => {
+                let sql = crate::handlers::read_only::rollback_and_clean_sql("ROLLBACK", baseline);
+                let _ = pg_client.batch_execute(&sql).await;
+            }
+            None => {
+                let _ = pg_client.batch_execute("ROLLBACK").await;
+            }
+        }
+    };
+
     match result {
         Ok(value) if read_only => {
-            // The one-shot client closes right after this, so a failed
-            // ROLLBACK only means the server ends the transaction itself.
-            let _ = pg_client.batch_execute("ROLLBACK").await;
+            end_protected_call().await;
             Ok(value)
         }
         Ok(value) => {
@@ -848,7 +864,7 @@ async fn pin_pooled_txn(
         Err(e) => {
             // best-effort rollback; the one-shot client drops and closes
             // regardless, so the server aborts the txn even if this fails.
-            let _ = pg_client.batch_execute("ROLLBACK").await;
+            end_protected_call().await;
             Err(e)
         }
     }
