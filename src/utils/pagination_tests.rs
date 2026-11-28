@@ -127,3 +127,141 @@ fn a_user_offset_added_to_a_page_offset_stays_within_a_bigint() {
     let sql = build_paginated_query("SELECT * FROM t OFFSET 9223372036854775807", 10, 2);
     assert_eq!(sql, "SELECT * FROM t LIMIT 11 OFFSET 9223372036854775807");
 }
+
+// Issue #204: the clause used to be appended inside a trailing `--` comment,
+// where PostgreSQL ignores it and every page returns the same rows.
+
+#[test]
+fn a_trailing_line_comment_does_not_swallow_the_page_clause() {
+    let sql = build_paginated_query("SELECT g FROM t ORDER BY g -- export", 1000, 2);
+    assert_eq!(
+        sql,
+        "SELECT g FROM t ORDER BY g LIMIT 1001 OFFSET 1000 -- export"
+    );
+}
+
+#[test]
+fn a_comment_on_its_own_trailing_line_is_kept_after_the_clause() {
+    let sql = build_paginated_query("SELECT g FROM t ORDER BY g\n-- export", 1000, 2);
+    assert_eq!(
+        sql,
+        "SELECT g FROM t ORDER BY g LIMIT 1001 OFFSET 1000 -- export"
+    );
+}
+
+#[test]
+fn a_trailing_block_comment_is_kept_after_the_clause() {
+    let sql = build_paginated_query(
+        "SELECT g FROM t ORDER BY g /* export /* nested */ */",
+        10,
+        1,
+    );
+    assert_eq!(
+        sql,
+        "SELECT g FROM t ORDER BY g LIMIT 11 OFFSET 0 /* export /* nested */ */"
+    );
+}
+
+#[test]
+fn a_comment_marker_inside_a_string_or_identifier_is_not_a_comment() {
+    for (query, expected) in [
+        (
+            "SELECT '--' AS a FROM t",
+            "SELECT '--' AS a FROM t LIMIT 11 OFFSET 0",
+        ),
+        (
+            "SELECT '/*' AS a FROM t",
+            "SELECT '/*' AS a FROM t LIMIT 11 OFFSET 0",
+        ),
+        (
+            "SELECT \"a--b\" FROM t",
+            "SELECT \"a--b\" FROM t LIMIT 11 OFFSET 0",
+        ),
+        (
+            "SELECT $$ -- x $$ FROM t",
+            "SELECT $$ -- x $$ FROM t LIMIT 11 OFFSET 0",
+        ),
+        (
+            "SELECT $q$ ' -- $q$ FROM t",
+            "SELECT $q$ ' -- $q$ FROM t LIMIT 11 OFFSET 0",
+        ),
+        // A backslash escapes the quote only in an `E'..'` string.
+        (
+            "SELECT E'it\\'s -- x' FROM t",
+            "SELECT E'it\\'s -- x' FROM t LIMIT 11 OFFSET 0",
+        ),
+        (
+            "SELECT 'a\\' FROM t -- c",
+            "SELECT 'a\\' FROM t LIMIT 11 OFFSET 0 -- c",
+        ),
+    ] {
+        assert_eq!(build_paginated_query(query, 10, 1), expected, "{query}");
+    }
+}
+
+#[test]
+fn a_user_limit_and_offset_are_found_through_trailing_comments() {
+    let sql = build_paginated_query("SELECT * FROM t LIMIT 5 OFFSET 3 -- keep it small", 100, 1);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 5 OFFSET 3 -- keep it small");
+    let sql = build_paginated_query("SELECT * FROM t LIMIT 5 /* a */ -- b", 100, 1);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 5 OFFSET 0 /* a */\n-- b");
+    // The user's limit still caps the rows across pages.
+    let sql = build_paginated_query("SELECT * FROM t LIMIT 15 -- cap", 10, 2);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 5 OFFSET 10 -- cap");
+}
+
+#[test]
+fn a_comment_before_a_stripped_clause_does_not_swallow_the_page_clause() {
+    let sql = build_paginated_query("SELECT * FROM t -- note\nLIMIT 5", 10, 1);
+    assert_eq!(sql, "SELECT * FROM t -- note\nLIMIT 5 OFFSET 0");
+    let sql = build_paginated_query("SELECT * FROM t -- a\nLIMIT 5 OFFSET 2 -- b", 10, 1);
+    assert_eq!(sql, "SELECT * FROM t -- a\nLIMIT 5 OFFSET 2 -- b");
+}
+
+#[test]
+fn a_carriage_return_ends_a_line_comment() {
+    let sql = build_paginated_query("SELECT 1 -- a\rLIMIT 5", 10, 1);
+    assert_eq!(sql, "SELECT 1 -- a\nLIMIT 5 OFFSET 0");
+}
+
+#[test]
+fn limit_and_offset_inside_a_comment_or_string_are_not_the_users() {
+    let sql = build_paginated_query("SELECT 1 -- LIMIT 5", 10, 1);
+    assert_eq!(sql, "SELECT 1 LIMIT 11 OFFSET 0 -- LIMIT 5");
+    let sql = build_paginated_query("SELECT 'x LIMIT 5'", 10, 1);
+    assert_eq!(sql, "SELECT 'x LIMIT 5' LIMIT 11 OFFSET 0");
+    let sql = build_paginated_query("SELECT \"limit\" FROM t", 10, 1);
+    assert_eq!(sql, "SELECT \"limit\" FROM t LIMIT 11 OFFSET 0");
+}
+
+#[test]
+fn trailing_semicolons_and_unterminated_constructs_are_handled() {
+    assert_eq!(
+        build_paginated_query("SELECT 1; -- done", 10, 1),
+        "SELECT 1 LIMIT 11 OFFSET 0 -- done"
+    );
+    assert_eq!(
+        build_paginated_query("SELECT 1;;", 10, 1),
+        "SELECT 1 LIMIT 11 OFFSET 0"
+    );
+    // An unterminated block comment stays unterminated, so the server reports it.
+    assert_eq!(
+        build_paginated_query("SELECT 1 /* oops", 10, 1),
+        "SELECT 1 LIMIT 11 OFFSET 0 /* oops"
+    );
+}
+
+#[test]
+fn limit_and_offset_are_matched_in_any_case() {
+    let sql = build_paginated_query("select * from t limit 5 offset 3", 100, 1);
+    assert_eq!(sql, "select * from t LIMIT 5 OFFSET 3");
+    let sql = build_paginated_query("SELECT * FROM t Limit 15", 10, 2);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 5 OFFSET 10");
+}
+
+#[test]
+fn a_dollar_tag_cannot_start_with_a_digit() {
+    // `$1$` is not a dollar quote, so the `--` after it is a real comment.
+    let sql = build_paginated_query("SELECT $1$ -- x $1$ y", 10, 1);
+    assert_eq!(sql, "SELECT $1$ LIMIT 11 OFFSET 0 -- x $1$ y");
+}

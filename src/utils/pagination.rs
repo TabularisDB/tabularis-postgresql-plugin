@@ -6,12 +6,16 @@
 //! the plugin's own pagination clause. ORDER BY is left in place (not wrapped
 //! in a subquery) so table-qualified column references stay valid.
 //!
-//! This is a simpler whitespace/token scan than the builtin's full quote- and
-//! comment-aware tokenizer — it correctly handles the common case (a plain
-//! trailing `LIMIT n` / `LIMIT n OFFSET m`) but does not defend against SQL
-//! comments after the clause or identifiers that literally are `LIMIT`/`OFFSET`
-//! tokens inside quotes. Sufficient for the current parity test corpus;
-//! revisit if a query pattern breaks this.
+//! The query is read by a small lexer that knows `--` and (nested) `/* */`
+//! comments, `'..'` and `E'..'` strings, `".."` identifiers and dollar-quoted
+//! bodies. One scan drives the strip, both extractions and the append, so a
+//! trailing comment never hides the user's own `LIMIT`/`OFFSET` and the paging
+//! clause is never appended inside a `--` comment (where PostgreSQL would
+//! ignore it and every page would return the same rows).
+//!
+//! A plain `'..'` string is read with a literal backslash, which is
+//! PostgreSQL's default (`standard_conforming_strings = on`). With it off, a
+//! `\'` inside a plain string would be misread.
 
 const MAX_OFFSET: u64 = i64::MAX as u64;
 
@@ -28,91 +32,225 @@ pub fn limit_offset(page: u32, page_size: u32) -> (u64, u64) {
     (u64::from(page_size), offset)
 }
 
-/// Split a query into whitespace-separated tokens, tracking each token's
-/// starting byte offset in the original string.
-fn tokenize_with_pos(sql: &str) -> Vec<(&str, usize)> {
-    let mut tokens = Vec::new();
-    let mut idx = 0;
-    for part in sql.split_whitespace() {
-        // Find this token's actual position (split_whitespace doesn't give us
-        // offsets directly).
-        let start = sql[idx..].find(part).map(|p| idx + p).unwrap_or(idx);
-        idx = start + part.len();
-        tokens.push((part, start));
-    }
-    tokens
+/// What a lexed piece of the query is. Whitespace is skipped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A run of letters, digits and `_`: a keyword, an unquoted name or a number.
+    Word,
+    Semicolon,
+    LineComment,
+    BlockComment,
+    /// Punctuation, a string, a quoted identifier or a dollar-quoted body.
+    Other,
 }
 
-/// Strip a trailing `LIMIT <n>` and/or `OFFSET <n>` clause from the query,
-/// returning the query text with that clause removed.
-fn strip_limit_offset(query: &str) -> String {
-    let trimmed = query.trim_end().trim_end_matches(';').trim_end();
-    let tokens = tokenize_with_pos(trimmed);
-    let mut end = tokens.len();
-
-    if end >= 2
-        && tokens[end - 2].0.to_uppercase() == "OFFSET"
-        && tokens[end - 1].0.parse::<u64>().is_ok()
-    {
-        end -= 2;
-    }
-
-    if end >= 2
-        && tokens[end - 2].0.to_uppercase() == "LIMIT"
-        && tokens[end - 1].0.parse::<u64>().is_ok()
-    {
-        end -= 2;
-    }
-
-    if end == tokens.len() {
-        return trimmed.to_string();
-    }
-
-    trimmed[..tokens[end].1].trim_end().to_string()
+struct Tok {
+    kind: Kind,
+    start: usize,
+    end: usize,
 }
 
-/// Extract the numeric value from a trailing `LIMIT` clause, if present.
-fn extract_user_limit(query: &str) -> Option<u64> {
-    let trimmed = query.trim_end().trim_end_matches(';').trim_end();
-    let tokens = tokenize_with_pos(trimmed);
-    let len = tokens.len();
-
-    let mut end = len;
-    if end >= 2
-        && tokens[end - 2].0.to_uppercase() == "OFFSET"
-        && tokens[end - 1].0.parse::<u64>().is_ok()
-    {
-        end -= 2;
-    }
-
-    if end >= 2 && tokens[end - 2].0.to_uppercase() == "LIMIT" {
-        return tokens[end - 1].0.parse().ok();
-    }
-
-    None
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
-/// Extract the numeric value from a trailing `OFFSET` clause, if present.
-fn extract_user_offset(query: &str) -> Option<u64> {
-    let trimmed = query.trim_end().trim_end_matches(';').trim_end();
-    let tokens = tokenize_with_pos(trimmed);
-    let end = tokens.len();
+/// Splits `sql` into tokens with their byte spans. Anything unterminated (a
+/// string, a quoted identifier, a block comment) runs to the end of the text.
+fn lex(sql: &str) -> Vec<Tok> {
+    let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    let at = |i: usize| chars.get(i).map(|&(_, c)| c);
+    let offset = |i: usize| chars.get(i).map_or(sql.len(), |&(o, _)| o);
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let (start_offset, c) = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let kind = if c == '-' && at(i + 1) == Some('-') {
+            // PostgreSQL ends a `--` comment at `\n` or `\r`.
+            while at(i).is_some_and(|c| c != '\n' && c != '\r') {
+                i += 1;
+            }
+            Kind::LineComment
+        } else if c == '/' && at(i + 1) == Some('*') {
+            let mut depth = 1;
+            i += 2;
+            while i < chars.len() && depth > 0 {
+                match (chars[i].1, at(i + 1)) {
+                    ('*', Some('/')) => {
+                        depth -= 1;
+                        i += 2;
+                    }
+                    ('/', Some('*')) => {
+                        depth += 1;
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            i = i.min(chars.len());
+            Kind::BlockComment
+        } else if is_word_char(c) {
+            while at(i).is_some_and(is_word_char) {
+                i += 1;
+            }
+            Kind::Word
+        } else if c == '\'' || c == '"' {
+            // `E'..'` (an `e`/`E` that is not the tail of a longer name) lets a
+            // backslash escape the next character.
+            let escapes = c == '\''
+                && start > 0
+                && matches!(chars[start - 1].1, 'e' | 'E')
+                && !(start > 1 && is_word_char(chars[start - 2].1));
+            i += 1;
+            while i < chars.len() {
+                if escapes && chars[i].1 == '\\' {
+                    i += 2;
+                } else if chars[i].1 == c {
+                    if at(i + 1) == Some(c) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            i = i.min(chars.len());
+            Kind::Other
+        } else if c == '$'
+            && !(start > 0 && (is_word_char(chars[start - 1].1) || chars[start - 1].1 == '$'))
+        {
+            let mut end = i + 1;
+            while at(end).is_some_and(is_word_char) {
+                end += 1;
+            }
+            let tag_ok = at(end) == Some('$') && !at(i + 1).is_some_and(|c| c.is_ascii_digit());
+            if tag_ok {
+                let tag: Vec<char> = chars[i..=end].iter().map(|&(_, c)| c).collect();
+                i = end + 1;
+                while i < chars.len()
+                    && !chars[i..]
+                        .iter()
+                        .map(|&(_, c)| c)
+                        .take(tag.len())
+                        .eq(tag.iter().copied())
+                {
+                    i += 1;
+                }
+                i = (i + tag.len()).min(chars.len());
+            } else {
+                i += 1;
+            }
+            Kind::Other
+        } else if c == ';' {
+            i += 1;
+            Kind::Semicolon
+        } else {
+            i += 1;
+            Kind::Other
+        };
+        toks.push(Tok {
+            kind,
+            start: start_offset,
+            end: offset(i),
+        });
+    }
+    toks
+}
 
-    if end >= 2 && tokens[end - 2].0.to_uppercase() == "OFFSET" {
-        return tokens[end - 1].0.parse().ok();
+/// A query split into the part to page, the user's own trailing `LIMIT` and
+/// `OFFSET`, and the comments that followed the code.
+struct Parsed<'a> {
+    base: &'a str,
+    /// What goes between `base` and the page clause: a newline when `base` ends
+    /// inside a `--` comment (which would otherwise swallow the clause).
+    separator: &'static str,
+    user_limit: Option<u64>,
+    user_offset: Option<u64>,
+    trailing_comments: String,
+}
+
+fn parse(sql: &str) -> Parsed<'_> {
+    let toks = lex(sql);
+    let code: Vec<&Tok> = toks
+        .iter()
+        .filter(|t| !matches!(t.kind, Kind::LineComment | Kind::BlockComment))
+        .collect();
+    let mut end = code.len();
+    while end > 0 && code[end - 1].kind == Kind::Semicolon {
+        end -= 1;
+    }
+    let text = |t: &Tok| &sql[t.start..t.end];
+    // `<keyword> <number>` as the last two tokens of `code[..upto]`.
+    let clause = |upto: usize, keyword: &str| -> Option<u64> {
+        if upto < 2 {
+            return None;
+        }
+        let (word, number) = (code[upto - 2], code[upto - 1]);
+        if word.kind == Kind::Word
+            && number.kind == Kind::Word
+            && text(word).eq_ignore_ascii_case(keyword)
+        {
+            text(number).parse().ok()
+        } else {
+            None
+        }
+    };
+
+    let mut cut = end;
+    let user_offset = clause(cut, "OFFSET");
+    if user_offset.is_some() {
+        cut -= 2;
+    }
+    let user_limit = clause(cut, "LIMIT");
+    if user_limit.is_some() {
+        cut -= 2;
     }
 
-    None
+    let code_end = end.checked_sub(1).map_or(0, |i| code[i].end);
+    let base_end = if cut == end {
+        code_end
+    } else {
+        code[cut].start
+    };
+    let trailing_comments = toks
+        .iter()
+        .filter(|t| matches!(t.kind, Kind::LineComment | Kind::BlockComment) && t.start >= code_end)
+        .map(text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let base = sql[..base_end].trim_end();
+    let ends_in_line_comment = toks
+        .iter()
+        .rfind(|t| t.end <= base.len())
+        .is_some_and(|t| t.kind == Kind::LineComment);
+    Parsed {
+        base,
+        separator: if ends_in_line_comment { "\n" } else { " " },
+        user_limit,
+        user_offset,
+        trailing_comments,
+    }
 }
 
 /// Build a paginated query: strip any user-supplied LIMIT/OFFSET and append
 /// this page's clause. A user LIMIT caps the total rows returned across all
-/// pages; a user OFFSET is added to the per-page offset.
+/// pages; a user OFFSET is added to the per-page offset. Comments after the
+/// code are kept, after the clause.
 pub fn build_paginated_query(query: &str, page_size: u32, page: u32) -> String {
     let (page_size, page_offset) = limit_offset(page, page_size);
-    let user_limit = extract_user_limit(query);
-    let user_offset = extract_user_offset(query).unwrap_or(0);
-    let base = strip_limit_offset(query);
+    let Parsed {
+        base,
+        separator,
+        user_limit,
+        user_offset,
+        trailing_comments,
+    } = parse(query);
 
     let fetch_count = match user_limit {
         Some(ul) => {
@@ -122,7 +260,15 @@ pub fn build_paginated_query(query: &str, page_size: u32, page: u32) -> String {
         None => page_size + 1,
     };
 
-    let offset = user_offset.saturating_add(page_offset).min(MAX_OFFSET);
+    let offset = user_offset
+        .unwrap_or(0)
+        .saturating_add(page_offset)
+        .min(MAX_OFFSET);
 
-    format!("{} LIMIT {} OFFSET {}", base, fetch_count, offset)
+    let comments = if trailing_comments.is_empty() {
+        String::new()
+    } else {
+        format!(" {trailing_comments}")
+    };
+    format!("{base}{separator}LIMIT {fetch_count} OFFSET {offset}{comments}")
 }
