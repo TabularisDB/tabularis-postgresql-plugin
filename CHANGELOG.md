@@ -11,7 +11,7 @@
   call if protection is not in effect. Transaction-control statements are
   refused, including ones hidden behind a `--` comment that ends at a carriage
   return. `PREPARE`, `DEALLOCATE`, `COPY`, `ANALYZE`, `CLUSTER`, `REINDEX`,
-  `CHECKPOINT` and `LOAD` are refused too, because a read-only transaction does
+  `CHECKPOINT`, `LOAD` and `DISCARD` are refused too, because a read-only transaction does
   not stop them from changing state outside it. The connection returns to the
   pool only after `ROLLBACK` succeeded and the session holds no prepared
   statement or session-level advisory lock the call created; otherwise, and on

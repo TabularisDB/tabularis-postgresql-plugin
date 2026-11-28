@@ -153,6 +153,20 @@ fn server_side_copy_and_unrelated_statements_mentioning_copy_run() {
 }
 
 #[test]
+fn a_comment_ends_at_a_carriage_return_so_the_code_after_it_is_still_read() {
+    // PostgreSQL ends a `--` comment at `\r` as well as `\n`.
+    assert_eq!(
+        classify("COPY t -- note\rFROM STDIN"),
+        Action::Reject(
+            "COPY ... FROM STDIN / TO STDOUT is not supported in an import; re-export the data as INSERT statements (pg_dump --inserts)"
+        )
+    );
+    assert!(disables_standard_conforming_strings(
+        "SET -- off\rstandard_conforming_strings = off"
+    ));
+}
+
+#[test]
 fn pg_dump_restrict_markers_are_skipped_and_other_meta_commands_rejected() {
     assert_eq!(classify("\\restrict abc123"), Action::Skip);
     assert_eq!(classify("\\unrestrict abc123"), Action::Skip);

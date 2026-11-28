@@ -72,7 +72,7 @@ fn strip_limit_offset(query: &str) -> String {
 }
 
 /// Extract the numeric value from a trailing `LIMIT` clause, if present.
-fn extract_user_limit(query: &str) -> Option<u32> {
+fn extract_user_limit(query: &str) -> Option<u64> {
     let trimmed = query.trim_end().trim_end_matches(';').trim_end();
     let tokens = tokenize_with_pos(trimmed);
     let len = tokens.len();
@@ -93,7 +93,7 @@ fn extract_user_limit(query: &str) -> Option<u32> {
 }
 
 /// Extract the numeric value from a trailing `OFFSET` clause, if present.
-fn extract_user_offset(query: &str) -> Option<u32> {
+fn extract_user_offset(query: &str) -> Option<u64> {
     let trimmed = query.trim_end().trim_end_matches(';').trim_end();
     let tokens = tokenize_with_pos(trimmed);
     let end = tokens.len();
@@ -110,8 +110,8 @@ fn extract_user_offset(query: &str) -> Option<u32> {
 /// pages; a user OFFSET is added to the per-page offset.
 pub fn build_paginated_query(query: &str, page_size: u32, page: u32) -> String {
     let (page_size, page_offset) = limit_offset(page, page_size);
-    let user_limit = extract_user_limit(query).map(u64::from);
-    let user_offset = u64::from(extract_user_offset(query).unwrap_or(0));
+    let user_limit = extract_user_limit(query);
+    let user_offset = extract_user_offset(query).unwrap_or(0);
     let base = strip_limit_offset(query);
 
     let fetch_count = match user_limit {

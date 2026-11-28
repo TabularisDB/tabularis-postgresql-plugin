@@ -278,16 +278,23 @@ commands by name and checks the connection afterwards. `PREPARE` and
 `DEALLOCATE` are refused, because they change what the connection keeps for the
 next caller. `COPY` is refused, because `COPY ... TO` can write a server-side
 file or run a program. `ANALYZE`, `CLUSTER`, `REINDEX`, `CHECKPOINT` and `LOAD`
-are refused because they write statistics, rewrite storage or load code. Dynamic
-SQL (a `DO` block, a function) can still create a prepared statement or take a
-session-level advisory lock, so after the call the plugin reads both back and
-closes the connection instead of pooling it when either remains.
+are refused because they write statistics, rewrite storage or load code, and
+`DISCARD` is refused because `DISCARD SEQUENCES` resets state that `ROLLBACK`
+does not restore. This list stops a mistake by a person or a tool that sends one
+of these commands as the statement; it is not a boundary. Dynamic SQL (a `DO`
+block, a function) can run the same commands from inside, where the plugin
+cannot see them, so what bounds the protection is the role (below). What the
+plugin does catch after the call is the session state a connection keeps: it
+reads back prepared statements and session-level advisory locks, and closes the
+connection instead of pooling it when the call left either behind.
 
 PostgreSQL's read-only mode is still bounded by the connecting role. Functions
 that act outside the transaction, such as `pg_create_physical_replication_slot`,
 `pg_logical_emit_message` or `pg_switch_wal`, are allowed in it, and `dblink`
 (where installed) opens a separate session that is not read-only. Connect with
-a role that has only the privileges a read-only user should have.
+a role that has only the privileges a read-only user should have. The host must
+be Tabularis v0.33.0 or later for `read_only_queries`; an older host never sends
+`execute_read_only_query`.
 
 The connection goes back to the pool only after `ROLLBACK` succeeded and the
 session is as clean as it was. If the `ROLLBACK` fails, or the call is

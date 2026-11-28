@@ -268,7 +268,7 @@ fn without_comments(sql: &str) -> String {
         let c = chars[i];
         match c {
             '-' if chars.get(i + 1) == Some(&'-') => {
-                while i < chars.len() && chars[i] != '\n' {
+                while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
                     i += 1;
                 }
                 out.push(' ');
@@ -334,7 +334,7 @@ fn keywords_outside_quotes(sql: &str) -> Vec<String> {
         }
         match c {
             '-' if chars.get(i + 1) == Some(&'-') => {
-                while i < chars.len() && chars[i] != '\n' {
+                while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
                     i += 1;
                 }
             }

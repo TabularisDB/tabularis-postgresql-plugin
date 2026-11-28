@@ -2845,27 +2845,20 @@ async fn writable(params: &ConnectionParams) -> deadpool_postgres::Object {
 /// so a failure here cannot leave `poolMaxSize = 1` or a one-connection pool
 /// behind for the tests that follow.
 struct SmallPool {
-    keys: Vec<String>,
     _size_lock: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl SmallPool {
+    /// Every cached pool is dropped on the way in and out, not only the ones for
+    /// the default test parameters: a test that connects with other parameters
+    /// (a pooler port, TLS) must not inherit a pool built at the wrong size.
     async fn new() -> Self {
         let size_lock = crate::settings::test_support::POOL_MAX_SIZE_TEST_LOCK
             .lock()
             .await;
         crate::settings::set_pool_max_size(&serde_json::json!({"poolMaxSize": 1}));
-        let mut pools = POOLS.lock().unwrap();
-        let mut keys = Vec::new();
-        for read_only in [false, true] {
-            let mut p = import_live_params();
-            p.read_only = read_only;
-            let key = connection_key(&p);
-            pools.remove(&key);
-            keys.push(key);
-        }
+        POOLS.lock().unwrap().clear();
         Self {
-            keys,
             _size_lock: size_lock,
         }
     }
@@ -2874,9 +2867,7 @@ impl SmallPool {
 impl Drop for SmallPool {
     fn drop(&mut self) {
         if let Ok(mut pools) = POOLS.lock() {
-            for key in &self.keys {
-                pools.remove(key);
-            }
+            pools.clear();
         }
         crate::settings::set_pool_max_size(&serde_json::Value::Null);
     }
@@ -4204,7 +4195,7 @@ async fn pooler_leaves_nothing_behind(transport: &Transport, label: &str) {
         ),
         (
             "a statement that fails after locking",
-            format!("SELECT pg_advisory_lock({key}), 1/0"),
+            format!("SELECT pg_advisory_lock({key}), 1/(random()*0)::int"),
         ),
     ] {
         let _ = run_on(transport, &taker, false).await;
@@ -4553,6 +4544,118 @@ mod podman {
         let _guard = POOLS_TEST_LOCK.lock().await;
         let t = pooler_transport(env_var("PG_PLUGIN_TEST_POOLER_PORT").parse().unwrap());
         pooler_leaves_nothing_behind(&t, "transaction PgBouncer").await;
+    }
+
+    /// A statement that fails after taking a session lock aborts the protected
+    /// transaction. The call must end it itself, in the one message that also
+    /// releases the lock: when the statement's own error handling rolls back
+    /// first, the pooler is free to serve the cleanup from another backend and
+    /// the lock stays on the one that took it. Four backends, so it would.
+    #[tokio::test]
+    #[ignore = "needs the podman PgBouncers (tests/podman/env.sh up: PG_PLUGIN_TEST_MULTI_POOLER_PORT)"]
+    async fn behind_a_multi_backend_pgbouncer_a_failing_statement_cannot_strand_a_lock() {
+        let _guard = POOLS_TEST_LOCK.lock().await;
+        let t = pooler_transport(env_var("PG_PLUGIN_TEST_MULTI_POOLER_PORT").parse().unwrap());
+        // A failure at run time, after the lock: `1/0` alone is folded away when planned.
+        let fail = "1/(random()*0)::int";
+        let direct = crate::client::get_pool_client(&{
+            let mut p = base_params();
+            p.pooler_mode = None;
+            p
+        })
+        .await
+        .unwrap();
+        // Other clients keep three of the four backends busy, so the one a call
+        // frees is quickly taken by somebody else and the pooler has to pick a
+        // backend for whatever the call sends next.
+        let mut traffic = Vec::new();
+        for _ in 0..3 {
+            let mut p = base_params();
+            p.port = t.params.port;
+            p.pooler_mode = None;
+            traffic.push(tokio::spawn(async move {
+                let c = crate::client::oneshot_pool_client(&p).await.unwrap();
+                loop {
+                    let _ = c.simple_query("SELECT pg_sleep(0.005)").await;
+                }
+            }));
+        }
+        for (i, what) in ["a result-set query", "a statement that is not a result set"]
+            .iter()
+            .enumerate()
+        {
+            for round in 0..40_i64 {
+                let key = 7_300_000_i64
+                    + i64::from(std::process::id() % 1000) * 100
+                    + (i as i64) * 50
+                    + round;
+                let sql = if i == 0 {
+                    format!("SELECT pg_advisory_lock({key}), {fail}")
+                } else {
+                    format!("DO $$ BEGIN PERFORM pg_advisory_lock({key}); PERFORM {fail}; END $$")
+                };
+                let err = run_on(&t, &sql, false).await.unwrap_err();
+                assert!(err.contains("division by zero"), "{what}: {err}");
+                assert!(
+                    !err.contains("rolled back"),
+                    "{what}: the notice about a rolled-back user transaction leaked: {err}"
+                );
+                let held: i64 = direct
+                    .query_one(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = $1::int AND classid = 0",
+                        &[&(key as i32)],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(
+                    held, 0,
+                    "{what} (round {round}) stranded advisory lock {key} on a backend"
+                );
+            }
+        }
+        for task in traffic {
+            task.abort();
+        }
+    }
+
+    /// The one-shot connection a result-set query uses behind a pooler has the
+    /// same idle gaps as the shared pool's: PgBouncer queues the call's `BEGIN`
+    /// until a backend is free, and a `cancel` that arrives there reaches no
+    /// statement. The call must still stop before its query runs.
+    #[tokio::test]
+    #[ignore = "needs the podman PgBouncers (tests/podman/env.sh up: PG_PLUGIN_TEST_POOLER_PORT)"]
+    async fn behind_a_pgbouncer_a_cancel_that_arrives_before_the_query_stops_the_call() {
+        let _guard = POOLS_TEST_LOCK.lock().await;
+        let t = pooler_transport(env_var("PG_PLUGIN_TEST_POOLER_PORT").parse().unwrap());
+        let request_id = 8_202_101_u64;
+
+        // The pooler has one backend: hold it so the call queues behind this.
+        let holder = crate::client::oneshot_pool_client(&t.params).await.unwrap();
+        holder.batch_execute("BEGIN").await.unwrap();
+        holder.batch_execute("SELECT 1").await.unwrap();
+
+        let call = async {
+            let response = crate::handlers::read_only::execute_read_only_query(
+                serde_json::json!(request_id),
+                &request_for(&t.params, "SELECT pg_sleep(20)", false),
+            )
+            .await;
+            response["error"]["message"].as_str().map(str::to_string)
+        };
+        let cancel_then_free = async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            crate::cancel::cancel(request_id).await;
+            holder.batch_execute("ROLLBACK").await.unwrap();
+        };
+        let started = std::time::Instant::now();
+        let (outcome, ()) = tokio::join!(call, cancel_then_free);
+        let err = outcome.expect("a cancelled call must not run its query");
+        assert!(err.contains("canceling statement"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the query ran to completion after the cancel"
+        );
     }
 
     /// Behind a pooler a statement that is not a result set (here `DO`) runs on the

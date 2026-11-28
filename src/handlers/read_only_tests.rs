@@ -145,6 +145,9 @@ fn commands_that_act_outside_the_transaction_are_refused_by_name() {
         "REINDEX TABLE t",
         "CHECKPOINT",
         "LOAD 'auto_explain'",
+        "DISCARD SEQUENCES",
+        "discard temp",
+        "DISCARD ALL",
         "/* c */ PREPARE p AS SELECT 1",
         "-- c\rPREPARE p AS SELECT 1",
     ] {
@@ -154,12 +157,24 @@ fn commands_that_act_outside_the_transaction_are_refused_by_name() {
     }
 }
 
-fn baseline(sql: i64, protocol: i64, locks: i64) -> SessionBaseline {
+fn state(sql: &[&str], protocol: i64, locks: &[&str]) -> SessionBaseline {
     SessionBaseline {
-        sql_prepared: sql,
+        sql_prepared: sql.iter().map(|s| s.to_string()).collect(),
         protocol_prepared: protocol,
-        advisory_locks: locks,
+        advisory_locks: locks.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+fn baseline(sql: usize, protocol: i64, locks: usize) -> SessionBaseline {
+    let names: Vec<String> = (0..sql).map(|i| format!("p{i}")).collect();
+    let held: Vec<String> = (0..locks)
+        .map(|i| format!("0:{i}:1:ExclusiveLock"))
+        .collect();
+    state(
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        protocol,
+        &held.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
 }
 
 #[test]
@@ -169,6 +184,8 @@ fn a_session_that_is_as_clean_as_before_may_return_to_the_pool() {
     assert!(baseline(0, 2, 0).is_unchanged_by(&baseline(0, 3, 0)));
     // A statement or lock the connection already held is not this call's doing.
     assert!(baseline(1, 2, 1).is_unchanged_by(&baseline(1, 2, 1)));
+    // One it held and the call released is fine too.
+    assert!(baseline(2, 2, 2).is_unchanged_by(&baseline(1, 2, 1)));
 }
 
 #[test]
@@ -182,28 +199,45 @@ fn a_session_that_kept_state_past_rollback_is_not_returned_to_the_pool() {
 }
 
 #[test]
-fn the_session_counts_are_read_in_one_statement_with_fixed_columns() {
-    assert_eq!(SESSION_COUNTS_SQL.matches("count(*)").count(), 3);
-    assert!(SESSION_COUNTS_SQL.contains("from_sql"));
-    assert!(SESSION_COUNTS_SQL.contains("pg_backend_pid()"));
+fn state_is_compared_by_identity_not_by_count() {
+    // The call released the lock the session held and took a different one: the
+    // count is the same, the session is not.
+    let before = state(&[], 2, &["0:1:1:ExclusiveLock"]);
+    assert!(!before.is_unchanged_by(&state(&[], 2, &["0:2:1:ExclusiveLock"])));
+    // The same for a prepared statement dropped and another created.
+    let before = state(&["held"], 2, &[]);
+    assert!(!before.is_unchanged_by(&state(&["other"], 2, &[])));
+    // A different mode on the same lock is a different lock.
+    let before = state(&[], 2, &["0:1:1:ExclusiveLock"]);
+    assert!(!before.is_unchanged_by(&state(&[], 2, &["0:1:1:ShareLock"])));
 }
 
 #[test]
-fn the_notice_about_a_rolled_back_user_transaction_is_removed() {
-    let with = format!(
-        "ERROR: relation \"t\" does not exist{}",
-        crate::handlers::query::TXN_ROLLED_BACK_NOTICE
-    );
-    assert_eq!(
-        strip_rollback_notice(with),
-        "ERROR: relation \"t\" does not exist"
-    );
+fn the_session_state_is_read_in_one_statement_with_fixed_columns() {
+    assert_eq!(SESSION_STATE_SQL.matches("(SELECT").count(), 3);
+    assert!(SESSION_STATE_SQL.contains("from_sql"));
+    assert!(SESSION_STATE_SQL.contains("pg_backend_pid()"));
 }
 
 #[test]
-fn an_error_without_the_notice_is_left_alone() {
-    let plain = "ERROR: cannot execute INSERT in a read-only transaction".to_string();
-    assert_eq!(strip_rollback_notice(plain.clone()), plain);
+fn the_session_state_columns_are_decoded_by_position() {
+    let texts = [
+        None,
+        Some(r#"["a","b"]"#.to_string()),
+        Some("7".to_string()),
+        Some(r#"["0:1:1:ExclusiveLock"]"#.to_string()),
+    ];
+    let parsed = SessionBaseline::from_columns(
+        1,
+        |i| texts[i].clone(),
+        |i| texts[i].as_ref().and_then(|v| v.parse().ok()),
+    )
+    .unwrap();
+    assert_eq!(parsed.sql_prepared.len(), 2);
+    assert_eq!(parsed.protocol_prepared, 7);
+    assert!(parsed.advisory_locks.contains("0:1:1:ExclusiveLock"));
+    let unreadable = SessionBaseline::from_columns(1, |_| Some("not json".into()), |_| Some(1));
+    assert!(unreadable.is_err());
 }
 
 #[test]

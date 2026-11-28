@@ -1,5 +1,6 @@
 //! Protected read-only queries (`execute_read_only_query`).
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use deadpool_postgres::Object as PgClient;
@@ -10,7 +11,7 @@ use crate::cancel;
 use crate::client;
 use crate::handlers::query::{
     apply_search_path_local, exec_query_on_client, exec_query_pooled_txn, leading_keywords,
-    returns_result_set, transaction_effect, TransactionEffect, TXN_ROLLED_BACK_NOTICE,
+    returns_result_set, transaction_effect, OpenTransaction, TransactionEffect,
 };
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{error_response, ok_response};
@@ -46,8 +47,7 @@ async fn exec_read_only(req: &ReadOnlyRequest, id: &Value) -> Result<Value, Stri
             id,
             /* read_only = */ true,
         )
-        .await
-        .map_err(strip_rollback_notice);
+        .await;
     }
     exec_on_shared_pool(req, id).await
 }
@@ -115,7 +115,7 @@ pub(crate) async fn exec_on_shared_pool_with(
 
 /// What the server reports when the call is cancelled before its query ran.
 /// Matches the text of a cancelled statement (SQLSTATE 57014).
-const CANCELLED_MESSAGE: &str = "ERROR: canceling statement due to user request";
+pub(crate) const CANCELLED_MESSAGE: &str = "ERROR: canceling statement due to user request";
 
 async fn run_protected(pg_client: &PgClient, req: &ReadOnlyRequest) -> Result<Value, String> {
     if let Some(schema) = req.schema.as_deref() {
@@ -128,10 +128,10 @@ async fn run_protected(pg_client: &PgClient, req: &ReadOnlyRequest) -> Result<Va
         req.page,
         req.params.is_transaction_pooler(),
         !req.params.is_transaction_pooler(),
-        /* in_transaction = */ true,
+        OpenTransaction::EndedByCaller,
     )
     .await;
-    outcome.result.map_err(strip_rollback_notice)
+    outcome.result
 }
 
 /// A pooled connection that is detached and closed, not returned to the pool,
@@ -194,41 +194,60 @@ pub(crate) async fn bounded(limit: Duration, work: impl std::future::Future<Outp
 /// The statement that opens a protected call's transaction.
 pub(crate) const BEGIN_READ_ONLY: &str = "BEGIN READ ONLY";
 
-/// Counts of what a session holds that `ROLLBACK` does not undo, read inside
-/// the protected transaction and again after it ends. A `PREPARE` (directly,
-/// or from dynamic SQL in a `DO` block or function) survives `ROLLBACK`, and
-/// would be inherited by whoever borrows the connection next; a `DEALLOCATE`
-/// would remove a statement the client library still has cached; a
-/// session-level advisory lock stays held for the life of the connection. A
-/// connection that fails the comparison is closed, which releases all three.
+/// What a session holds that `ROLLBACK` does not undo, read inside the
+/// protected transaction and again after it ends. A `PREPARE` (directly, or
+/// from dynamic SQL in a `DO` block or function) survives `ROLLBACK`, and would
+/// be inherited by whoever borrows the connection next; a `DEALLOCATE` would
+/// remove a statement the client library still has cached; a session-level
+/// advisory lock stays held for the life of the connection. A connection that
+/// fails the comparison is closed, which releases all three.
+///
+/// The SQL-level statements and the locks are compared by identity, so a call
+/// that releases one the session already held and takes another is still seen.
+/// A lock the session already held and the call took again cannot be told
+/// apart: the catalog does not show the nesting depth.
 #[derive(Debug)]
 pub(crate) struct SessionBaseline {
-    sql_prepared: i64,
+    sql_prepared: BTreeSet<String>,
     protocol_prepared: i64,
-    advisory_locks: i64,
+    advisory_locks: BTreeSet<String>,
 }
 
-/// Prepared statements the SQL `PREPARE` command created, and those the client
-/// library created through the wire protocol.
-const SESSION_COUNTS_SQL: &str = "(SELECT count(*) FROM pg_prepared_statements WHERE from_sql), \
+/// The names of the statements the SQL `PREPARE` command created, the number
+/// the client library created through the wire protocol, and the advisory locks
+/// this backend holds, each lock as `classid:objid:objsubid:mode`.
+const SESSION_STATE_SQL: &str = "\
+     (SELECT coalesce(json_agg(name ORDER BY name), '[]') FROM pg_prepared_statements WHERE from_sql)::text, \
      (SELECT count(*) FROM pg_prepared_statements WHERE NOT from_sql), \
-     (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())";
+     (SELECT coalesce(json_agg(classid || ':' || objid || ':' || objsubid || ':' || mode ORDER BY classid, objid, objsubid, mode), '[]') \
+        FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid())::text";
 
 impl SessionBaseline {
-    fn from_row(first: usize, get: impl Fn(usize) -> Option<i64>) -> Result<Self, String> {
-        let read = |i| get(i).ok_or_else(|| "could not read the session state".to_string());
+    /// Reads the three values `SESSION_STATE_SQL` selects, starting at column `first`.
+    fn from_columns(
+        first: usize,
+        text: impl Fn(usize) -> Option<String>,
+        count: impl Fn(usize) -> Option<i64>,
+    ) -> Result<Self, String> {
+        let unreadable = || "could not read the session state".to_string();
+        let set = |i: usize| -> Result<BTreeSet<String>, String> {
+            let json = text(i).ok_or_else(unreadable)?;
+            serde_json::from_str(&json).map_err(|_| unreadable())
+        };
         Ok(Self {
-            sql_prepared: read(first)?,
-            protocol_prepared: read(first + 1)?,
-            advisory_locks: read(first + 2)?,
+            sql_prepared: set(first)?,
+            protocol_prepared: count(first + 1).ok_or_else(unreadable)?,
+            advisory_locks: set(first + 2)?,
         })
     }
 
-    /// Whether a session now at `after` is as clean as it was at `self`.
+    /// Whether a session now at `after` is as clean as it was at `self`: it
+    /// holds nothing it did not hold before, and the client library's own
+    /// statements are all still there.
     fn is_unchanged_by(&self, after: &SessionBaseline) -> bool {
-        after.sql_prepared <= self.sql_prepared
+        after.sql_prepared.is_subset(&self.sql_prepared)
             && after.protocol_prepared >= self.protocol_prepared
-            && after.advisory_locks <= self.advisory_locks
+            && after.advisory_locks.is_subset(&self.advisory_locks)
     }
 }
 
@@ -250,7 +269,7 @@ pub(crate) async fn begin_protected_with(
         .await
         .map_err(|e| client::format_pg_error(&e))?;
     let unprotected = |e: String| format!("Read-only protection could not be enabled: {e}");
-    let sql = format!("SELECT current_setting('transaction_read_only'), {SESSION_COUNTS_SQL}");
+    let sql = format!("SELECT current_setting('transaction_read_only'), {SESSION_STATE_SQL}");
     let row = pg_client
         .query_typed_one(&sql, &[])
         .await
@@ -259,7 +278,12 @@ pub(crate) async fn begin_protected_with(
         .try_get(0)
         .map_err(|e| unprotected(client::format_pg_error(&e)))?;
     require_read_only_transaction(&setting)?;
-    SessionBaseline::from_row(1, |i| row.try_get::<_, i64>(i).ok()).map_err(unprotected)
+    SessionBaseline::from_columns(
+        1,
+        |i| row.try_get::<_, String>(i).ok(),
+        |i| row.try_get::<_, i64>(i).ok(),
+    )
+    .map_err(unprotected)
 }
 
 /// The statements that end a protected call behind a transaction pooler.
@@ -273,10 +297,10 @@ pub(crate) async fn begin_protected_with(
 /// own, so that kind is left alone.
 pub(crate) fn rollback_and_clean_sql(end_sql: &str, baseline: &SessionBaseline) -> String {
     let mut sql = end_sql.to_string();
-    if baseline.advisory_locks == 0 {
+    if baseline.advisory_locks.is_empty() {
         sql.push_str("; SELECT pg_advisory_unlock_all()");
     }
-    if baseline.sql_prepared == 0 {
+    if baseline.sql_prepared.is_empty() {
         sql.push_str(
             "; DO $ro$ DECLARE r record; BEGIN \
              FOR r IN SELECT name FROM pg_prepared_statements WHERE from_sql LOOP \
@@ -309,7 +333,7 @@ async fn end_protected(
         return Ok(true);
     }
     let messages = pg_client
-        .simple_query(&format!("{end_sql}; SELECT {SESSION_COUNTS_SQL}"))
+        .simple_query(&format!("{end_sql}; SELECT {SESSION_STATE_SQL}"))
         .await
         .map_err(|e| client::format_pg_error(&e))?;
     let row = messages
@@ -319,7 +343,11 @@ async fn end_protected(
             _ => None,
         })
         .ok_or("the server did not report the session state")?;
-    let after = SessionBaseline::from_row(0, |i| row.get(i).and_then(|v| v.parse().ok()))?;
+    let after = SessionBaseline::from_columns(
+        0,
+        |i| row.get(i).map(str::to_string),
+        |i| row.get(i).and_then(|v| v.parse().ok()),
+    )?;
     Ok(baseline.is_unchanged_by(&after))
 }
 
@@ -371,7 +399,8 @@ pub(crate) fn parse_request(request: &Value) -> Result<ReadOnlyRequest, String> 
 /// `DEALLOCATE` change what the connection keeps for the next borrower, `COPY`
 /// can write a server-side file or run a program, and `ANALYZE`, `CLUSTER`,
 /// `REINDEX`, `CHECKPOINT` and `LOAD` write statistics, rewrite storage or load
-/// code. They are refused by name rather than left to a role's privileges.
+/// code, and `DISCARD` resets session state (`DISCARD SEQUENCES` is not undone
+/// by `ROLLBACK`). They are refused by name rather than left to a role's privileges.
 pub(crate) fn refuse_transaction_control(query: &str) -> Result<(), String> {
     if !matches!(transaction_effect(query), TransactionEffect::None) {
         return Err(
@@ -383,23 +412,12 @@ pub(crate) fn refuse_transaction_control(query: &str) -> Result<(), String> {
     match first.as_deref() {
         Some(
             command @ ("PREPARE" | "DEALLOCATE" | "COPY" | "ANALYZE" | "ANALYSE" | "CLUSTER"
-            | "REINDEX" | "CHECKPOINT" | "LOAD"),
+            | "REINDEX" | "CHECKPOINT" | "LOAD" | "DISCARD"),
         ) => Err(format!(
             "{command} is not allowed in a read-only query: PostgreSQL's read-only mode does not stop it from changing state outside the transaction"
         )),
         _ => Ok(()),
     }
-}
-
-/// `exec_query_on_client` appends this when a failing statement aborted the
-/// caller's open transaction and it rolled it back. Here the transaction is
-/// the protection, not the user's, so telling them their transaction was
-/// rolled back would be wrong.
-pub(crate) fn strip_rollback_notice(error: String) -> String {
-    error
-        .strip_suffix(TXN_ROLLED_BACK_NOTICE)
-        .map(str::to_string)
-        .unwrap_or(error)
 }
 
 /// Confirms the server reports the transaction as read-only. The value is
