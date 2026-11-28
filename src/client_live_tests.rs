@@ -3499,6 +3499,50 @@ async fn a_failing_protected_statement_does_not_claim_a_user_transaction_was_rol
     assert!(!err.contains("rolled back"), "{err}");
 }
 
+/// Issue #204: a query ending in a `--` comment used to get its paging clause
+/// appended inside the comment, so every page returned the same first rows and
+/// `has_more` never turned false. Driven through `execute_query` as the host's
+/// export loop does: follow `has_more` and collect every row.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL (PG_PLUGIN_TEST_HOST=127.0.0.1 ... podman 54320)"]
+async fn pages_of_a_query_with_a_trailing_comment_walk_the_whole_result() {
+    let _guard = POOLS_TEST_LOCK.lock().await;
+    let params = import_live_params();
+    for query in [
+        "SELECT g AS id FROM generate_series(1,25) g ORDER BY g -- export",
+        "SELECT g AS id FROM generate_series(1,25) g ORDER BY g\n-- export",
+        "SELECT g AS id FROM generate_series(1,25) g ORDER BY g /* export */",
+        "SELECT g AS id FROM generate_series(1,25) g ORDER BY g LIMIT 20 -- cap",
+    ] {
+        let mut ids = Vec::new();
+        for page in 1..=10_u64 {
+            let response = crate::handlers::query::execute_query(
+                serde_json::json!(1),
+                &serde_json::json!({
+                    "host": params.host, "port": params.port, "database": params.database,
+                    "username": params.username, "password": params.password,
+                    "query": query, "limit": 10, "page": page,
+                }),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{query}: {response}");
+            let result = &response["result"];
+            ids.extend(
+                result["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r[0].as_i64().unwrap()),
+            );
+            if !result["pagination"]["has_more"].as_bool().unwrap() {
+                break;
+            }
+        }
+        let expected: Vec<i64> = (1..=if query.contains("LIMIT 20") { 20 } else { 25 }).collect();
+        assert_eq!(ids, expected, "{query}");
+    }
+}
+
 /// PostgreSQL discards a cancel that reaches an idle backend, and a protected
 /// call has idle gaps (waiting for a connection, between its own BEGIN and the
 /// query). A cancel that lands in one has to stop the call before the query

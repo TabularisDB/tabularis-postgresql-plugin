@@ -70,6 +70,15 @@
 
 ### Fixed
 
+- A query that ends in a comment is now paginated correctly (#204). The paging
+  clause was appended to the end of the text, so after a trailing `-- note` it
+  sat inside the comment, PostgreSQL ignored it, and every page returned the
+  first rows with `has_more` still true: an export of such a query repeated
+  the first page until cancelled. Pagination now reads the query with a lexer
+  that knows `--` and nested `/* */` comments, strings (including `E'..'`),
+  quoted identifiers and dollar quotes. The clause goes on a new line after a
+  line comment, comments after the code are kept after it, and the user's own
+  trailing `LIMIT`/`OFFSET` is found even when a comment follows it.
 - A very large `limit` or `page` no longer breaks a paginated query. The page
   size plus one and the page offset were computed in 32 bits: a debug build
   panicked and left the request unanswered, and a release build wrapped to
