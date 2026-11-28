@@ -1,7 +1,8 @@
 //! Registry of in-flight query cancel actions, keyed by JSON-RPC request id.
 //!
 //! Populated by the query handlers (`execute_query`, `execute_query_batch`,
-//! `explain_query`) and `import_database_sql` before running a statement, and
+//! `explain_query`, `execute_read_only_query`) and `import_database_sql` before
+//! running a statement, and
 //! drained by [`CancelGuard`] when the statement finishes — success, error, or
 //! an early `?` — so the map never grows unbounded. A delivered cancel is also
 //! remembered (see [`CancelGuard::is_cancelled`]) until its guard drops,
@@ -146,7 +147,7 @@ impl Drop for CancelGuard {
 /// response channel back to the host, and the server never reports whether
 /// a cancellation attempt actually landed anyway (see
 /// `tokio_postgres::CancelToken::cancel_query`'s own doc comment).
-async fn run_cancel(token: CancelToken, params: ConnectionParams) {
+pub(crate) async fn run_cancel(token: CancelToken, params: ConnectionParams) {
     let result = if client::uses_tls(&params) {
         match client::make_tls_connect(&params) {
             Ok(tls) => token.cancel_query(tls).await,

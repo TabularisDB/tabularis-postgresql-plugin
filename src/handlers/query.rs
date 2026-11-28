@@ -256,7 +256,7 @@ async fn run_batch_in_session(
                         page,
                         conn_params.is_transaction_pooler(),
                         /* pre_resolve_types = */ true,
-                        /* in_transaction = */ in_transaction,
+                        OpenTransaction::from_open(in_transaction),
                     )
                     .await
                 } else {
@@ -278,9 +278,16 @@ async fn run_batch_in_session(
                     // map entry while it runs, then re-register for the shared
                     // client before the next iteration.
                     drop(cancel_guard.take());
-                    let result =
-                        exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id)
-                            .await;
+                    let result = exec_query_pooled_txn(
+                        conn_params,
+                        query,
+                        limit,
+                        page,
+                        schema,
+                        request_id,
+                        /* read_only = */ false,
+                    )
+                    .await;
                     cancel_guard = Some(cancel::CancelGuard::register(
                         request_id.as_u64(),
                         &pg_client,
@@ -305,7 +312,7 @@ async fn run_batch_in_session(
                     page,
                     conn_params.is_transaction_pooler(),
                     !conn_params.is_transaction_pooler(),
-                    /* in_transaction = */ in_transaction,
+                    OpenTransaction::from_open(in_transaction),
                 );
                 // Only a direct connection gets here with a path to send
                 // along: `travels_with_search_path` refuses a pooler.
@@ -488,7 +495,16 @@ async fn exec_query(
     // `run_batch_in_session`); one inside an open transaction likewise
     // pre-resolves on the shared client.
     if conn_params.is_transaction_pooler() && returns_result_set(query) {
-        return exec_query_pooled_txn(conn_params, query, limit, page, schema, request_id).await;
+        return exec_query_pooled_txn(
+            conn_params,
+            query,
+            limit,
+            page,
+            schema,
+            request_id,
+            /* read_only = */ false,
+        )
+        .await;
     }
 
     let pg_client = client::get_pool_client(conn_params).await?;
@@ -508,8 +524,7 @@ async fn exec_query(
         page,
         conn_params.is_transaction_pooler(),
         !conn_params.is_transaction_pooler(),
-        /* in_transaction = */
-        false, // single-query path has no session, never an open txn
+        OpenTransaction::None, // single-query path has no session, never an open txn
     );
     let outcome = match schema {
         Some(s) if travels_with_search_path(conn_params, query) => {
@@ -539,6 +554,47 @@ async fn exec_query(
 /// pooler isn't cut short, short enough that a Supavisor-style stall never
 /// reaches the host timeout (#160 / #163).
 const POOLED_TXN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Appended to an error when the statement that failed also aborted the
+/// caller's open transaction and the handler rolled it back.
+pub(crate) const TXN_ROLLED_BACK_NOTICE: &str =
+    "\n\nThe transaction was rolled back (a statement in it \
+     failed with an error that aborted the transaction).";
+
+/// Whether `exec_query_on_client` runs inside an open transaction, and who ends
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenTransaction {
+    /// No transaction is open.
+    None,
+    /// The caller's own `BEGIN` is open. A statement that aborts it is rolled
+    /// back here, with a notice, so the caller does not re-pin a dead session.
+    Open,
+    /// A transaction the caller opened and will end itself (a protected
+    /// read-only call). A statement that aborts it is reported as
+    /// `txn_aborted` but not rolled back here, so the caller's own ending (which
+    /// may also undo session state, on the same pooled backend) is the only
+    /// `ROLLBACK`, and no notice about a rolled-back transaction is added.
+    EndedByCaller,
+}
+
+impl OpenTransaction {
+    pub(crate) fn from_open(open: bool) -> Self {
+        if open {
+            Self::Open
+        } else {
+            Self::None
+        }
+    }
+
+    fn is_open(self) -> bool {
+        self != Self::None
+    }
+
+    fn ended_by_caller(self) -> bool {
+        self == Self::EndedByCaller
+    }
+}
 
 /// The outcome of `exec_query_on_client`, carrying a flag the batch caller needs
 /// to decide whether the transaction it was tracking is still open (#170 + #181).
@@ -583,9 +639,9 @@ const POOLED_TXN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(9
 /// (returns only `outcome.result`) — `pin_pooled_txn` owns the one-shot
 /// client's transaction lifecycle and ROLLBACKs on `Err` regardless. So
 /// `txn_aborted=true` on that path does not flow to a batch caller.
-struct QueryOutcome {
-    result: Result<Value, String>,
-    txn_aborted: bool,
+pub(crate) struct QueryOutcome {
+    pub(crate) result: Result<Value, String>,
+    pub(crate) txn_aborted: bool,
 }
 
 /// Whether a failed pre-resolve `prepare` should short-circuit (ROLLBACK +
@@ -715,7 +771,9 @@ fn in_transaction_after_outcome(
 ///    unnamed protocol — #149's pooler-safe path is preserved (#1097 stays
 ///    fixed), and binary `Row` decoding / `extract_value` is unchanged.
 /// 5. A final `DEALLOCATE ALL` clears the statements `prepare` created.
-/// 6. `COMMIT` ends the pin.
+/// 6. `COMMIT` ends the pin (a protected call, `read_only`, opens it with
+///    `BEGIN READ ONLY` plus a read-back and ends it with `ROLLBACK` instead,
+///    so nothing is ever committed).
 ///
 /// The client comes from [`client::oneshot_pool_client`] — a transient pool
 /// not inserted into the global cache. Both the client and its pool drop at
@@ -727,21 +785,27 @@ fn in_transaction_after_outcome(
 /// actionable error, not a 120s host timeout. On any error after `BEGIN` we
 /// best-effort `ROLLBACK` (the one-shot client drop closes the connection
 /// regardless).
-async fn exec_query_pooled_txn(
+///
+/// `read_only` makes this a protected call (`execute_read_only_query`).
+pub(crate) async fn exec_query_pooled_txn(
     conn_params: &ConnectionParams,
     query: &str,
     limit: Option<u32>,
     page: u32,
     schema: Option<&str>,
     request_id: &Value,
+    read_only: bool,
 ) -> Result<Value, String> {
+    // Claimed before the connection exists, so a `cancel` that arrives while it
+    // is still being opened is remembered instead of dropped.
+    let cancel_guard = cancel::CancelGuard::reserve(request_id.as_u64());
+
     // One-shot client: not returned to any pool, so its caches die with it.
     let pg_client = client::oneshot_pool_client(conn_params).await?;
 
-    // Register a cancel handle for this in-flight query (#126). The guard
-    // deregisters on drop — at every return path below, Ok or Err.
-    let _cancel_guard =
-        cancel::CancelGuard::register(request_id.as_u64(), &pg_client, conn_params.clone());
+    // Point the cancel handle for this in-flight query at the connection
+    // (#126). The guard deregisters on drop — at every return path below.
+    cancel_guard.attach(&pg_client, conn_params.clone());
 
     // Wrap the pinned work in a plugin-owned timeout so a Supavisor-style
     // stall surfaces here instead of at the host's 120s call timeout. A
@@ -750,7 +814,14 @@ async fn exec_query_pooled_txn(
     // below.
     match tokio::time::timeout(
         POOLED_TXN_TIMEOUT,
-        pin_pooled_txn(&pg_client, query, limit, page, schema),
+        pin_pooled_txn(
+            &pg_client,
+            query,
+            limit,
+            page,
+            schema,
+            read_only.then_some(&cancel_guard),
+        ),
     )
     .await
     {
@@ -786,15 +857,61 @@ async fn pin_pooled_txn(
     limit: Option<u32>,
     page: u32,
     schema: Option<&str>,
+    protected_call: Option<&cancel::CancelGuard>,
 ) -> Result<Value, String> {
-    // Pin the backend for the whole sequence.
-    if let Err(e) = pg_client.batch_execute("BEGIN").await {
+    let read_only = protected_call.is_some();
+    // Pin the backend for the whole sequence. A protected call opens the
+    // transaction read-only and always ends it with ROLLBACK, so the server
+    // refuses any write the statement attempts and nothing is ever committed.
+    let baseline = if read_only {
+        match crate::handlers::read_only::begin_protected(pg_client).await {
+            Ok(baseline) => Some(baseline),
+            Err(e) => {
+                // May be mid-transaction; the one-shot client closes right after.
+                let _ = pg_client.batch_execute("ROLLBACK").await;
+                return Err(e);
+            }
+        }
+    } else if let Err(e) = pg_client.batch_execute("BEGIN").await {
         return Err(client::format_pg_error(&e));
-    }
+    } else {
+        None
+    };
 
-    let result = run_pinned_body(pg_client, query, limit, page, schema).await;
+    // PostgreSQL discards a cancel that arrives while the backend is idle
+    // between statements, and the BEGIN and read-back above are such statements:
+    // a cancel landing there must stop the call here.
+    let result = if protected_call.is_some_and(cancel::CancelGuard::is_cancelled) {
+        Err(crate::handlers::read_only::CANCELLED_MESSAGE.to_string())
+    } else {
+        run_pinned_body(pg_client, query, limit, page, schema, read_only).await
+    };
+
+    // The one-shot client closes right after, but behind a pooler that does not
+    // close the backend: end the call and undo the session state it created in
+    // one message, so both happen on the backend that ran it.
+    let end_protected_call = || async {
+        match &baseline {
+            Some(baseline) => {
+                let sql = crate::handlers::read_only::rollback_and_clean_sql("ROLLBACK", baseline);
+                if let Err(e) = pg_client.batch_execute(&sql).await {
+                    log::warn!(
+                        "PostgreSQL: ending a protected call behind a pooler failed: {}",
+                        client::format_pg_error(&e)
+                    );
+                }
+            }
+            None => {
+                let _ = pg_client.batch_execute("ROLLBACK").await;
+            }
+        }
+    };
 
     match result {
+        Ok(value) if read_only => {
+            end_protected_call().await;
+            Ok(value)
+        }
         Ok(value) => {
             if let Err(e) = pg_client.batch_execute("COMMIT").await {
                 return Err(format!("COMMIT failed: {}", client::format_pg_error(&e)));
@@ -804,7 +921,7 @@ async fn pin_pooled_txn(
         Err(e) => {
             // best-effort rollback; the one-shot client drops and closes
             // regardless, so the server aborts the txn even if this fails.
-            let _ = pg_client.batch_execute("ROLLBACK").await;
+            end_protected_call().await;
             Err(e)
         }
     }
@@ -820,6 +937,7 @@ async fn run_pinned_body(
     limit: Option<u32>,
     page: u32,
     schema: Option<&str>,
+    read_only: bool,
 ) -> Result<Value, String> {
     // Clear stale server-side prepared statements left by a previous
     // assignment's typeinfo query (or the connection's prior use).
@@ -881,7 +999,11 @@ async fn run_pinned_body(
         page,
         is_transaction_pooler,
         /* pre_resolve_types = */ false,
-        /* in_transaction = */ true,
+        if read_only {
+            OpenTransaction::EndedByCaller
+        } else {
+            OpenTransaction::Open
+        },
     )
     .await;
 
@@ -1085,7 +1207,11 @@ fn reads_only(query: &str) -> bool {
             .any(|word| WRITES.iter().any(|w| word.eq_ignore_ascii_case(w)))
 }
 
-/// Execute a query on an existing client (used by both single and batch execution).
+/// Execute a query on an existing client (used by single and batch execution,
+/// and by protected read-only queries inside their own transaction).
+///
+/// `transaction` says whether the call runs inside an open transaction and
+/// who ends it (see [`OpenTransaction`]).
 ///
 /// `is_transaction_pooler` selects error-message phrasing (definitive when
 /// the host declared a transaction pooler, conditional when it didn't).
@@ -1103,15 +1229,17 @@ fn reads_only(query: &str) -> bool {
 /// `is_transaction_pooler = true` (for correct error phrasing) AND
 /// `pre_resolve_types = true` (because the backend is pinned by the user's
 /// open transaction, so the `prepare` is safe) — see `run_batch_in_session`.
-async fn exec_query_on_client(
+pub(crate) async fn exec_query_on_client(
     pg_client: &PgClient,
     query: &str,
     limit: Option<u32>,
     page: u32,
     is_transaction_pooler: bool,
     pre_resolve_types: bool,
-    in_transaction: bool,
+    transaction: OpenTransaction,
 ) -> QueryOutcome {
+    let in_transaction = transaction.is_open();
+    let caller_ends_transaction = transaction.ended_by_caller();
     // Check if the statement returns a result set
     if !returns_result_set(query) {
         // Unnamed-statement protocol (`execute_typed`) — pooler-safe under
@@ -1142,7 +1270,8 @@ async fn exec_query_on_client(
                     )
             }
         };
-        if txn_aborted {
+        let rolled_back = txn_aborted && !caller_ends_transaction;
+        if rolled_back {
             // Best-effort ROLLBACK; the transaction is aborted, so ROLLBACK is
             // the one command PostgreSQL still accepts in this state. A
             // failure here is logged, not fatal — the connection still drops
@@ -1166,14 +1295,11 @@ async fn exec_query_on_client(
             })
             .map_err(|e| {
                 let msg = client::format_pg_error(&e);
-                if txn_aborted {
+                if rolled_back {
                     // Tell the user the transaction was rolled back so the
                     // state change isn't implicit — a multi-statement batch's
                     // user needs to know earlier writes were discarded.
-                    format!(
-                        "{msg}\n\nThe transaction was rolled back (a statement in it \
-                         failed with an error that aborted the transaction)."
-                    )
+                    format!("{msg}{TXN_ROLLED_BACK_NOTICE}")
                 } else {
                     msg
                 }
@@ -1354,10 +1480,12 @@ async fn exec_query_on_client(
             // failure here is logged, not fatal — the connection still drops
             // back to the pool and `RecyclingMethod::Fast` will surface a
             // stale-state issue on reuse if it ever matters.
-            if let Err(rollback_err) = pg_client.batch_execute("ROLLBACK").await {
-                log::warn!(
-                    "ROLLBACK after a prepare failure aborted a transaction failed: {rollback_err}"
-                );
+            if !caller_ends_transaction {
+                if let Err(rollback_err) = pg_client.batch_execute("ROLLBACK").await {
+                    log::warn!(
+                        "ROLLBACK after a prepare failure aborted a transaction failed: {rollback_err}"
+                    );
+                }
             }
             // Surface the prepare's real SQLSTATE (e.g. 42P01) and tell the
             // user the transaction was rolled back, so the state change isn't
@@ -1365,9 +1493,13 @@ async fn exec_query_on_client(
             // writes were discarded.
             return QueryOutcome {
                 result: Err(format!(
-                    "{}\n\nThe transaction was rolled back (a statement in it \
-                     failed with an error that aborted the transaction).",
+                    "{}{}",
                     client::format_query_error(e, is_transaction_pooler),
+                    if caller_ends_transaction {
+                        ""
+                    } else {
+                        TXN_ROLLED_BACK_NOTICE
+                    },
                 )),
                 txn_aborted: true,
             };
@@ -1466,7 +1598,8 @@ async fn exec_query_on_client(
                     transaction_effect(query),
                     TransactionEffect::Closes | TransactionEffect::Chains
                 );
-            if txn_aborted {
+            let rolled_back = txn_aborted && !caller_ends_transaction;
+            if rolled_back {
                 if let Err(rollback_err) = pg_client.batch_execute("ROLLBACK").await {
                     log::warn!(
                         "ROLLBACK after a query_typed error aborted a transaction failed: {rollback_err}"
@@ -1475,11 +1608,8 @@ async fn exec_query_on_client(
             }
             let msg = client::format_query_error(&e, is_transaction_pooler);
             return QueryOutcome {
-                result: Err(if txn_aborted {
-                    format!(
-                        "{msg}\n\nThe transaction was rolled back (a statement in it \
-                         failed with an error that aborted the transaction)."
-                    )
+                result: Err(if rolled_back {
+                    format!("{msg}{TXN_ROLLED_BACK_NOTICE}")
                 } else {
                     msg
                 }),
@@ -1717,8 +1847,11 @@ pub(crate) fn leading_keywords(query: &str, n: usize) -> Vec<String> {
         }
         match (c, chars.peek()) {
             ('-', Some('-')) => {
+                // PostgreSQL ends a `--` comment at `\n` or `\r`; stopping only
+                // at `\n` would read a keyword the server treats as code as
+                // part of the comment.
                 for c in chars.by_ref() {
-                    if c == '\n' {
+                    if c == '\n' || c == '\r' {
                         break;
                     }
                 }
@@ -1747,7 +1880,8 @@ fn strip_leading_sql_comments(query: &str) -> &str {
     loop {
         s = s.trim_start();
         if s.starts_with("--") {
-            match s.find('\n') {
+            // `\n` or `\r` ends the comment, as in PostgreSQL's lexer.
+            match s.find(['\n', '\r']) {
                 Some(pos) => s = &s[pos + 1..],
                 None => return "",
             }
@@ -1764,7 +1898,7 @@ fn strip_leading_sql_comments(query: &str) -> &str {
 }
 
 /// Check if a SQL statement returns a result set (SELECT, WITH, SHOW, etc.)
-fn returns_result_set(query: &str) -> bool {
+pub(crate) fn returns_result_set(query: &str) -> bool {
     let upper = strip_leading_sql_comments(query).to_uppercase();
     upper.starts_with("SELECT")
         || upper.starts_with("WITH")

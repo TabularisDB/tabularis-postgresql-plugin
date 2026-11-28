@@ -835,3 +835,49 @@ fn prepend_search_path_statement_binds_the_schema_and_the_base_setting() {
     assert!(PREPEND_SEARCH_PATH_SQL.contains("current_setting($2, true)"));
     assert!(!PREPEND_SEARCH_PATH_SQL.contains("$3"));
 }
+
+// PostgreSQL ends a `--` comment at `\n` *or* `\r`. A reader that only knows
+// `\n` classifies a different first keyword than the server runs (#202).
+#[test]
+fn a_carriage_return_ends_a_line_comment_for_the_keyword_reader() {
+    use super::leading_keywords;
+    assert_eq!(leading_keywords("-- x\rSELECT 1", 1), vec!["SELECT"]);
+    assert_eq!(leading_keywords("-- x\r\nSELECT 1", 1), vec!["SELECT"]);
+    assert_eq!(leading_keywords("/* a */-- x\rSELECT 1", 1), vec!["SELECT"]);
+}
+
+#[test]
+fn transaction_control_after_a_carriage_return_comment_is_still_transaction_control() {
+    for sql in [
+        "-- x\rCOMMIT\nWORK",
+        "-- x\rEND",
+        "-- x\rROLLBACK",
+        "--\rABORT",
+        "-- x\rPREPARE\nTRANSACTION 'x'",
+        "-- x\rBEGIN",
+    ] {
+        assert_ne!(transaction_effect(sql), TransactionEffect::None, "{sql:?}");
+    }
+}
+
+#[test]
+fn a_form_feed_or_vertical_tab_does_not_end_a_line_comment() {
+    use super::leading_keywords;
+    // The server keeps reading the comment through these, so the next word is
+    // still comment text.
+    assert_eq!(
+        leading_keywords("-- x\x0cCOMMIT\nSELECT 1", 1),
+        vec!["SELECT"]
+    );
+    assert_eq!(
+        leading_keywords("-- x\x0bCOMMIT\nSELECT 1", 1),
+        vec!["SELECT"]
+    );
+}
+
+#[test]
+fn strip_leading_sql_comments_ends_a_line_comment_at_a_carriage_return() {
+    assert_eq!(strip_leading_sql_comments("-- x\rSELECT 1"), "SELECT 1");
+    assert_eq!(strip_leading_sql_comments("-- x\r\nSELECT 1"), "SELECT 1");
+    assert!(returns_result_set("-- x\rSELECT 1"));
+}

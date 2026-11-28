@@ -68,3 +68,62 @@ fn build_paginated_query_ignores_trailing_semicolon() {
     let sql = build_paginated_query("SELECT * FROM t;", 10, 1);
     assert_eq!(sql, "SELECT * FROM t LIMIT 11 OFFSET 0");
 }
+
+// The caller clamps `limit` and `page` to `u32::MAX`, so the arithmetic has to
+// hold there (#202): a wrapped `page_size + 1` became `LIMIT 0` and an
+// overflowing offset panicked the worker.
+#[test]
+fn the_largest_page_size_does_not_overflow() {
+    let sql = build_paginated_query("SELECT * FROM t", u32::MAX, 1);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 4294967296 OFFSET 0");
+}
+
+#[test]
+fn a_page_offset_beyond_u32_does_not_overflow() {
+    let sql = build_paginated_query("SELECT * FROM t", 100_000, 100_000);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 100001 OFFSET 9999900000");
+    let sql = build_paginated_query("SELECT * FROM t", 2, 3_000_000_000);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 3 OFFSET 5999999998");
+}
+
+#[test]
+fn the_largest_page_and_page_size_stay_within_a_bigint() {
+    let sql = build_paginated_query("SELECT * FROM t", u32::MAX, u32::MAX);
+    assert_eq!(
+        sql,
+        "SELECT * FROM t LIMIT 4294967296 OFFSET 9223372036854775807"
+    );
+}
+
+#[test]
+fn limit_offset_does_not_overflow_at_the_extremes() {
+    assert_eq!(limit_offset(u32::MAX, u32::MAX).0, u64::from(u32::MAX));
+    assert_eq!(limit_offset(u32::MAX, u32::MAX).1, i64::MAX as u64);
+    assert_eq!(limit_offset(0, 10), (10, 0));
+}
+
+#[test]
+fn a_user_limit_beyond_u32_is_kept_not_silently_dropped() {
+    // 5_000_000_000 does not fit in a u32; dropping it would return more rows than asked for.
+    let sql = build_paginated_query("SELECT * FROM t LIMIT 5000000000", 10, 1);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 11 OFFSET 0");
+    let sql = build_paginated_query("SELECT * FROM t LIMIT 5 OFFSET 5000000000", 10, 1);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 5 OFFSET 5000000000");
+    let sql = build_paginated_query("SELECT * FROM t LIMIT 5000000000 OFFSET 5000000000", 10, 2);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 11 OFFSET 5000000010");
+}
+
+#[test]
+fn a_user_limit_beyond_u32_still_caps_a_deep_page() {
+    // Page 1_000_000_000 of 5 starts at row 4_999_999_995; a user LIMIT of
+    // 5_000_000_000 leaves five rows. Reading the limit as a u32 would drop it
+    // and ask for six.
+    let sql = build_paginated_query("SELECT * FROM t LIMIT 5000000000", 5, 1_000_000_000);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 5 OFFSET 4999999995");
+}
+
+#[test]
+fn a_user_offset_added_to_a_page_offset_stays_within_a_bigint() {
+    let sql = build_paginated_query("SELECT * FROM t OFFSET 9223372036854775807", 10, 2);
+    assert_eq!(sql, "SELECT * FROM t LIMIT 11 OFFSET 9223372036854775807");
+}

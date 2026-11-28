@@ -40,6 +40,14 @@ pub struct ConnectionParams {
     /// on the pooler side for non-builtin column types — see #157,
     /// tabularis#1097). `None` for direct connections — no behavior change.
     pub pooler_mode: Option<String>,
+    /// The connection's **Read-only mode** (a saved per-connection policy).
+    /// The host forwards it to every call. While it is on, the plugin makes
+    /// each new session read-only at the database level (except behind a
+    /// transaction pooler, where only `execute_read_only_query` calls are
+    /// protected) and never runs the saved `startup_script` (see
+    /// [`Self::startup_script_to_run`]). `execute_read_only_query` protects
+    /// each call whatever this flag says.
+    pub read_only: bool,
 }
 
 impl ConnectionParams {
@@ -70,6 +78,10 @@ impl ConnectionParams {
             startup_script: get_str("startup_script"),
             unix_socket_path: get_str("unix_socket_path"),
             pooler_mode: get_str("pooler_mode"),
+            read_only: obj
+                .and_then(|o| o.get("read_only"))
+                .and_then(Value::as_bool)
+                == Some(true),
         }
     }
 
@@ -86,6 +98,21 @@ impl ConnectionParams {
             .as_deref()
             .map(str::trim)
             .filter(|p| !p.is_empty())
+    }
+
+    /// The startup script to run on each new connection: trimmed, `None` when
+    /// blank, and always `None` in read-only mode. Startup SQL is user code
+    /// that runs before write protection is installed, so a read-only
+    /// connection must not run it (the host omits it too; this keeps the
+    /// plugin safe on its own).
+    pub fn startup_script_to_run(&self) -> Option<&str> {
+        if self.read_only {
+            return None;
+        }
+        self.startup_script
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// True when the connection goes through a transaction-mode pooler

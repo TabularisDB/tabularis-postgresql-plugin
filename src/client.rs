@@ -381,6 +381,41 @@ pub async fn build_pool_pub(params: &ConnectionParams) -> Result<Pool, String> {
     get_or_create_pool(params).await
 }
 
+/// The session statement a read-only connection runs on every new pooled
+/// connection, before it is handed out: from then on a write fails in the
+/// database even on a path that forgets to open a read-only transaction
+/// (metadata, connection tests, `execute_query`).
+///
+/// A statement rather than a `-c default_transaction_read_only=on` startup
+/// option, because PgBouncer (in every pool mode) rejects that option in the
+/// startup packet ("unsupported startup parameter in options"), which made a
+/// read-only connection to any PgBouncer impossible to open.
+///
+/// `None` behind a transaction pooler: a session-level `SET` would land on a
+/// backend other clients share. There each protected call's own
+/// `BEGIN READ ONLY` is the protection.
+pub(crate) fn read_only_session_sql(params: &ConnectionParams) -> Option<&'static str> {
+    (params.read_only && !params.is_transaction_pooler())
+        .then_some("SET default_transaction_read_only = on")
+}
+
+/// Build the `post_create` hook that makes a new connection read-only. A
+/// failure rejects the connection: a read-only pool must never hand out a
+/// session that failed to become read-only.
+fn read_only_hook(sql: &'static str) -> deadpool_postgres::Hook {
+    deadpool_postgres::Hook::async_fn(move |client, _metrics| {
+        Box::pin(async move {
+            client.batch_execute(sql).await.map_err(|e| {
+                deadpool_postgres::HookError::message(format!(
+                    "Read-only protection could not be enabled: {}",
+                    format_pg_error(&e)
+                ))
+            })?;
+            Ok(())
+        })
+    })
+}
+
 /// SHA-256 hash of `bytes` as a lowercase hex string. Used for the password
 /// and connection_string cache-key segments — never stores plaintext.
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -419,22 +454,40 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// different TLS or startup-script settings get distinct pools (#134). Absent
 /// or empty/whitespace connection_string → falls back to the full
 /// discrete-field + password key.
+///
+/// A read-only connection (`read_only`) is keyed apart from a writable one of
+/// the same target with a `read_only:` prefix (`read_only+pooler:` behind a
+/// transaction pooler, whose pool is built without the session statement), and
+/// its `startup_script` is not part of the key because it never runs for it.
 fn connection_key(params: &ConnectionParams) -> String {
+    let key = connection_key_inner(params);
+    // A protected connection must never borrow a writable session, and a
+    // writable one must never receive a protected session. Behind a
+    // transaction pooler the pool is built without the session statement (see
+    // `read_only_session_sql`), so it must not be shared with a pool of the
+    // same target that has it, or the other way round, when only
+    // `pooler_mode` was edited.
+    if params.read_only && params.is_transaction_pooler() {
+        format!("read_only+pooler:{key}")
+    } else if params.read_only {
+        format!("read_only:{key}")
+    } else {
+        key
+    }
+}
+
+fn connection_key_inner(params: &ConnectionParams) -> String {
     // The TLS params and startup_script are always part of the key — build_pool
     // reads them from the discrete fields unconditionally, even when
     // connection_string is set (it only ignores the discrete host/port/db/
     // user/password). Folding them here once avoids duplicating them in both
     // branches below. The startup_script is trimmed to match build_pool's own
-    // `.map(str::trim)` at line 507 — so two scripts differing only in
+    // `.map(str::trim)` (now `startup_script_to_run`) — so two scripts differing only in
     // surrounding whitespace produce the same key (matching build_pool's
     // identical pool behavior), not duplicate pools.
     let tls_and_script = format!(
         "{}:{}:{}:{}:{}",
-        params
-            .startup_script
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or(""),
+        params.startup_script_to_run().unwrap_or(""),
         params.ssl_mode.as_deref().unwrap_or(""),
         params.ssl_ca.as_deref().unwrap_or(""),
         params.ssl_cert.as_deref().unwrap_or(""),
@@ -761,12 +814,8 @@ async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Res
         recycling_method: RecyclingMethod::Fast,
     });
     cfg.ssl_mode = resolve_ssl_mode(params.ssl_mode.as_deref());
-
-    let script = params
-        .startup_script
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let script = params.startup_script_to_run();
+    let read_only_sql = read_only_session_sql(params);
 
     if uses_tls(params) {
         let tls_config = build_tls_connector(params)?;
@@ -781,6 +830,9 @@ async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Res
             .map_err(|e| format!("Pool creation failed (TLS): {e}"))?
             .runtime(Runtime::Tokio1)
             .max_size(crate::settings::pool_max_size());
+        if let Some(sql) = read_only_sql {
+            builder = builder.post_create(read_only_hook(sql));
+        }
         if let Some(script) = script {
             builder = builder.post_create(startup_script_hook(script));
         }
@@ -812,6 +864,9 @@ async fn build_pool_impl(params: &ConnectionParams, skip_preflight: bool) -> Res
             .map_err(|e| format!("Pool creation failed: {e}"))?
             .runtime(Runtime::Tokio1)
             .max_size(crate::settings::pool_max_size());
+        if let Some(sql) = read_only_sql {
+            builder = builder.post_create(read_only_hook(sql));
+        }
         if let Some(script) = script {
             builder = builder.post_create(startup_script_hook(script));
         }
@@ -869,11 +924,7 @@ async fn build_socket_pool(
 ) -> Result<Pool, String> {
     let pg_config = build_socket_pg_config(params, socket);
 
-    let script = params
-        .startup_script
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let script = params.startup_script_to_run();
 
     if !skip_preflight {
         if let Some(script) = script {
@@ -902,6 +953,9 @@ async fn build_socket_pool(
     let mut builder = Pool::builder(manager)
         .runtime(Runtime::Tokio1)
         .max_size(crate::settings::pool_max_size());
+    if let Some(sql) = read_only_session_sql(params) {
+        builder = builder.post_create(read_only_hook(sql));
+    }
     if let Some(script) = script {
         builder = builder.post_create(startup_script_hook(script));
     }

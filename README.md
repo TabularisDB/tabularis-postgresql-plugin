@@ -48,6 +48,7 @@ both drivers against the same live database and compares every response.
 - [Supported Operations](#supported-operations)
   - [Whole-database operations](#whole-database-operations)
   - [SQL file import](#sql-file-import)
+  - [Protected read-only queries](#protected-read-only-queries)
 - [Building from Source](#building-from-source)
 - [Development](#development)
 - [Changelog](#changelog)
@@ -110,7 +111,8 @@ both drivers against the same live database and compares every response.
 | `ssl_key` | Path to the private key PEM file matching `ssl_cert`. Must be set together with `ssl_cert` | No |
 | `unix_socket_path` | Path to a Unix socket file (`/var/run/postgresql/.s.PGSQL.5432`) or its directory. When set, the plugin dials the socket instead of `host`/`port`, and TLS is forced off (a socket peer cannot negotiate it). The host strips this when a tunnel is active, so the tunnel owns the route | No |
 | `connection_string` | Full `postgres://user:pass@host:port/db` URL, as an alternative to the discrete fields above | No |
-| `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query | No |
+| `startup_script` | SQL run on every new pooled connection (e.g. `SET search_path = ...`) before it's handed to a query. Not run for a read-only connection | No |
+| `read_only` | Set by the host for a read-only connection. The plugin opens it on its own pool with `default_transaction_read_only=on` and skips the startup script (see [Protected read-only queries](#protected-read-only-queries)) | No |
 
 ## Supported PostgreSQL Data Types
 
@@ -193,6 +195,7 @@ instead of reconnecting.
 | `get_routines` / `get_routine_parameters` / `get_routine_definition` | Function/procedure metadata |
 | `get_triggers` / `get_trigger_definition` / `create_trigger` / `drop_trigger` | Trigger lifecycle |
 | `execute_query` / `execute_query_batch` / `explain_query` | Query execution, multi-statement batches, and query plans. Both query methods accept an optional `session_id` that keeps the connection while an explicit transaction is open |
+| `execute_read_only_query` | Same request and response as `execute_query`, run in a transaction the database itself will not let write (see [Protected read-only queries](#protected-read-only-queries)) |
 | `release_session` | Rolls back and releases the connection a session pinned for an open transaction |
 | `insert_record` / `update_record` / `delete_record` | Row-level CRUD with type-aware value binding |
 | `get_create_table_sql` / `get_add_column_sql` / `get_alter_column_sql` / `get_create_index_sql` / `get_create_foreign_key_sql` / `drop_index` / `drop_foreign_key` | DDL generation and execution |
@@ -252,6 +255,73 @@ makes (`set_config(..., false)`, `SET ROLE`) are reset before `COMMIT`, so they
 cannot leak to other clients behind a transaction pooler. The import holds one
 of the plugin's four general workers for its whole run.
 
+### Protected read-only queries
+
+The plugin declares `read_only_queries`, so the host sends `execute_read_only_query`
+for a read-only connection and for MCP queries on a writable one. The request
+and response match `execute_query` (`query`, `limit`, `page`, `schema`), and the
+host never falls back to `execute_query`.
+
+Each call runs as `BEGIN READ ONLY`, the query, then `ROLLBACK`, and reads
+`transaction_read_only` back to confirm the server really entered a read-only
+transaction; if it did not, the query is not run. `INSERT`, `UPDATE`, `DELETE`,
+DDL and a function call that writes all fail in the database and change
+nothing. A function or `DO` block cannot switch the transaction back to
+writable, because `SET TRANSACTION READ WRITE` is only accepted before the first
+query of a transaction. A query that opens or ends a transaction (`BEGIN`,
+`COMMIT`, `ROLLBACK`, `PREPARE TRANSACTION`) is refused, since the call owns its
+transaction. PostgreSQL's read-only mode also rejects `nextval()` and temporary
+tables.
+
+A read-only transaction does not cover everything, so the plugin refuses a few
+commands by name and checks the connection afterwards. `PREPARE` and
+`DEALLOCATE` are refused, because they change what the connection keeps for the
+next caller. `COPY` is refused, because `COPY ... TO` can write a server-side
+file or run a program. `ANALYZE`, `CLUSTER`, `REINDEX`, `CHECKPOINT` and `LOAD`
+are refused because they write statistics, rewrite storage or load code, and
+`DISCARD` is refused because `DISCARD SEQUENCES` resets state that `ROLLBACK`
+does not restore. This list stops a mistake by a person or a tool that sends one
+of these commands as the statement; it is not a boundary. Dynamic SQL (a `DO`
+block, a function) can run the same commands from inside, where the plugin
+cannot see them, so what bounds the protection is the role (below). What the
+plugin does catch after the call is the session state a connection keeps: it
+reads back prepared statements and session-level advisory locks, and closes the
+connection instead of pooling it when the call left either behind.
+
+PostgreSQL's read-only mode is still bounded by the connecting role. Functions
+that act outside the transaction, such as `pg_create_physical_replication_slot`,
+`pg_logical_emit_message` or `pg_switch_wal`, are allowed in it, and `dblink`
+(where installed) opens a separate session that is not read-only. Connect with
+a role that has only the privileges a read-only user should have. The host must
+be Tabularis v0.33.0 or later for `read_only_queries`; an older host never sends
+`execute_read_only_query`.
+
+The connection goes back to the pool only after `ROLLBACK` succeeded and the
+session is as clean as it was. If the `ROLLBACK` fails, or the call is
+cancelled or dropped part-way, the connection is detached, the statement still
+running on it is cancelled, and the socket is closed, so the next caller never
+inherits a read-only or half-finished session. A `cancel` that arrives while the
+call is still connecting, or between its own `BEGIN` and the query, stops the
+call before the query runs.
+
+A connection saved with `read_only = true` gets its own pool (keyed apart from
+the writable one) whose new sessions run `SET default_transaction_read_only = on`
+before they are handed out, so its connection test and metadata discovery
+cannot write either. It is a statement and not a startup option, because
+PgBouncer rejects that option in the startup packet in every pool mode. The host
+leaves out the saved `startup_script` for such a connection, and the plugin
+never runs one for it.
+
+Behind a transaction pooler (`pooler_mode = transaction`) the statement is not
+run, because a session-level `SET` would land on a backend other clients share,
+and the pool is keyed apart again so editing `pooler_mode` never reuses the
+wrong pool. The per-call `BEGIN READ ONLY` is the protection there: a query that
+returns rows runs on a dedicated connection that is closed afterwards, and any
+other statement runs on the shared pool, where `BEGIN` pins the backend for the
+call. A closed connection does not close the backend behind a pooler, so the call
+releases the session-level advisory locks and `PREPARE`d statements it created in
+the same message as its `ROLLBACK`.
+
 ## Building from Source
 
 ### Prerequisites
@@ -297,6 +367,23 @@ just demo-db-stop
 just test    # cargo test — unit tests for SQL builders, parsing, RPC
 just lint    # clippy -D warnings
 just fmt     # cargo fmt --all
+```
+
+#### Live tests
+
+CI runs the live tests against one plain PostgreSQL on `127.0.0.1:54320`. The
+ones that need TLS, mutual TLS, PgBouncer (transaction and session mode) or a
+Unix socket live in `client_live_tests::podman` and are skipped there.
+`tests/podman/env.sh` starts what they need (podman containers named `ro-*`,
+plus a native PostgreSQL for the socket, because a container's socket does not
+cross the podman VM on macOS) and prints the environment variables to export:
+
+```bash
+tests/podman/env.sh up                       # needs podman, openssl, psql, postgresql@16
+eval "$(tests/podman/env.sh env)"
+PG_PLUGIN_TEST_HOST=127.0.0.1 PG_PLUGIN_TEST_PORT=54320 \
+  cargo test --lib client_live_tests -- --ignored --test-threads=1
+tests/podman/env.sh down
 ```
 
 ### Manual JSON-RPC test via shell

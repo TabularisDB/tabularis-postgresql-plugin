@@ -148,3 +148,49 @@ fn local_socket_path_trims_and_filters_empty() {
         "an empty socket path must be treated as unset"
     );
 }
+
+fn params_from(extra: serde_json::Value) -> ConnectionParams {
+    let mut base = json!({"host": "h", "database": "d", "username": "u"});
+    for (k, v) in extra.as_object().unwrap() {
+        base[k] = v.clone();
+    }
+    ConnectionParams::from_value(&base)
+}
+
+#[test]
+fn read_only_is_true_only_for_a_json_true() {
+    assert!(params_from(json!({"read_only": true})).read_only);
+    assert!(!params_from(json!({"read_only": false})).read_only);
+    assert!(!params_from(json!({})).read_only);
+    assert!(!params_from(json!({"read_only": null})).read_only);
+}
+
+#[test]
+fn a_non_boolean_read_only_value_is_not_treated_as_true() {
+    // The host sends a bool. Anything else is malformed, and the protected RPC
+    // enforces read-only on every call regardless of this flag, so a malformed
+    // value cannot weaken that path.
+    for bad in [json!("true"), json!(1), json!([true]), json!({"x": true})] {
+        assert!(!params_from(json!({ "read_only": bad })).read_only);
+    }
+}
+
+#[test]
+fn the_startup_script_is_trimmed_and_blank_means_none() {
+    assert_eq!(
+        params_from(json!({"startup_script": "  SET x = 1  "})).startup_script_to_run(),
+        Some("SET x = 1")
+    );
+    assert_eq!(
+        params_from(json!({"startup_script": "   \n"})).startup_script_to_run(),
+        None
+    );
+    assert_eq!(params_from(json!({})).startup_script_to_run(), None);
+}
+
+#[test]
+fn a_read_only_connection_never_runs_its_startup_script() {
+    // Startup SQL is user code and would run before protection is installed.
+    let params = params_from(json!({"read_only": true, "startup_script": "SET x = 1"}));
+    assert_eq!(params.startup_script_to_run(), None);
+}
